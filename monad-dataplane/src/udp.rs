@@ -230,6 +230,7 @@ async fn tx(
             && batch_count < MAX_AGGREGATED_SEGMENTS as usize
         {
             let (addr, mut payload, stride, msg_type) = messages_to_send.pop_front().unwrap();
+
             let chunk_size = payload.len().min(stride as usize).min(max_batch_bytes);
 
             if chunk_size + total_bytes > max_batch_bytes {
