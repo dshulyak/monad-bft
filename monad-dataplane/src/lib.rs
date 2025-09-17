@@ -33,6 +33,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{debug, warn};
 
 pub(crate) mod addrlist;
+pub mod auth_udp;
 pub(crate) mod ban_expiry;
 pub(crate) mod buffer_ext;
 pub mod tcp;
