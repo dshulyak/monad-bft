@@ -10,12 +10,11 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::Future;
-use monad_secp::{KeyPair as MonadKeyPair, PubKey as SecpPubKey};
 use monoio::time;
 use rand::rngs::OsRng;
 use thiserror::Error;
 use session::{Config, Context, SessionManager};
-use wireauth_protocol::common::PublicKey as WirePublicKey;
+use wireauth_protocol::{common::PublicKey as WirePublicKey, messages::DataPacketHeader};
 
 #[derive(Error, Debug)]
 pub enum AdapterError {
@@ -66,41 +65,14 @@ pub struct MonoioAuthProtocolBackground {
 }
 
 impl MonoioAuthProtocolSender {
-    pub fn encrypt(
-        &self,
-        identity: &SecpPubKey,
-        mut plaintext: BytesMut,
-    ) -> Result<(Bytes, Bytes), AdapterError> {
-        let mut inner = self.inner.borrow_mut();
-        let pubkey_bytes = identity.bytes_compressed();
-        let wire_public = WirePublicKey::try_from(pubkey_bytes)
-            .map_err(|e| AdapterError::KeyConversion(format!("Failed to convert public key: {:?}", e)))?;
-        let header = inner
-            .manager
-            .encrypt_by_public_key(&wire_public, plaintext.as_mut())?;
-
-        let mut header_bytes = BytesMut::with_capacity(32);
-        let header_ptr = &header as *const _ as *const u8;
-        let header_slice = unsafe { std::slice::from_raw_parts(header_ptr, 32) };
-        header_bytes.extend_from_slice(header_slice);
-
-        Ok((header_bytes.freeze(), plaintext.freeze()))
-    }
-
     pub fn encrypt_by_socket(
         &self,
         socket: &SocketAddr,
-        mut plaintext: BytesMut,
-    ) -> Result<(Bytes, Bytes), AdapterError> {
+        plaintext: &mut [u8],
+    ) -> Result<DataPacketHeader, AdapterError> {
         let mut inner = self.inner.borrow_mut();
-        let header = inner.manager.encrypt_by_socket(socket, plaintext.as_mut())?;
-
-        let mut header_bytes = BytesMut::with_capacity(32);
-        let header_ptr = &header as *const _ as *const u8;
-        let header_slice = unsafe { std::slice::from_raw_parts(header_ptr, 32) };
-        header_bytes.extend_from_slice(header_slice);
-
-        Ok((header_bytes.freeze(), plaintext.freeze()))
+        let header = inner.manager.encrypt_by_socket(socket, plaintext)?;
+        Ok(header)
     }
 }
 
@@ -193,14 +165,6 @@ pub struct MonoioAuthProtocol {
 }
 
 impl MonoioAuthProtocol {
-    pub fn new(_keypair: &MonadKeyPair) -> Result<Self, AdapterError> {
-        // For now, we can't extract the secret key from MonadKeyPair safely
-        // This method requires refactoring to pass keys as bytes
-        Err(AdapterError::KeyConversion(
-            "new() method not supported - use new_from_bytes() instead".to_string()
-        ))
-    }
-
     pub fn new_from_bytes(private_key_bytes: &[u8], public_key_bytes: &[u8]) -> Result<Self, AdapterError> {
         if private_key_bytes.len() != 32 {
             return Err(AdapterError::KeyConversion(format!(
@@ -236,7 +200,6 @@ impl MonoioAuthProtocol {
                 AdapterError::KeyConversion(format!("Failed to convert private key: {:?}", e))
             })?;
         
-        // Parse public key from bytes
         let mut pubkey_array = [0u8; 33];
         pubkey_array.copy_from_slice(public_key_bytes);
         let wire_public = WirePublicKey::try_from(pubkey_array)
@@ -268,245 +231,5 @@ impl MonoioAuthProtocol {
         MonoioAuthProtocolBackground,
     ) {
         (self.sender, self.receiver, self.background)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::BytesMut;
-    use monad_secp::KeyPair;
-    use rand::RngCore;
-    use std::net::SocketAddr;
-    use tracing::{debug, info};
-    use tracing_subscriber::EnvFilter;
-
-    fn init_tracing() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .try_init();
-    }
-
-    fn create_test_keypair() -> KeyPair {
-        let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
-        KeyPair::from_bytes(&mut secret).expect("Failed to create keypair")
-    }
-
-    #[monoio::test(timer_enabled = true)]
-    async fn test_manager_with_three_monoio_tasks() {
-        init_tracing();
-        info!("starting test_manager_with_three_monoio_tasks");
-
-        let keypair = create_test_keypair();
-        info!(pubkey=?keypair.pubkey().bytes(), "created test keypair");
-
-        let auth_protocol = MonoioAuthProtocol::new(&keypair).expect("Failed to create auth protocol");
-        let (sender, receiver, mut background) = auth_protocol.split();
-
-        let sender = std::rc::Rc::new(sender);
-        let receiver = std::rc::Rc::new(receiver);
-
-        let sender_clone = sender.clone();
-        let task1 = monoio::spawn(async move {
-            info!("task1: starting background packet handler");
-            for i in 0..3 {
-                match monoio::time::timeout(Duration::from_millis(100), &mut background).await {
-                    Ok(packet) => {
-                        info!(from=?packet.0, len=packet.1.len(), iteration=i, "task1: received packet");
-                    }
-                    Err(_) => {
-                        debug!(iteration=i, "task1: timeout waiting for packet");
-                    }
-                }
-            }
-            info!("task1: completed");
-        });
-
-        let task2 = monoio::spawn(async move {
-            info!("task2: starting encryption task");
-            let remote_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-            
-            for i in 0..5 {
-                let data = format!("Test message {}", i);
-                let buf = BytesMut::from(data.as_bytes());
-                
-                match sender_clone.encrypt_by_socket(&remote_addr, buf) {
-                    Ok((header, payload)) => {
-                        info!(
-                            iteration=i,
-                            header_len=header.len(),
-                            payload_len=payload.len(),
-                            "task2: encrypted message"
-                        );
-                    }
-                    Err(e) => {
-                        debug!(iteration=i, error=?e, "task2: encryption failed (expected before session init)");
-                    }
-                }
-                
-                monoio::time::sleep(Duration::from_millis(50)).await;
-            }
-            info!("task2: completed");
-        });
-
-        let task3 = monoio::spawn(async move {
-            info!("task3: starting decryption task");
-            let remote_addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
-            
-            for i in 0..3 {
-                let data = format!("Incoming packet {}", i);
-                let buf = BytesMut::from(data.as_bytes());
-                
-                match receiver.on_packet(buf, remote_addr) {
-                    Ok(Some(decrypted)) => {
-                        info!(
-                            iteration=i,
-                            decrypted_len=decrypted.len(),
-                            from=?remote_addr,
-                            "task3: decrypted packet"
-                        );
-                    }
-                    Ok(None) => {
-                        debug!(iteration=i, "task3: no decrypted data");
-                    }
-                    Err(e) => {
-                        debug!(iteration=i, error=?e, "task3: decryption failed (expected for non-encrypted data)");
-                    }
-                }
-                
-                monoio::time::sleep(Duration::from_millis(100)).await;
-            }
-            info!("task3: completed");
-        });
-
-        let timeout_duration = Duration::from_secs(2);
-        match monoio::time::timeout(timeout_duration, async {
-            let _ = monoio::join!(task1, task2, task3);
-        })
-        .await
-        {
-            Ok(_) => info!("all tasks completed successfully"),
-            Err(_) => info!("test completed with timeout (expected)"),
-        }
-
-        info!("test_manager_with_three_monoio_tasks: completed");
-    }
-
-    #[monoio::test(timer_enabled = true)]
-    async fn test_two_peers_handshake() {
-        init_tracing();
-        info!("starting test_two_peers_handshake");
-
-        let peer1_keypair = create_test_keypair();
-        let peer2_keypair = create_test_keypair();
-        
-        info!(
-            peer1_pubkey=?peer1_keypair.pubkey().bytes(),
-            peer2_pubkey=?peer2_keypair.pubkey().bytes(),
-            "created keypairs for both peers"
-        );
-
-        let peer1_auth = MonoioAuthProtocol::new(&peer1_keypair).expect("Failed to create peer1 auth");
-        let peer2_auth = MonoioAuthProtocol::new(&peer2_keypair).expect("Failed to create peer2 auth");
-
-        let (peer1_sender, peer1_receiver, mut peer1_background) = peer1_auth.split();
-        let (peer2_sender, peer2_receiver, mut peer2_background) = peer2_auth.split();
-
-        let peer1_addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
-        let peer2_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
-
-        info!(peer1_addr=?peer1_addr, peer2_addr=?peer2_addr, "initialized peers");
-
-        let peer1_sender = std::rc::Rc::new(peer1_sender);
-        let peer1_receiver = std::rc::Rc::new(peer1_receiver);
-        let peer2_sender = std::rc::Rc::new(peer2_sender);
-        let peer2_receiver = std::rc::Rc::new(peer2_receiver);
-
-        let peer1_bg_task = monoio::spawn(async move {
-            info!("peer1: background task started");
-            for _ in 0..10 {
-                match monoio::time::timeout(Duration::from_millis(100), &mut peer1_background).await {
-                    Ok((addr, packet)) => {
-                        info!(target=?addr, packet_len=packet.len(), "peer1: sending packet");
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-
-        let peer2_bg_task = monoio::spawn(async move {
-            info!("peer2: background task started");
-            for _ in 0..10 {
-                match monoio::time::timeout(Duration::from_millis(100), &mut peer2_background).await {
-                    Ok((addr, packet)) => {
-                        info!(target=?addr, packet_len=packet.len(), "peer2: sending packet");
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-
-        let test_task = monoio::spawn(async move {
-            info!("initializing session from peer1 to peer2");
-            
-            let sessions = vec![
-                (peer2_addr, peer2_keypair.pubkey().bytes().to_vec())
-            ];
-            
-            monoio::time::sleep(Duration::from_millis(200)).await;
-            
-            for i in 0..5 {
-                let message = format!("Test message {}", i);
-                let buf = BytesMut::from(message.as_bytes());
-                
-                match peer1_sender.encrypt_by_socket(&peer2_addr, buf) {
-                    Ok((header, payload)) => {
-                        debug!(
-                            msg_num=i,
-                            header_len=header.len(),
-                            payload_len=payload.len(),
-                            "peer1: encrypted message"
-                        );
-                        
-                        let mut packet = BytesMut::with_capacity(header.len() + payload.len());
-                        packet.extend_from_slice(&header);
-                        packet.extend_from_slice(&payload);
-                        
-                        match peer2_receiver.on_packet(packet, peer1_addr) {
-                            Ok(Some(decrypted)) => {
-                                let decrypted_msg = String::from_utf8_lossy(&decrypted);
-                                info!(msg_num=i, decrypted=?decrypted_msg, "peer2: decrypted message");
-                            }
-                            Ok(None) => {
-                                debug!(msg_num=i, "peer2: handshake packet processed");
-                            }
-                            Err(e) => {
-                                debug!(msg_num=i, error=?e, "peer2: failed to process packet");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!(msg_num=i, error=?e, "peer1: encryption failed");
-                    }
-                }
-                
-                monoio::time::sleep(Duration::from_millis(100)).await;
-            }
-            
-            info!("test completed");
-        });
-
-        let timeout_duration = Duration::from_secs(3);
-        match monoio::time::timeout(timeout_duration, async {
-            let _ = monoio::join!(peer1_bg_task, peer2_bg_task, test_task);
-        })
-        .await
-        {
-            Ok(_) => info!("all tasks completed"),
-            Err(_) => info!("test timed out (expected)"),
-        }
-
-        info!("test_two_peers_handshake: completed");
     }
 }

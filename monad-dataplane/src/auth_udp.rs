@@ -242,6 +242,11 @@ async fn tx(
     let mut messages_to_send: VecDeque<(SocketAddr, Bytes, u16, UdpMessageType)> = VecDeque::new();
     let max_batch_bytes = max_write_size_for_segment_size(DEFAULT_SEGMENT_SIZE) as usize;
     let mut send_futures = Vec::with_capacity(MAX_AGGREGATED_SEGMENTS as usize);
+    
+    let mut buffer_pool: VecDeque<BytesMut> = VecDeque::with_capacity(MAX_AGGREGATED_SEGMENTS as usize);
+    for _ in 0..MAX_AGGREGATED_SEGMENTS {
+        buffer_pool.push_back(BytesMut::with_capacity(1500));
+    }
 
     loop {
         let now = Instant::now();
@@ -310,16 +315,19 @@ async fn tx(
 
             let chunk = payload.split_to(chunk_size);
 
-            let plaintext_buf = BytesMut::from(chunk.as_ref());
-            match sender.encrypt_by_socket(&addr, plaintext_buf) {
-                Ok((header, encrypted_payload)) => {
-                    let mut combined =
-                        BytesMut::with_capacity(header.len() + encrypted_payload.len());
-                    combined.extend_from_slice(&header);
-                    combined.extend_from_slice(&encrypted_payload);
-                    let encrypted = combined.freeze();
+            let mut buffer = buffer_pool.pop_front().unwrap_or_else(|| BytesMut::with_capacity(1500));
+            buffer.clear();
+            buffer.resize(32 + chunk.len(), 0);
+            buffer[32..].copy_from_slice(chunk.as_ref());
+            
+            match sender.encrypt_by_socket(&addr, &mut buffer[32..]) {
+                Ok(header) => {
+                    let header_bytes = unsafe {
+                        std::slice::from_raw_parts(&header as *const _ as *const u8, 32)
+                    };
+                    buffer[..32].copy_from_slice(header_bytes);
 
-                    total_bytes += encrypted.len();
+                    total_bytes += buffer.len();
 
                     let socket = match (&msg_type, &direct_socket_tx) {
                         (UdpMessageType::Direct, Some(direct_socket)) => direct_socket,
@@ -332,27 +340,16 @@ async fn tx(
 
                     trace!(
                         dst_addr = ?addr,
-                        encrypted_len = encrypted.len(),
+                        encrypted_len = buffer.len(),
                         msg_type = ?msg_type,
                         "preparing encrypted udp send"
                     );
 
-                    send_futures.push(socket.send_to(encrypted, addr));
+                    send_futures.push(socket.send_to(buffer, addr));
                 }
                 Err(err) => {
                     trace!(?err, "encryption failed, sending plaintext");
-                    total_bytes += chunk.len();
-
-                    let socket = match (&msg_type, &direct_socket_tx) {
-                        (UdpMessageType::Direct, Some(direct_socket)) => direct_socket,
-                        _ => &socket_tx,
-                    };
-
-                    if !payload.is_empty() {
-                        messages_to_send.push_front((addr, payload, stride, msg_type.clone()));
-                    }
-
-                    send_futures.push(socket.send_to(chunk, addr));
+                    buffer_pool.push_back(buffer);
                 }
             }
             batch_count += 1;
@@ -367,7 +364,10 @@ async fn tx(
             );
         }
 
-        for (ret, chunk) in join_all(send_futures.drain(..)).await {
+        let results = join_all(send_futures.drain(..)).await;
+
+        
+        for (ret, chunk) in results {
             if let Err(err) = &ret {
                 match err.kind() {
                     ErrorKind::NetworkUnreachable => {
@@ -389,6 +389,7 @@ async fn tx(
                     }
                 }
             }
+            buffer_pool.push_back(chunk);
         }
 
         if total_bytes > 0 {
