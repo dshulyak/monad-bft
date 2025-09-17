@@ -42,8 +42,9 @@ pub const DEFAULT_MTU: u16 = 1480;
 
 const IPV4_HDR_SIZE: u16 = 20;
 const UDP_HDR_SIZE: u16 = 8;
+pub const ENCRYPTION_HEADER_SIZE: u16 = 32;
 pub const fn segment_size_for_mtu(mtu: u16) -> u16 {
-    mtu - IPV4_HDR_SIZE - UDP_HDR_SIZE
+    mtu - IPV4_HDR_SIZE - UDP_HDR_SIZE - ENCRYPTION_HEADER_SIZE
 }
 
 pub const DEFAULT_SEGMENT_SIZE: u16 = segment_size_for_mtu(DEFAULT_MTU);
