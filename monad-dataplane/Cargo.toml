@@ -21,6 +21,10 @@ socket2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 zerocopy = { workspace = true }
+thiserror = { workspace = true }
+wireauth-protocol = { path = "/home/dd/wireauth/protocol" }
+session = { path = "/home/dd/wireauth/session" }
+monad-secp = { path = "../monad-secp" }
 
 [dev-dependencies]
 ntest = { workspace = true }

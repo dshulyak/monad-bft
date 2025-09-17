@@ -106,7 +106,13 @@ pub(crate) fn spawn_tasks(
     buffer_size: Option<usize>,
     auth: Option<Vec<u8>>,
 ) {
-    let auth_protocol = MonoioAuthProtocol::new_from_bytes(&auth.expect("auth required for auth_udp")).expect("Failed to create auth protocol");
+    let auth_bytes = auth.expect("auth required for auth_udp");
+    // For now, expect auth to be concatenated private key (32 bytes) + public key (33 bytes) = 65 bytes
+    if auth_bytes.len() != 65 {
+        panic!("Expected 65 bytes for auth (32 byte private key + 33 byte public key), got {}", auth_bytes.len());
+    }
+    let (private_key, public_key) = auth_bytes.split_at(32);
+    let auth_protocol = MonoioAuthProtocol::new_from_bytes(private_key, public_key).expect("Failed to create auth protocol");
     let (sender, receiver, background) = auth_protocol.split();
     
     let sender = Rc::new(sender);

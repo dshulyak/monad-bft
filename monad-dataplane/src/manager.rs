@@ -72,7 +72,9 @@ impl MonoioAuthProtocolSender {
         mut plaintext: BytesMut,
     ) -> Result<(Bytes, Bytes), AdapterError> {
         let mut inner = self.inner.borrow_mut();
-        let wire_public = WirePublicKey::from(identity.to_inner());
+        let pubkey_bytes = identity.bytes_compressed();
+        let wire_public = WirePublicKey::try_from(pubkey_bytes)
+            .map_err(|e| AdapterError::KeyConversion(format!("Failed to convert public key: {:?}", e)))?;
         let header = inner
             .manager
             .encrypt_by_public_key(&wire_public, plaintext.as_mut())?;
@@ -191,7 +193,29 @@ pub struct MonoioAuthProtocol {
 }
 
 impl MonoioAuthProtocol {
-    pub fn new(keypair: &MonadKeyPair) -> Result<Self, AdapterError> {
+    pub fn new(_keypair: &MonadKeyPair) -> Result<Self, AdapterError> {
+        // For now, we can't extract the secret key from MonadKeyPair safely
+        // This method requires refactoring to pass keys as bytes
+        Err(AdapterError::KeyConversion(
+            "new() method not supported - use new_from_bytes() instead".to_string()
+        ))
+    }
+
+    pub fn new_from_bytes(private_key_bytes: &[u8], public_key_bytes: &[u8]) -> Result<Self, AdapterError> {
+        if private_key_bytes.len() != 32 {
+            return Err(AdapterError::KeyConversion(format!(
+                "Invalid private key length: expected 32, got {}",
+                private_key_bytes.len()
+            )));
+        }
+        
+        if public_key_bytes.len() != 33 {
+            return Err(AdapterError::KeyConversion(format!(
+                "Invalid public key length: expected 33, got {}",
+                public_key_bytes.len()
+            )));
+        }
+
         let config = Config {
             init_response_timeout: Duration::from_secs(10),
             init_retry_interval: Duration::from_secs(1),
@@ -207,14 +231,16 @@ impl MonoioAuthProtocol {
             start_time: Instant::now(),
         };
 
-        let pubkey = keypair.pubkey();
-        let wire_public = WirePublicKey::from(pubkey.to_inner());
-
-        let secret_bytes = keypair.secret_bytes();
-        let wire_private = wireauth_protocol::common::PrivateKey::from_bytes(&secret_bytes)
+        let wire_private = wireauth_protocol::common::PrivateKey::from_bytes(private_key_bytes)
             .map_err(|e| {
                 AdapterError::KeyConversion(format!("Failed to convert private key: {:?}", e))
             })?;
+        
+        // Parse public key from bytes
+        let mut pubkey_array = [0u8; 33];
+        pubkey_array.copy_from_slice(public_key_bytes);
+        let wire_public = WirePublicKey::try_from(pubkey_array)
+            .map_err(|e| AdapterError::KeyConversion(format!("Failed to convert public key: {:?}", e)))?;
 
         let manager = SessionManager::new(config, wire_private, wire_public, context);
 
