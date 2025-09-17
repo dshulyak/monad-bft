@@ -30,7 +30,7 @@ use futures::channel::oneshot;
 use monoio::{spawn, time::Instant, IoUringDriver, RuntimeBuilder};
 use tcp::{TcpConfig, TcpControl, TcpRateLimit};
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 pub(crate) mod addrlist;
 pub mod auth_udp;
@@ -131,6 +131,7 @@ impl DataplaneBuilder {
         let (udp_direct_ingress_tx, udp_direct_ingress_rx) =
             mpsc::channel(UDP_INGRESS_CHANNEL_SIZE);
         let (udp_egress_tx, udp_egress_rx) = mpsc::channel(UDP_EGRESS_CHANNEL_SIZE);
+        let (init_sessions_tx, init_sessions_rx) = mpsc::unbounded_channel();
 
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
@@ -143,6 +144,7 @@ impl DataplaneBuilder {
             .spawn({
                 let tcp_control_map = tcp_control_map.clone();
                 let addrlist = addrlist.clone();
+                let auth_clone = auth.clone();
                 move || {
                     RuntimeBuilder::<IoUringDriver>::new()
                         .enable_timer()
@@ -169,8 +171,10 @@ impl DataplaneBuilder {
                                 udp_ingress_tx,
                                 udp_direct_ingress_tx,
                                 udp_egress_rx,
+                                init_sessions_rx,
                                 up_bandwidth_mbps,
                                 udp_buffer_size,
+                                auth_clone,
                             );
 
                             ready_clone.store(true, Ordering::Release);
@@ -184,6 +188,7 @@ impl DataplaneBuilder {
         let writer = DataplaneWriter::new(
             tcp_egress_tx,
             udp_egress_tx,
+            init_sessions_tx,
             tcp_control_map,
             banned_ips_tx,
             addrlist,
@@ -197,6 +202,10 @@ impl DataplaneBuilder {
             auth,
         }
     }
+}
+
+pub struct InitSessionsMessage {
+    pub sessions: Vec<(SocketAddr, Vec<u8>)>,
 }
 
 pub struct Dataplane {
@@ -220,6 +229,7 @@ pub struct DataplaneWriter {
 struct DataplaneWriterInner {
     tcp_egress_tx: mpsc::Sender<(SocketAddr, TcpMsg)>,
     udp_egress_tx: mpsc::Sender<UdpEgressMessage>,
+    init_sessions_tx: mpsc::UnboundedSender<InitSessionsMessage>,
 
     tcp_control_map: TcpControl,
     notify_ban_expiry: mpsc::UnboundedSender<(IpAddr, Instant)>,
@@ -389,6 +399,10 @@ impl Dataplane {
         self.writer.udp_write_direct(dst, payload, stride);
     }
 
+    pub fn init_sessions(&self, sessions: Vec<(SocketAddr, Vec<u8>)>) {
+        self.writer.init_sessions(sessions);
+    }
+
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -485,6 +499,7 @@ impl DataplaneWriter {
     fn new(
         tcp_egress_tx: mpsc::Sender<(SocketAddr, TcpMsg)>,
         udp_egress_tx: mpsc::Sender<UdpEgressMessage>,
+        init_sessions_tx: mpsc::UnboundedSender<InitSessionsMessage>,
         tcp_control_map: TcpControl,
         notify_ban_expiry: mpsc::UnboundedSender<(IpAddr, Instant)>,
         addrlist: Arc<Addrlist>,
@@ -492,6 +507,7 @@ impl DataplaneWriter {
         let inner = DataplaneWriterInner {
             tcp_egress_tx,
             udp_egress_tx,
+            init_sessions_tx,
             tcp_control_map,
             notify_ban_expiry,
             addrlist,
@@ -646,6 +662,13 @@ impl DataplaneWriter {
                 );
             }
             Err(TrySendError::Closed(_)) => panic!("udp_egress_tx channel closed"),
+        }
+    }
+
+    pub fn init_sessions(&self, sessions: Vec<(SocketAddr, Vec<u8>)>) {
+        let msg = InitSessionsMessage { sessions };
+        if let Err(e) = self.inner.init_sessions_tx.send(msg) {
+            error!(error = ?e, "failed to send init_sessions message");
         }
     }
 }

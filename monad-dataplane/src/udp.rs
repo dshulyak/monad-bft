@@ -110,8 +110,10 @@ pub(crate) fn spawn_tasks(
     udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     udp_direct_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     udp_egress_rx: mpsc::Receiver<UdpEgressMessage>,
+    init_sessions_rx: mpsc::UnboundedReceiver<super::InitSessionsMessage>,
     up_bandwidth_mbps: u64,
     buffer_size: Option<usize>,
+    auth: Option<Vec<u8>>,
 ) {
     let (udp_socket_rx, udp_socket_tx) = create_socket_pair(local_addr, buffer_size);
     let (direct_socket_rx, direct_socket_tx) = direct_socket_port
