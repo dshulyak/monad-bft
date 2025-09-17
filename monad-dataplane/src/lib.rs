@@ -47,6 +47,7 @@ pub struct DataplaneBuilder {
     tcp_config: TcpConfig,
     ban_duration: Duration,
     direct_socket_port: Option<u16>,
+    auth: Option<Vec<u8>>,
 }
 
 impl DataplaneBuilder {
@@ -66,6 +67,7 @@ impl DataplaneBuilder {
             },
             ban_duration: Duration::from_secs(5 * 60), // 5 minutes
             direct_socket_port: None,
+            auth: None,
         }
     }
 
@@ -104,6 +106,12 @@ impl DataplaneBuilder {
         self
     }
 
+    /// with_authentication configures authentication with the given private key bytes
+    pub fn with_authentication(mut self, private_key: Vec<u8>) -> Self {
+        self.auth = Some(private_key);
+        self
+    }
+
     pub fn build(self) -> Dataplane {
         let DataplaneBuilder {
             local_addr,
@@ -113,6 +121,7 @@ impl DataplaneBuilder {
             tcp_config,
             ban_duration,
             direct_socket_port,
+            auth,
         } = self;
 
         let (tcp_ingress_tx, tcp_ingress_rx) = mpsc::channel(TCP_INGRESS_CHANNEL_SIZE);
@@ -184,6 +193,7 @@ impl DataplaneBuilder {
             writer,
             reader,
             ready,
+            auth,
         }
     }
 }
@@ -192,6 +202,7 @@ pub struct Dataplane {
     writer: DataplaneWriter,
     reader: DataplaneReader,
     ready: Arc<AtomicBool>,
+    auth: Option<Vec<u8>>,
 }
 
 pub struct DataplaneReader {
@@ -313,6 +324,10 @@ const UDP_EGRESS_CHANNEL_SIZE: usize = 12_800;
 impl Dataplane {
     pub fn split(self) -> (DataplaneReader, DataplaneWriter) {
         (self.reader, self.writer)
+    }
+
+    pub fn auth(&self) -> Option<&[u8]> {
+        self.auth.as_deref()
     }
 
     /// add_trusted marks ip address as trusted.
