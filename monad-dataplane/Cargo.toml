@@ -30,3 +30,7 @@ monad-secp = { path = "../monad-secp" }
 ntest = { workspace = true }
 rstest = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+rand = { workspace = true }
+wireauth-protocol = { path = "/home/dd/wireauth/protocol" }
+secp256k1 = { workspace = true }
+hex = { workspace = true }

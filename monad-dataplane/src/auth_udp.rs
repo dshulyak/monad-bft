@@ -191,31 +191,39 @@ async fn rx_single_socket(
     udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     receiver: Rc<MonoioAuthProtocolReceiver>,
 ) {
+    let local_addr = socket.local_addr().unwrap();
+    debug!(?local_addr, "AUTH UDP rx_single_socket started listening");
+    
     loop {
         let buf = BytesMut::with_capacity(ETHERNET_SEGMENT_SIZE.into());
-
+        debug!("awaiting read");
         match socket.recv_from(buf).await {
-            (Ok((len, src_addr)), mut buf) => match receiver.on_packet(buf.clone(), src_addr) {
-                Ok(Some(decrypted)) => {
-                    buf = BytesMut::from(decrypted.as_ref());
-                    let payload = buf.freeze();
+            (Ok((len, src_addr)), mut buf) => {
+                trace!(?local_addr, ?src_addr, len, "received packet on socket");
+                
+                match receiver.on_packet(buf.clone(), src_addr) {
+                    Ok(Some(decrypted)) => {
+                        debug!(?src_addr, len, "packet decrypted successfully");
+                        buf = BytesMut::from(decrypted.as_ref());
+                        let payload = buf.freeze();
 
-                    let msg = RecvUdpMsg {
-                        src_addr,
-                        payload,
-                        stride: len.max(1).try_into().unwrap(),
-                    };
+                        let msg = RecvUdpMsg {
+                            src_addr,
+                            payload,
+                            stride: len.max(1).try_into().unwrap(),
+                        };
 
-                    if let Err(err) = udp_ingress_tx.send(msg).await {
-                        warn!(?src_addr, ?err, "error queueing up decrypted UDP message");
-                        break;
+                        if let Err(err) = udp_ingress_tx.send(msg).await {
+                            warn!(?src_addr, ?err, "error queueing up decrypted UDP message");
+                            break;
+                        }
                     }
-                }
-                Ok(None) => {
-                    trace!(?src_addr, "handshake packet processed");
-                }
-                Err(err) => {
-                    warn!(?src_addr, ?err, "decryption failed, dropping packet");
+                    Ok(None) => {
+                        debug!(?src_addr, "handshake packet processed");
+                    }
+                    Err(err) => {
+                        warn!(?src_addr, ?err, "decryption failed, dropping packet");
+                    }
                 }
             },
             (Err(err), _buf) => {
@@ -305,11 +313,9 @@ async fn tx(
                 }
                 packet = (&mut background).fuse() => {
                     let (dst, data) = packet;
-                    trace!(?dst, len = data.len(), "auth protocol generated packet");
-                    messages_to_send.push_back((dst, data, data.len(), UdpMessageType::Auth));
-                }
-                default => {
-                    break;
+                    let data_len = data.len() as u16;
+                    trace!(?dst, len = data_len, "auth protocol generated packet");
+                    messages_to_send.push_back((dst, data, data_len, UdpMessageType::Auth));
                 }
             }
         }
@@ -350,6 +356,7 @@ async fn tx(
                 trace!(
                     dst_addr = ?addr,
                     auth_len = buffer.len(),
+                    local_addr = ?socket.local_addr().ok(),
                     "sending auth control packet"
                 );
 
@@ -409,6 +416,9 @@ async fn tx(
 
         
         for (ret, chunk) in results {
+            if let Ok(bytes_sent) = &ret {
+                trace!(bytes_sent, "UDP packet sent successfully");
+            }
             if let Err(err) = &ret {
                 match err.kind() {
                     ErrorKind::NetworkUnreachable => {
