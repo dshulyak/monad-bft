@@ -36,6 +36,7 @@ pub(crate) mod addrlist;
 pub mod auth_udp;
 pub(crate) mod ban_expiry;
 pub(crate) mod buffer_ext;
+pub(crate) mod manager;
 pub mod tcp;
 pub mod udp;
 
@@ -165,17 +166,31 @@ impl DataplaneBuilder {
                                 tcp_ingress_tx,
                                 tcp_egress_rx,
                             );
-                            udp::spawn_tasks(
-                                local_addr,
-                                direct_socket_port,
-                                udp_ingress_tx,
-                                udp_direct_ingress_tx,
-                                udp_egress_rx,
-                                init_sessions_rx,
-                                up_bandwidth_mbps,
-                                udp_buffer_size,
-                                auth_clone,
-                            );
+                            if auth_clone.is_some() {
+                                auth_udp::spawn_tasks(
+                                    local_addr,
+                                    direct_socket_port,
+                                    udp_ingress_tx,
+                                    udp_direct_ingress_tx,
+                                    udp_egress_rx,
+                                    init_sessions_rx,
+                                    up_bandwidth_mbps,
+                                    udp_buffer_size,
+                                    auth_clone,
+                                );
+                            } else {
+                                udp::spawn_tasks(
+                                    local_addr,
+                                    direct_socket_port,
+                                    udp_ingress_tx,
+                                    udp_direct_ingress_tx,
+                                    udp_egress_rx,
+                                    init_sessions_rx,
+                                    up_bandwidth_mbps,
+                                    udp_buffer_size,
+                                    auth_clone,
+                                );
+                            }
 
                             ready_clone.store(true, Ordering::Release);
 
