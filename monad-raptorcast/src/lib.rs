@@ -411,6 +411,26 @@ where
                             },
                         );
                         assert!(removed.is_none());
+                        
+                        // Initialize encryption sessions for the new epoch validators
+                        let pd_driver = self.peer_discovery_driver.lock().unwrap();
+                        let sessions: Vec<(SocketAddr, Vec<u8>)> = validator_set
+                            .iter()
+                            .filter_map(|(node_id, _)| {
+                                pd_driver.get_addr(node_id).map(|addr| {
+                                    // Serialize the public key to bytes
+                                    // node_id.0 is the CertificateSignaturePubKey which for secp is PubKey
+                                    // We need to handle this generically - use bytes() if available
+                                    let pubkey_bytes = node_id.0.bytes().to_vec();
+                                    (addr, pubkey_bytes)
+                                })
+                            })
+                            .collect();
+                        drop(pd_driver);
+                        
+                        if !sessions.is_empty() {
+                            self.dataplane_writer.init_sessions(sessions);
+                        }
                     }
                     self.peer_discovery_driver.lock().unwrap().update(
                         PeerDiscoveryEvent::UpdateValidatorSet {
