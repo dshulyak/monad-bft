@@ -28,13 +28,14 @@ use monoio::{net::udp::UdpSocket, spawn, time};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
-use super::{RecvUdpMsg, UdpEgressMessage, InitSessionsMessage};
+use super::{InitSessionsMessage, RecvUdpMsg, UdpEgressMessage};
 use crate::{
     buffer_ext::SocketBufferExt,
-    manager::{MonoioAuthProtocol, MonoioAuthProtocolSender, MonoioAuthProtocolReceiver, MonoioAuthProtocolBackground},
-    udp::{
-        UdpMessageType, DEFAULT_SEGMENT_SIZE,
+    manager::{
+        MonoioAuthProtocol, MonoioAuthProtocolBackground, MonoioAuthProtocolReceiver,
+        MonoioAuthProtocolSender,
     },
+    udp::{UdpMessageType, DEFAULT_SEGMENT_SIZE},
 };
 
 const ETHERNET_MTU: u16 = 1500;
@@ -109,17 +110,21 @@ pub(crate) fn spawn_tasks(
     let auth_bytes = auth.expect("auth required for auth_udp");
     // For now, expect auth to be concatenated private key (32 bytes) + public key (33 bytes) = 65 bytes
     if auth_bytes.len() != 65 {
-        panic!("Expected 65 bytes for auth (32 byte private key + 33 byte public key), got {}", auth_bytes.len());
+        panic!(
+            "Expected 65 bytes for auth (32 byte private key + 33 byte public key), got {}",
+            auth_bytes.len()
+        );
     }
     let (private_key, public_key) = auth_bytes.split_at(32);
-    let auth_protocol = MonoioAuthProtocol::new_from_bytes(private_key, public_key).expect("Failed to create auth protocol");
+    let auth_protocol = MonoioAuthProtocol::new_from_bytes(private_key, public_key)
+        .expect("Failed to create auth protocol");
     let (sender, receiver, background) = auth_protocol.split();
-    
+
     let sender = Rc::new(sender);
     let receiver = Rc::new(receiver);
-    
+
     let (_auth_packet_tx, auth_packet_rx) = mpsc::channel(1000);
-    
+
     let (udp_socket_rx, udp_socket_tx) = create_socket_pair(local_addr, buffer_size);
     let (direct_socket_rx, direct_socket_tx) = direct_socket_port
         .map(|port| {
@@ -129,7 +134,6 @@ pub(crate) fn spawn_tasks(
             (Some(rx), Some(tx))
         })
         .unwrap_or((None, None));
-
 
     spawn(rx(
         udp_socket_rx,
@@ -169,8 +173,16 @@ async fn rx(
 ) {
     match direct_socket_rx {
         Some(direct_socket) => {
-            spawn(rx_single_socket(udp_socket_rx, udp_ingress_tx, receiver.clone()));
-            spawn(rx_single_socket(direct_socket, udp_direct_ingress_tx, receiver));
+            spawn(rx_single_socket(
+                udp_socket_rx,
+                udp_ingress_tx,
+                receiver.clone(),
+            ));
+            spawn(rx_single_socket(
+                direct_socket,
+                udp_direct_ingress_tx,
+                receiver,
+            ));
         }
         None => {
             rx_single_socket(udp_socket_rx, udp_ingress_tx, receiver).await;
@@ -179,7 +191,7 @@ async fn rx(
 }
 
 async fn rx_single_socket(
-    socket: UdpSocket, 
+    socket: UdpSocket,
     udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     receiver: Rc<MonoioAuthProtocolReceiver>,
 ) {
@@ -187,42 +199,29 @@ async fn rx_single_socket(
         let buf = BytesMut::with_capacity(ETHERNET_SEGMENT_SIZE.into());
 
         match socket.recv_from(buf).await {
-            (Ok((len, src_addr)), mut buf) => {
-                match receiver.on_packet(buf.clone(), src_addr) {
-                    Ok(Some(decrypted)) => {
-                        buf = BytesMut::from(decrypted.as_ref());
-                        let payload = buf.freeze();
-                        
-                        let msg = RecvUdpMsg {
-                            src_addr,
-                            payload,
-                            stride: len.max(1).try_into().unwrap(),
-                        };
+            (Ok((len, src_addr)), mut buf) => match receiver.on_packet(buf.clone(), src_addr) {
+                Ok(Some(decrypted)) => {
+                    buf = BytesMut::from(decrypted.as_ref());
+                    let payload = buf.freeze();
 
-                        if let Err(err) = udp_ingress_tx.send(msg).await {
-                            warn!(?src_addr, ?err, "error queueing up decrypted UDP message");
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        trace!(?src_addr, "handshake packet processed");
-                    }
-                    Err(_err) => {
-                        let payload = buf.freeze();
-                        
-                        let msg = RecvUdpMsg {
-                            src_addr,
-                            payload,
-                            stride: len.max(1).try_into().unwrap(),
-                        };
+                    let msg = RecvUdpMsg {
+                        src_addr,
+                        payload,
+                        stride: len.max(1).try_into().unwrap(),
+                    };
 
-                        if let Err(err) = udp_ingress_tx.send(msg).await {
-                            warn!(?src_addr, ?err, "error queueing up received UDP message");
-                            break;
-                        }
+                    if let Err(err) = udp_ingress_tx.send(msg).await {
+                        warn!(?src_addr, ?err, "error queueing up decrypted UDP message");
+                        break;
                     }
                 }
-            }
+                Ok(None) => {
+                    trace!(?src_addr, "handshake packet processed");
+                }
+                Err(err) => {
+                    warn!(?src_addr, ?err, "decryption failed, dropping packet");
+                }
+            },
             (Err(err), _buf) => {
                 warn!("socket.recv_from() error {}", err);
             }
@@ -310,15 +309,16 @@ async fn tx(
             }
 
             let chunk = payload.split_to(chunk_size);
-            
+
             let plaintext_buf = BytesMut::from(chunk.as_ref());
             match sender.encrypt_by_socket(&addr, plaintext_buf) {
                 Ok((header, encrypted_payload)) => {
-                    let mut combined = BytesMut::with_capacity(header.len() + encrypted_payload.len());
+                    let mut combined =
+                        BytesMut::with_capacity(header.len() + encrypted_payload.len());
                     combined.extend_from_slice(&header);
                     combined.extend_from_slice(&encrypted_payload);
                     let encrypted = combined.freeze();
-                    
+
                     total_bytes += encrypted.len();
 
                     let socket = match (&msg_type, &direct_socket_tx) {
@@ -405,15 +405,13 @@ fn max_write_size_for_segment_size(segment_size: u16) -> u16 {
     (MAX_AGGREGATED_WRITE_SIZE / segment_size).min(MAX_AGGREGATED_SEGMENTS) * segment_size
 }
 
-
 async fn background_task(
     mut background: MonoioAuthProtocolBackground,
     mut init_sessions_rx: mpsc::UnboundedReceiver<InitSessionsMessage>,
     mut auth_packet_rx: mpsc::Receiver<(SocketAddr, Bytes)>,
 ) {
-    use futures::future::FutureExt;
-    use futures::select;
-    
+    use futures::{future::FutureExt, select};
+
     loop {
         select! {
             msg = init_sessions_rx.recv().fuse() => {
