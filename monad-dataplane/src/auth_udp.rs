@@ -123,7 +123,6 @@ pub(crate) fn spawn_tasks(
     let sender = Rc::new(sender);
     let receiver = Rc::new(receiver);
 
-    let (_auth_packet_tx, auth_packet_rx) = mpsc::channel(1000);
 
     let (udp_socket_rx, udp_socket_tx) = create_socket_pair(local_addr, buffer_size);
     let (direct_socket_rx, direct_socket_tx) = direct_socket_port
@@ -146,13 +145,10 @@ pub(crate) fn spawn_tasks(
         udp_socket_tx,
         direct_socket_tx,
         udp_egress_rx,
+        init_sessions_rx,
         up_bandwidth_mbps,
         sender.clone(),
-    ));
-    spawn(background_task(
         background,
-        init_sessions_rx,
-        auth_packet_rx,
     ));
 }
 
@@ -235,8 +231,10 @@ async fn tx(
     socket_tx: UdpSocket,
     direct_socket_tx: Option<UdpSocket>,
     mut udp_egress_rx: mpsc::Receiver<UdpEgressMessage>,
+    mut init_sessions_rx: mpsc::UnboundedReceiver<InitSessionsMessage>,
     up_bandwidth_mbps: u64,
     sender: Rc<MonoioAuthProtocolSender>,
+    mut background: MonoioAuthProtocolBackground,
 ) {
     let mut next_transmit = Instant::now();
     let mut messages_to_send: VecDeque<(SocketAddr, Bytes, u16, UdpMessageType)> = VecDeque::new();
@@ -260,37 +258,58 @@ async fn tx(
         }
 
         while messages_to_send.is_empty() || !udp_egress_rx.is_empty() {
-            let Some(msg) = udp_egress_rx.recv().await else {
-                return;
-            };
+            use futures::{future::FutureExt, select};
+            
+            select! {
+                msg = udp_egress_rx.recv().fuse() => {
+                    let Some(msg) = msg else {
+                        return;
+                    };
 
-            match msg {
-                UdpEgressMessage::Unicast(unicast_msg) => {
-                    for (addr, udp_msg) in unicast_msg.into_iter() {
-                        messages_to_send.push_back((
-                            addr,
-                            udp_msg.payload,
-                            udp_msg.stride,
-                            UdpMessageType::Common,
-                        ));
+                    match msg {
+                        UdpEgressMessage::Unicast(unicast_msg) => {
+                            for (addr, udp_msg) in unicast_msg.into_iter() {
+                                messages_to_send.push_back((
+                                    addr,
+                                    udp_msg.payload,
+                                    udp_msg.stride,
+                                    UdpMessageType::Common,
+                                ));
+                            }
+                        }
+                        UdpEgressMessage::Broadcast(broadcast_msg) => {
+                            for (addr, udp_msg) in broadcast_msg.into_iter() {
+                                messages_to_send.push_back((
+                                    addr,
+                                    udp_msg.payload,
+                                    udp_msg.stride,
+                                    UdpMessageType::Common,
+                                ));
+                            }
+                        }
+                        UdpEgressMessage::Direct {
+                            dst,
+                            payload,
+                            stride,
+                        } => {
+                            messages_to_send.push_back((dst, payload, stride, UdpMessageType::Direct));
+                        }
                     }
                 }
-                UdpEgressMessage::Broadcast(broadcast_msg) => {
-                    for (addr, udp_msg) in broadcast_msg.into_iter() {
-                        messages_to_send.push_back((
-                            addr,
-                            udp_msg.payload,
-                            udp_msg.stride,
-                            UdpMessageType::Common,
-                        ));
+                init_msg = init_sessions_rx.recv().fuse() => {
+                    if let Some(msg) = init_msg {
+                        if let Err(err) = background.init_sessions(msg.sessions) {
+                            warn!(?err, "failed to initialize sessions");
+                        }
                     }
                 }
-                UdpEgressMessage::Direct {
-                    dst,
-                    payload,
-                    stride,
-                } => {
-                    messages_to_send.push_back((dst, payload, stride, UdpMessageType::Direct));
+                packet = (&mut background).fuse() => {
+                    let (dst, data) = packet;
+                    trace!(?dst, len = data.len(), "auth protocol generated packet");
+                    messages_to_send.push_back((dst, data, data.len(), UdpMessageType::Auth));
+                }
+                default => {
+                    break;
                 }
             }
         }
@@ -315,41 +334,63 @@ async fn tx(
 
             let chunk = payload.split_to(chunk_size);
 
-            let mut buffer = buffer_pool.pop_front().unwrap_or_else(|| BytesMut::with_capacity(1500));
-            buffer.clear();
-            buffer.resize(32 + chunk.len(), 0);
-            buffer[32..].copy_from_slice(chunk.as_ref());
-            
-            match sender.encrypt_by_socket(&addr, &mut buffer[32..]) {
-                Ok(header) => {
-                    let header_bytes = unsafe {
-                        std::slice::from_raw_parts(&header as *const _ as *const u8, 32)
-                    };
-                    buffer[..32].copy_from_slice(header_bytes);
+            if matches!(msg_type, UdpMessageType::Auth) {
+                let mut buffer = buffer_pool.pop_front().unwrap_or_else(|| BytesMut::with_capacity(1500));
+                buffer.clear();
+                buffer.extend_from_slice(chunk.as_ref());
+                
+                total_bytes += buffer.len();
 
-                    total_bytes += buffer.len();
+                let socket = &socket_tx;
 
-                    let socket = match (&msg_type, &direct_socket_tx) {
-                        (UdpMessageType::Direct, Some(direct_socket)) => direct_socket,
-                        _ => &socket_tx,
-                    };
-
-                    if !payload.is_empty() {
-                        messages_to_send.push_front((addr, payload, stride, msg_type.clone()));
-                    }
-
-                    trace!(
-                        dst_addr = ?addr,
-                        encrypted_len = buffer.len(),
-                        msg_type = ?msg_type,
-                        "preparing encrypted udp send"
-                    );
-
-                    send_futures.push(socket.send_to(buffer, addr));
+                if !payload.is_empty() {
+                    messages_to_send.push_front((addr, payload, stride, msg_type.clone()));
                 }
-                Err(err) => {
-                    trace!(?err, "encryption failed, sending plaintext");
-                    buffer_pool.push_back(buffer);
+
+                trace!(
+                    dst_addr = ?addr,
+                    auth_len = buffer.len(),
+                    "sending auth control packet"
+                );
+
+                send_futures.push(socket.send_to(buffer, addr));
+            } else {
+                let mut buffer = buffer_pool.pop_front().unwrap_or_else(|| BytesMut::with_capacity(1500));
+                buffer.clear();
+                buffer.resize(32 + chunk.len(), 0);
+                buffer[32..].copy_from_slice(chunk.as_ref());
+                
+                match sender.encrypt_by_socket(&addr, &mut buffer[32..]) {
+                    Ok(header) => {
+                        let header_bytes = unsafe {
+                            std::slice::from_raw_parts(&header as *const _ as *const u8, 32)
+                        };
+                        buffer[..32].copy_from_slice(header_bytes);
+
+                        total_bytes += buffer.len();
+
+                        let socket = match (&msg_type, &direct_socket_tx) {
+                            (UdpMessageType::Direct, Some(direct_socket)) => direct_socket,
+                            _ => &socket_tx,
+                        };
+
+                        if !payload.is_empty() {
+                            messages_to_send.push_front((addr, payload, stride, msg_type.clone()));
+                        }
+
+                        trace!(
+                            dst_addr = ?addr,
+                            encrypted_len = buffer.len(),
+                            msg_type = ?msg_type,
+                            "preparing encrypted udp send"
+                        );
+
+                        send_futures.push(socket.send_to(buffer, addr));
+                    }
+                    Err(err) => {
+                        trace!(?err, "encryption failed, sending plaintext");
+                        buffer_pool.push_back(buffer);
+                    }
                 }
             }
             batch_count += 1;
@@ -406,34 +447,6 @@ fn max_write_size_for_segment_size(segment_size: u16) -> u16 {
     (MAX_AGGREGATED_WRITE_SIZE / segment_size).min(MAX_AGGREGATED_SEGMENTS) * segment_size
 }
 
-async fn background_task(
-    mut background: MonoioAuthProtocolBackground,
-    mut init_sessions_rx: mpsc::UnboundedReceiver<InitSessionsMessage>,
-    mut auth_packet_rx: mpsc::Receiver<(SocketAddr, Bytes)>,
-) {
-    use futures::{future::FutureExt, select};
-
-    loop {
-        select! {
-            msg = init_sessions_rx.recv().fuse() => {
-                if let Some(msg) = msg {
-                    if let Err(err) = background.init_sessions(msg.sessions) {
-                        warn!(?err, "failed to initialize sessions");
-                    }
-                }
-            }
-            packet = auth_packet_rx.recv().fuse() => {
-                if let Some((dst, packet)) = packet {
-                    trace!(?dst, len = packet.len(), "sending auth control packet");
-                }
-            }
-            packet = (&mut background).fuse() => {
-                let (dst, data) = packet;
-                trace!(?dst, len = data.len(), "auth protocol generated packet");
-            }
-        }
-    }
-}
 
 fn is_eafnosupport(err: &Error) -> bool {
     const EAFNOSUPPORT: &str = "Address family not supported by protocol";

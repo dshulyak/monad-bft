@@ -34,6 +34,7 @@ use crate::buffer_ext::SocketBufferExt;
 pub(crate) enum UdpMessageType {
     Common,
     Direct,
+    Auth,
 }
 
 // When running in docker with vpnkit, the maximum safe MTU is 1480, as per:
