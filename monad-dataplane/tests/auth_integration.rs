@@ -23,10 +23,10 @@ fn generate_test_keypair_with_seed(seed: u8) -> (Vec<u8>, Vec<u8>) {
     let mut rng = StdRng::from_seed(seed_array);
     
     // Generate a proper keypair using wireauth's crypto
-    let (public_key, private_key) = wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
+    let (_public_key, _private_key) = wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
     
     // Convert public key to bytes
-    let public_key_bytes: [u8; 33] = (&public_key).into();
+    let _public_key_bytes: [u8; 33] = (&_public_key).into();
     
     // The problem is we can't extract private key bytes from wireauth's PrivateKey
     // So we need to use a known private key that we can control

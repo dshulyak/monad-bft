@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 wireauth-protocol = { path = "/home/dd/wireauth/protocol" }
 session = { path = "/home/dd/wireauth/session" }
 monad-secp = { path = "../monad-secp" }
+hex = { workspace = true }
 
 [dev-dependencies]
 ntest = { workspace = true }

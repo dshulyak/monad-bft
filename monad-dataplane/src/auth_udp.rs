@@ -201,11 +201,43 @@ async fn rx_single_socket(
             (Ok((len, src_addr)), mut buf) => {
                 trace!(?local_addr, ?src_addr, len, "received packet on socket");
                 
+                debug!(
+                    ?src_addr,
+                    packet_len = len,
+                    first_32_bytes = ?buf.get(0..32.min(len)).map(hex::encode),
+                    "before decryption: raw packet received"
+                );
+                
                 match receiver.on_packet(buf.clone(), src_addr) {
                     Ok(Some(decrypted)) => {
-                        debug!(?src_addr, len, "packet decrypted successfully");
+                        // Workaround: The session manager incorrectly returns Some(empty) for 
+                        // handshake completion packets instead of None. Filter these out.
+                        if decrypted.is_empty() {
+                            debug!(
+                                ?src_addr,
+                                original_packet_len = len,
+                                "handshake completion packet with empty payload - treating as control packet"
+                            );
+                            continue; // Skip empty packets - they're handshake completions
+                        }
+                        
+                        debug!(
+                            ?src_addr, 
+                            original_packet_len = len,
+                            decrypted_len = decrypted.len(),
+                            decrypted_preview = ?String::from_utf8_lossy(&decrypted[..decrypted.len().min(50)]),
+                            "after decryption: packet decrypted successfully"
+                        );
+                        
                         buf = BytesMut::from(decrypted.as_ref());
                         let payload = buf.freeze();
+                        
+                        debug!(
+                            ?src_addr,
+                            payload_len = payload.len(),
+                            payload_is_empty = payload.is_empty(),
+                            "creating RecvUdpMsg with payload"
+                        );
 
                         let msg = RecvUdpMsg {
                             src_addr,
@@ -219,7 +251,7 @@ async fn rx_single_socket(
                         }
                     }
                     Ok(None) => {
-                        debug!(?src_addr, "handshake packet processed");
+                        debug!(?src_addr, len, "handshake/control packet processed (no data to forward)");
                     }
                     Err(err) => {
                         warn!(?src_addr, ?err, "decryption failed, dropping packet");
@@ -277,6 +309,12 @@ async fn tx(
                     match msg {
                         UdpEgressMessage::Unicast(unicast_msg) => {
                             for (addr, udp_msg) in unicast_msg.into_iter() {
+                                debug!(
+                                    ?addr,
+                                    payload_len = udp_msg.payload.len(),
+                                    payload_preview = ?String::from_utf8_lossy(&udp_msg.payload[..udp_msg.payload.len().min(50)]),
+                                    "received unicast message to send"
+                                );
                                 messages_to_send.push_back((
                                     addr,
                                     udp_msg.payload,
@@ -287,6 +325,12 @@ async fn tx(
                         }
                         UdpEgressMessage::Broadcast(broadcast_msg) => {
                             for (addr, udp_msg) in broadcast_msg.into_iter() {
+                                debug!(
+                                    ?addr,
+                                    payload_len = udp_msg.payload.len(),
+                                    payload_preview = ?String::from_utf8_lossy(&udp_msg.payload[..udp_msg.payload.len().min(50)]),
+                                    "received broadcast message to send"
+                                );
                                 messages_to_send.push_back((
                                     addr,
                                     udp_msg.payload,
@@ -367,8 +411,21 @@ async fn tx(
                 buffer.resize(32 + chunk.len(), 0);
                 buffer[32..].copy_from_slice(chunk.as_ref());
                 
+                debug!(
+                    dst_addr = ?addr,
+                    original_payload_len = chunk.len(),
+                    payload_preview = ?String::from_utf8_lossy(&chunk[..chunk.len().min(50)]),
+                    "before encryption: preparing payload"
+                );
+                
                 match sender.encrypt_by_socket(&addr, &mut buffer[32..]) {
                     Ok(header) => {
+                        debug!(
+                            dst_addr = ?addr,
+                            encrypted_payload_len = buffer[32..].len(),
+                            "after encryption: payload encrypted"
+                        );
+                        
                         let header_bytes = unsafe {
                             std::slice::from_raw_parts(&header as *const _ as *const u8, 32)
                         };
@@ -389,13 +446,15 @@ async fn tx(
                             dst_addr = ?addr,
                             encrypted_len = buffer.len(),
                             msg_type = ?msg_type,
+                            total_packet_len = buffer.len(),
+                            header_len = 32,
                             "preparing encrypted udp send"
                         );
 
                         send_futures.push(socket.send_to(buffer, addr));
                     }
                     Err(err) => {
-                        trace!(?err, "encryption failed, sending plaintext");
+                        warn!(?err, ?addr, "encryption failed, dropping packet");
                         buffer_pool.push_back(buffer);
                     }
                 }
