@@ -210,17 +210,6 @@ async fn rx_single_socket(
                 
                 match receiver.on_packet(buf.clone(), src_addr) {
                     Ok(Some(decrypted)) => {
-                        // Workaround: The session manager incorrectly returns Some(empty) for 
-                        // handshake completion packets instead of None. Filter these out.
-                        if decrypted.is_empty() {
-                            debug!(
-                                ?src_addr,
-                                original_packet_len = len,
-                                "handshake completion packet with empty payload - treating as control packet"
-                            );
-                            continue; // Skip empty packets - they're handshake completions
-                        }
-                        
                         debug!(
                             ?src_addr, 
                             original_packet_len = len,

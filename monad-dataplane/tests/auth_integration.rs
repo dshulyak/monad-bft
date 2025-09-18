@@ -86,14 +86,13 @@ fn test_two_nodes_auth() {
     
     info!("nodes initialized, setting up sessions");
     
-    // Try initiating from just one side first
+    // Both nodes initiate sessions simultaneously - this is the real-world scenario
     node1.init_sessions(vec![(node2_addr, node2_public.clone())]);
+    node2.init_sessions(vec![(node1_addr, node1_public.clone())]);
     
     info!("waiting for handshake completion");
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(100));
-        std::thread::yield_now();
-    }
+    // Give time for both handshakes to complete
+    std::thread::sleep(Duration::from_millis(500));
     
     info!("sending encrypted messages between nodes");
     
