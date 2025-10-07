@@ -1,10 +1,9 @@
+use std::{net::SocketAddr, time::Duration};
+
 use api::{Config, TestContext, API};
 use divan::Bencher;
+use monad_wireauth_protocol::{common::PublicKey, messages::DataPacketHeader};
 use rand::rngs::OsRng;
-use std::net::SocketAddr;
-use std::time::Duration;
-use monad_wireauth_protocol::common::PublicKey;
-use monad_wireauth_protocol::messages::DataPacketHeader;
 use zerocopy::{AsBytes, FromBytes};
 
 fn main() {
@@ -13,7 +12,8 @@ fn main() {
 
 fn create_test_manager() -> (API<TestContext>, PublicKey, TestContext) {
     let mut rng = OsRng;
-    let (public_key, private_key) = monad_wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
+    let (public_key, private_key) =
+        monad_wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
     let psk = [0u8; 32];
     let config = Config {
         session_timeout: Duration::from_secs(10),
@@ -90,7 +90,11 @@ fn bench_session_send_init(bencher: Bencher) {
         })
         .bench_local_values(|(mut manager, peer2_public, peer2_addr)| {
             manager
-                .connect(peer2_public, peer2_addr, monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS)
+                .connect(
+                    peer2_public,
+                    peer2_addr,
+                    monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS,
+                )
                 .expect("failed to init session");
         });
 }
@@ -105,7 +109,11 @@ fn bench_session_handle_init(bencher: Bencher) {
             let peer2_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
 
             peer1_manager
-                .connect(peer2_public, peer2_addr, monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS)
+                .connect(
+                    peer2_public,
+                    peer2_addr,
+                    monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS,
+                )
                 .expect("failed to init session");
             let init_packet = peer1_manager.next_packet().unwrap().1;
 

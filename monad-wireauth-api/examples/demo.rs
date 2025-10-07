@@ -1,15 +1,11 @@
+use std::{future::pending, net::SocketAddr, rc::Rc, time::Duration};
+
 use api::{Config, StdContext, API, RETRY_ALWAYS};
 use clap::Parser;
+use monad_wireauth_protocol::{common::PublicKey, crypto};
 use monoio::net::udp::UdpSocket;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use std::future::pending;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::time::Duration;
+use rand::{rngs::StdRng, SeedableRng};
 use tracing::{debug, info, warn};
-use monad_wireauth_protocol::common::PublicKey;
-use monad_wireauth_protocol::crypto;
 use zerocopy::AsBytes;
 
 #[derive(Parser, Debug)]

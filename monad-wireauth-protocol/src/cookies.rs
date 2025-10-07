@@ -1,9 +1,12 @@
-use crate::common::*;
-use crate::crypto::{decrypt_in_place, encrypt_in_place, LABEL_COOKIE};
-use crate::errors::{CookieError, ProtocolError};
-use crate::messages::*;
-use crate::{hash, keyed_hash};
 use std::net::SocketAddr;
+
+use crate::{
+    common::*,
+    crypto::{decrypt_in_place, encrypt_in_place, LABEL_COOKIE},
+    errors::{CookieError, ProtocolError},
+    hash, keyed_hash,
+    messages::*,
+};
 
 pub fn send_cookie_reply(
     nonce_secret: &[u8; 32],
@@ -89,11 +92,13 @@ pub fn verify_cookie<M: crate::messages::MacMessage>(
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryFrom;
+
+    use rand::rngs::OsRng;
+    use zerocopy::AsBytes;
+
     use super::*;
     use crate::messages::{CookieReply, HandshakeInitiation, HandshakeResponse};
-    use rand::rngs::OsRng;
-    use std::convert::TryFrom;
-    use zerocopy::AsBytes;
 
     #[test]
     fn test_cookie_send_and_accept() {

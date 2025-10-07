@@ -1,12 +1,18 @@
-use crate::common::{
-    CommonSessionData, Config, MessageEvent, RekeyEvent, SessionError, TerminatedEvent,
+use std::{
+    ops::{Deref, DerefMut},
+    time::Duration,
 };
-use crate::replay_filter::ReplayFilter;
-use std::ops::{Deref, DerefMut};
-use std::time::Duration;
+
+use monad_wireauth_protocol::{
+    common::{CipherKey, SessionIndex},
+    messages::{DataPacket, DataPacketHeader},
+};
 use tracing::debug;
-use monad_wireauth_protocol::common::{CipherKey, SessionIndex};
-use monad_wireauth_protocol::messages::{DataPacket, DataPacketHeader};
+
+use crate::{
+    common::{CommonSessionData, Config, MessageEvent, RekeyEvent, SessionError, TerminatedEvent},
+    replay_filter::ReplayFilter,
+};
 
 pub struct Transport {
     pub remote_index: SessionIndex,

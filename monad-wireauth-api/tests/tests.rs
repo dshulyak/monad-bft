@@ -1,13 +1,13 @@
+use std::{net::SocketAddr, time::Duration};
+
 use monad_wireauth_api::{Config, TestContext, API};
-use rand::rngs::OsRng;
-use monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS;
-use std::net::SocketAddr;
-use std::time::Duration;
-use tracing_subscriber::EnvFilter;
-use monad_wireauth_protocol::common::PublicKey;
-use monad_wireauth_protocol::messages::{
-    CookieReply, DataPacketHeader, HandshakeInitiation, HandshakeResponse,
+use monad_wireauth_protocol::{
+    common::PublicKey,
+    messages::{CookieReply, DataPacketHeader, HandshakeInitiation, HandshakeResponse},
 };
+use monad_wireauth_session::DEFAULT_RETRY_ATTEMPTS;
+use rand::rngs::OsRng;
+use tracing_subscriber::EnvFilter;
 use zerocopy::AsBytes;
 
 fn init_tracing() {
@@ -18,7 +18,8 @@ fn init_tracing() {
 
 fn create_manager() -> (API<TestContext>, PublicKey, TestContext, Config) {
     let mut rng = OsRng;
-    let (public_key, private_key) = monad_wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
+    let (public_key, private_key) =
+        monad_wireauth_protocol::crypto::generate_keypair(&mut rng).unwrap();
     let config = Config {
         session_timeout: Duration::from_secs(10),
         session_timeout_jitter: Duration::from_secs(1),

@@ -1,5 +1,4 @@
-use crate::common::*;
-use crate::errors::CryptoError;
+use crate::{common::*, errors::CryptoError};
 
 pub const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_secp256k1_AEGIS128L_BLAKE3";
 pub const IDENTIFIER: &[u8] = b"authenticated udp v1 -- monad";

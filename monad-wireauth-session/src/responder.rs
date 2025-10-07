@@ -1,13 +1,20 @@
-use rand::{CryptoRng, RngCore};
-use std::net::SocketAddr;
-use std::ops::{Deref, DerefMut};
-use std::time::Duration;
-use monad_wireauth_protocol::common::*;
-use monad_wireauth_protocol::handshake::{self};
-use monad_wireauth_protocol::messages::{DataPacket, HandshakeInitiation, HandshakeResponse};
+use std::{
+    net::SocketAddr,
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 
-use crate::common::{add_jitter, CommonSessionData, Config, SessionError, SessionTimeoutResult};
-use crate::transport::Transport;
+use monad_wireauth_protocol::{
+    common::*,
+    handshake::{self},
+    messages::{DataPacket, HandshakeInitiation, HandshakeResponse},
+};
+use rand::{CryptoRng, RngCore};
+
+use crate::{
+    common::{add_jitter, CommonSessionData, Config, SessionError, SessionTimeoutResult},
+    transport::Transport,
+};
 
 pub struct ValidatedHandshakeInit {
     pub handshake_state: monad_wireauth_protocol::handshake::HandshakeState,

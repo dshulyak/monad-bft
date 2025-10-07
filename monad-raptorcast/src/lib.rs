@@ -63,6 +63,7 @@ use util::{
     unix_ts_ms_now, BuildTarget, EpochValidators, FullNodes, Group, ReBroadcastGroupMap, Redundancy,
 };
 
+pub mod authentication;
 pub mod config;
 pub mod decoding;
 pub mod message;

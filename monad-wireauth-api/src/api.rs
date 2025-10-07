@@ -1,22 +1,29 @@
-use bytes::Bytes;
-use std::collections::{BTreeSet, VecDeque};
-use std::convert::TryFrom;
-use std::net::SocketAddr;
-use std::time::{Duration, UNIX_EPOCH};
-use tracing::{debug, instrument, trace, Level};
-use monad_wireauth_protocol::common::{PrivateKey, PublicKey, SerializedPublicKey};
-use monad_wireauth_protocol::messages::{
-    CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation, HandshakeResponse,
-    TYPE_COOKIE_REPLY, TYPE_DATA, TYPE_HANDSHAKE_INITIATION, TYPE_HANDSHAKE_RESPONSE,
+use std::{
+    collections::{BTreeSet, VecDeque},
+    convert::TryFrom,
+    net::SocketAddr,
+    time::{Duration, UNIX_EPOCH},
 };
 
-use crate::context::Context;
-use crate::cookie::Cookies;
-use crate::error::{Error, ProtocolErrorContext, Result, SessionErrorContext};
-use crate::filter::{Filter, FilterAction};
-use crate::state::State;
-use crate::{Initiator, Responder, Transport};
+use bytes::Bytes;
+use monad_wireauth_protocol::{
+    common::{PrivateKey, PublicKey, SerializedPublicKey},
+    messages::{
+        CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation, HandshakeResponse,
+        TYPE_COOKIE_REPLY, TYPE_DATA, TYPE_HANDSHAKE_INITIATION, TYPE_HANDSHAKE_RESPONSE,
+    },
+};
 use monad_wireauth_session::{Config, SessionIndex};
+use tracing::{debug, instrument, trace, Level};
+
+use crate::{
+    context::Context,
+    cookie::Cookies,
+    error::{Error, ProtocolErrorContext, Result, SessionErrorContext},
+    filter::{Filter, FilterAction},
+    state::State,
+    Initiator, Responder, Transport,
+};
 
 pub struct API<C: Context> {
     state: State,

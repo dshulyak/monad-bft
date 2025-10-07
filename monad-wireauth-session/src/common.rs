@@ -1,9 +1,11 @@
+use std::{
+    net::SocketAddr,
+    time::{Duration, SystemTime},
+};
+
+use monad_wireauth_protocol::{common::*, cookies};
 use rand::RngCore;
-use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
 use tracing::debug;
-use monad_wireauth_protocol::common::*;
-use monad_wireauth_protocol::cookies;
 
 pub const RETRY_ALWAYS: u64 = u64::MAX;
 pub const DEFAULT_RETRY_ATTEMPTS: u64 = 3;

@@ -1,8 +1,10 @@
-use rand::rngs::OsRng;
-use rand::{CryptoRng, RngCore};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant, SystemTime},
+};
+
+use rand::{rngs::OsRng, CryptoRng, RngCore};
 
 pub trait Context {
     type Rng: RngCore + CryptoRng;

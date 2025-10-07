@@ -1,8 +1,11 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
+    time::Duration,
+};
+
 use lru::LruCache;
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroUsize;
-use std::time::Duration;
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

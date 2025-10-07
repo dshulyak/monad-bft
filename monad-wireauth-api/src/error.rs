@@ -1,7 +1,8 @@
-use monad_wireauth_session::{SessionError, SessionIndex};
 use std::net::SocketAddr;
-use thiserror::Error as ThisError;
+
 use monad_wireauth_protocol::errors::{CookieError, CryptoError, HandshakeError, MessageError};
+use monad_wireauth_session::{SessionError, SessionIndex};
+use thiserror::Error as ThisError;
 
 #[derive(ThisError, Debug)]
 pub enum Error {

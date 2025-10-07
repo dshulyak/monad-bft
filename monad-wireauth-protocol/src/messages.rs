@@ -1,8 +1,9 @@
-use crate::common::*;
-use crate::errors::MessageError;
-use bytes::Bytes;
 use std::convert::TryFrom;
+
+use bytes::Bytes;
 use zerocopy::{AsBytes, FromBytes, FromZeroes, LE, U32, U64};
+
+use crate::{common::*, errors::MessageError};
 
 /// Trait for messages that have MAC1 and MAC2 fields
 pub trait MacMessage: AsBytes {
@@ -339,9 +340,10 @@ impl<'a> TryFrom<&'a mut [u8]> for DataPacket<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryFrom;
+
     use super::*;
     use crate::errors::MessageError;
-    use std::convert::TryFrom;
 
     #[test]
     fn test_handshake_initiation_default() {

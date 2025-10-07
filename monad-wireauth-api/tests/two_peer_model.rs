@@ -1,12 +1,15 @@
 mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Once,
+        time::Duration,
+    };
+
     use monad_wireauth_api::{Config, TestContext, API};
+    use monad_wireauth_protocol::common::PublicKey;
     use proptest::prelude::*;
     use rand::rngs::OsRng;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Once;
-    use std::time::Duration;
     use tracing_subscriber::EnvFilter;
-    use monad_wireauth_protocol::common::PublicKey;
     use zerocopy::AsBytes;
 
     static INIT: Once = Once::new();

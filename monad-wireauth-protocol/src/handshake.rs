@@ -1,15 +1,19 @@
-use crate::common::*;
-use crate::crypto::{
-    decrypt_in_place, ecdh, encrypt_in_place, generate_keypair, CONSTRUCTION, IDENTIFIER,
-    LABEL_COOKIE, LABEL_MAC1,
-};
-use crate::errors::{HandshakeError, ProtocolError};
-use crate::messages::*;
-use crate::{hash, keyed_hash};
-use rand::{CryptoRng, Rng};
 use std::time::SystemTime;
+
+use rand::{CryptoRng, Rng};
 use tai64::Tai64N;
 use zeroize::Zeroizing;
+
+use crate::{
+    common::*,
+    crypto::{
+        decrypt_in_place, ecdh, encrypt_in_place, generate_keypair, CONSTRUCTION, IDENTIFIER,
+        LABEL_COOKIE, LABEL_MAC1,
+    },
+    errors::{HandshakeError, ProtocolError},
+    hash, keyed_hash,
+    messages::*,
+};
 
 pub struct HandshakeState {
     pub chaining_key: Zeroizing<HashOutput>,
@@ -335,12 +339,13 @@ pub fn derive_transport_keys(chaining_key: &HashOutput, is_initiator: bool) -> T
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use serde::Serialize;
     use std::time::{Duration, SystemTime};
+
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use serde::Serialize;
     use zerocopy::AsBytes;
+
+    use super::*;
 
     #[derive(Serialize)]
     struct ProtocolTrace {

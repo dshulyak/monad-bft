@@ -5783,6 +5783,8 @@ dependencies = [
  "monad-testutil",
  "monad-types",
  "monad-validator",
+ "monad-wireauth-api",
+ "monad-wireauth-protocol",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rstest",
@@ -5790,6 +5792,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]

@@ -1,10 +1,13 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::SocketAddr;
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    net::SocketAddr,
+    time::{Duration, UNIX_EPOCH},
+};
+
 use monad_wireauth_protocol::common::SerializedPublicKey;
+use monad_wireauth_session::{Config, SessionIndex};
 
 use crate::{Initiator, Responder, Transport};
-use monad_wireauth_session::{Config, SessionIndex};
 
 pub struct State {
     initiating_sessions: HashMap<SessionIndex, Initiator>,
@@ -348,12 +351,15 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::SystemTime,
+    };
+
+    use monad_wireauth_protocol::{common::PublicKey, crypto};
     use rand::rngs::OsRng;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::time::SystemTime;
-    use monad_wireauth_protocol::common::PublicKey;
-    use monad_wireauth_protocol::crypto;
+
+    use super::*;
 
     fn create_dummy_hash_output() -> monad_wireauth_protocol::common::HashOutput {
         monad_wireauth_protocol::common::HashOutput([0u8; 32])

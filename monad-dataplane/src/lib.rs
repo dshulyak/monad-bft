@@ -260,15 +260,8 @@ impl UnicastMsg {
 
     fn into_iter(self) -> impl Iterator<Item = (SocketAddr, UdpMsg)> {
         let Self { msgs, stride } = self;
-        msgs.into_iter().map(move |(dst, payload)| {
-            (
-                dst,
-                UdpMsg {
-                    payload,
-                    stride,
-                },
-            )
-        })
+        msgs.into_iter()
+            .map(move |(dst, payload)| (dst, UdpMsg { payload, stride }))
     }
 }
 

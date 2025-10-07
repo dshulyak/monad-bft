@@ -30,7 +30,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 #[derive(Copy, Clone, PartialOrd, Ord)]
 pub struct PubKey(secp256k1::PublicKey);
 /// secp256k1 keypair
-pub struct KeyPair(secp256k1::KeyPair);
+pub struct KeyPair(secp256k1::Keypair);
 
 #[derive(ZeroizeOnDrop)]
 pub struct PrivKeyView(Vec<u8>);
@@ -101,7 +101,7 @@ impl KeyPair {
     /// Create a keypair from a secret key slice. The secret is zero-ized after
     /// use. The secret must be 32 byytes.
     pub fn from_bytes(secret: &mut [u8]) -> Result<Self, Error> {
-        let keypair = secp256k1::KeyPair::from_seckey_slice(secp256k1::SECP256K1, secret)
+        let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret)
             .map(Self)
             .map_err(Error);
         secret.zeroize();
@@ -136,6 +136,10 @@ impl KeyPair {
     pub fn pubkey(&self) -> PubKey {
         PubKey(self.0.public_key())
     }
+
+    pub fn to_inner(&self) -> secp256k1::SecretKey {
+        self.0.secret_key()
+    }
 }
 
 impl PubKey {
@@ -169,6 +173,10 @@ impl PubKey {
             &self.0,
         )
         .map_err(Error)
+    }
+
+    pub fn to_inner(&self) -> secp256k1::PublicKey {
+        self.0
     }
 }
 

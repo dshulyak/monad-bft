@@ -76,9 +76,10 @@ impl ReplayFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::prelude::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[rstest]
     #[case(0)]

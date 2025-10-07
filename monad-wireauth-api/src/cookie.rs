@@ -1,10 +1,9 @@
-use rand::{CryptoRng, RngCore};
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
-use monad_wireauth_protocol::common::SerializedPublicKey;
-use monad_wireauth_protocol::errors::ProtocolError;
-use monad_wireauth_protocol::messages::CookieReply;
+use monad_wireauth_protocol::{
+    common::SerializedPublicKey, errors::ProtocolError, messages::CookieReply,
+};
+use rand::{CryptoRng, RngCore};
 
 use crate::error::{ProtocolErrorContext, Result};
 
@@ -45,8 +44,11 @@ impl Cookies {
         duration_since_start: Duration,
     ) -> Result<CookieReply> {
         let time_counter = duration_since_start.as_secs() / self.refresh_duration.as_secs();
-        let cookie =
-            monad_wireauth_protocol::cookies::generate_cookie(&self.cookie_secret, time_counter, &addr);
+        let cookie = monad_wireauth_protocol::cookies::generate_cookie(
+            &self.cookie_secret,
+            time_counter,
+            &addr,
+        );
 
         let nonce_counter = self.nonce;
         self.nonce += 1;
@@ -93,10 +95,12 @@ impl Cookies {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rand::rngs::OsRng;
     use std::time::SystemTime;
+
     use monad_wireauth_protocol::handshake::send_handshake_init;
+    use rand::rngs::OsRng;
+
+    use super::*;
 
     #[test]
     fn test_sanity() {

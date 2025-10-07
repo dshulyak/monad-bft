@@ -1,6 +1,7 @@
-use crate::errors::CryptoError;
 use zerocopy::{AsBytes, FromBytes, FromZeroes, LE, U32};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::errors::CryptoError;
 
 pub const CIPHER_TAG_SIZE: usize = 16;
 pub const MAC_TAG_SIZE: usize = 16;

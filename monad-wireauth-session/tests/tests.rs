@@ -1,11 +1,15 @@
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, SystemTime},
+};
+
+use monad_wireauth_protocol::{
+    common::{PrivateKey, PublicKey, SerializedPublicKey, SessionIndex},
+    cookies,
+    messages::DataPacket,
+};
 use monad_wireauth_session::*;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::{Duration, SystemTime};
-use monad_wireauth_protocol::common::{PrivateKey, PublicKey, SerializedPublicKey, SessionIndex};
-use monad_wireauth_protocol::cookies;
-use monad_wireauth_protocol::messages::DataPacket;
+use rand::{rngs::StdRng, SeedableRng};
 
 struct TestEnv {
     rng: StdRng,
