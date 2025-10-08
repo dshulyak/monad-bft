@@ -7,7 +7,7 @@ use monad_crypto::certificate_signature::{
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub trait AuthenticationProtocol<ST: CertificateSignatureRecoverable> {
-    type Error;
+    type Error: std::fmt::Debug;
     type Header: AsBytes;
 
     fn connect(
@@ -28,6 +28,12 @@ pub trait AuthenticationProtocol<ST: CertificateSignatureRecoverable> {
     fn encrypt_by_public_key(
         &mut self,
         public_key: &CertificateSignaturePubKey<ST>,
+        plaintext: &mut [u8],
+    ) -> Result<Self::Header, Self::Error>;
+
+    fn encrypt_by_socket(
+        &mut self,
+        socket_addr: &SocketAddr,
         plaintext: &mut [u8],
     ) -> Result<Self::Header, Self::Error>;
 
@@ -94,6 +100,14 @@ impl AuthenticationProtocol<monad_secp::SecpSignature> for WireAuthProtocol {
         self.api.encrypt_by_public_key(&wireauth_pubkey, plaintext)
     }
 
+    fn encrypt_by_socket(
+        &mut self,
+        socket_addr: &SocketAddr,
+        plaintext: &mut [u8],
+    ) -> Result<Self::Header, Self::Error> {
+        self.api.encrypt_by_socket(socket_addr, plaintext)
+    }
+
     fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)> {
         self.api.next_packet()
     }
@@ -155,6 +169,14 @@ impl<ST: CertificateSignatureRecoverable> AuthenticationProtocol<ST> for NoopAut
     fn encrypt_by_public_key(
         &mut self,
         _public_key: &CertificateSignaturePubKey<ST>,
+        _plaintext: &mut [u8],
+    ) -> Result<Self::Header, Self::Error> {
+        Ok(NoopHeader)
+    }
+
+    fn encrypt_by_socket(
+        &mut self,
+        _socket_addr: &SocketAddr,
         _plaintext: &mut [u8],
     ) -> Result<Self::Header, Self::Error> {
         Ok(NoopHeader)

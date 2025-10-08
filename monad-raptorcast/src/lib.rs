@@ -39,8 +39,7 @@ use monad_crypto::{
 };
 use monad_dataplane::{
     udp::{segment_size_for_mtu, DEFAULT_MTU},
-    BroadcastMsg, DataplaneBuilder, DataplaneReader, DataplaneWriter, RecvTcpMsg, TcpMsg,
-    UnicastMsg,
+    DataplaneBuilder, DataplaneReader, DataplaneWriter, RecvTcpMsg, TcpMsg, UnicastMsg,
 };
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{
@@ -65,6 +64,7 @@ use tracing::{debug, debug_span, error, warn};
 use util::{
     unix_ts_ms_now, BuildTarget, EpochValidators, FullNodes, Group, ReBroadcastGroupMap, Redundancy,
 };
+use zerocopy::AsBytes;
 
 pub mod authentication;
 pub mod config;
@@ -217,6 +217,50 @@ where
         &self.rebroadcast_map
     }
 
+    fn update_auth_connections(&mut self, new_epoch: Epoch, old_epoch: Option<Epoch>) {
+        let pd_driver = self.peer_discovery_driver.lock().unwrap();
+        let new_validators: std::collections::HashSet<_> = self
+            .epoch_validators
+            .get(&new_epoch)
+            .into_iter()
+            .flat_map(|val| val.validators.keys())
+            .collect();
+        let old_validators: std::collections::HashSet<_> = old_epoch
+            .and_then(|epoch| self.epoch_validators.get(&epoch))
+            .into_iter()
+            .flat_map(|val| val.validators.keys())
+            .collect();
+
+        for validator in new_validators.difference(&old_validators) {
+            if let Some(addr) = pd_driver.get_addr(validator) {
+                if let Err(e) = self
+                    .auth_protocol
+                    .connect(&validator.pubkey(), addr, u64::MAX)
+                {
+                    tracing::warn!(
+                        validator = ?validator,
+                        addr = ?addr,
+                        error = ?e,
+                        "failed to connect to validator"
+                    );
+                }
+            }
+        }
+
+        for validator in old_validators.difference(&new_validators) {
+            self.auth_protocol.disconnect(&validator.pubkey());
+        }
+        drop(pd_driver);
+
+        while let Some((addr, packet)) = self.auth_protocol.next_packet() {
+            let stride = packet.len() as u16;
+            self.dataplane_writer.udp_write_unicast(UnicastMsg {
+                msgs: vec![(addr, packet)],
+                stride,
+            });
+        }
+    }
+
     fn enqueue_message_to_self(
         message: OM,
         pending_events: &mut VecDeque<RaptorCastEvent<M::Event, ST>>,
@@ -285,7 +329,7 @@ where
 
         let messages = udp::build_messages::<ST>(
             signing_key,
-            segment_size,
+            segment_size - 32,
             outbound_message,
             redundancy,
             epoch.0,
@@ -300,27 +344,13 @@ where
         }
     }
 
-    fn encrypt_unicast_msg(
-        &mut self,
-        mut unicast_msg: UnicastMsg,
-        known_addresses: &HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddr>,
-        epoch_validators: &BTreeMap<Epoch, EpochValidators<ST>>,
-        current_epoch: Epoch,
-    ) -> UnicastMsg {
-        let addr_to_node: HashMap<SocketAddr, NodeId<CertificateSignaturePubKey<ST>>> =
-            known_addresses.iter().map(|(n, a)| (*a, *n)).collect();
-
+    fn encrypt_unicast_msg(&mut self, unicast_msg: UnicastMsg) -> UnicastMsg {
         let encrypted_msgs: Vec<(SocketAddr, Bytes)> = unicast_msg
             .msgs
             .into_iter()
             .filter_map(|(addr, chunk)| {
-                let node_id = addr_to_node.get(&addr)?;
-
                 let mut plaintext = chunk.to_vec();
-                match self
-                    .auth_protocol
-                    .encrypt_by_public_key(&node_id.pubkey(), &mut plaintext)
-                {
+                match self.auth_protocol.encrypt_by_socket(&addr, &mut plaintext) {
                     Ok(header) => {
                         let header_bytes = header.as_bytes();
                         let mut packet = Vec::with_capacity(header_bytes.len() + plaintext.len());
@@ -331,7 +361,6 @@ where
                     Err(e) => {
                         tracing::warn!(
                             addr = ?addr,
-                            node_id = ?node_id,
                             error = ?e,
                             "failed to encrypt message"
                         );
@@ -439,49 +468,7 @@ where
                             self.dataplane_writer.update_trusted(added, removed);
                         }
 
-                        {
-                            let pd_driver = self.peer_discovery_driver.lock().unwrap();
-                            let new_validators: std::collections::HashSet<_> = self
-                                .epoch_validators
-                                .get(&epoch)
-                                .into_iter()
-                                .flat_map(|val| val.validators.keys())
-                                .collect();
-                            let old_validators: std::collections::HashSet<_> = self
-                                .epoch_validators
-                                .get(&self.current_epoch)
-                                .into_iter()
-                                .flat_map(|val| val.validators.keys())
-                                .collect();
-
-                            for validator in new_validators.difference(&old_validators) {
-                                if let Some(addr) = pd_driver.get_addr(validator) {
-                                    if let Err(e) = self.auth_protocol.connect(
-                                        &validator.pubkey(),
-                                        addr,
-                                        u64::MAX,
-                                    ) {
-                                        tracing::warn!(
-                                            validator = ?validator,
-                                            addr = ?addr,
-                                            error = ?e,
-                                            "failed to connect to validator"
-                                        );
-                                    }
-                                }
-                            }
-
-                            for validator in old_validators.difference(&new_validators) {
-                                self.auth_protocol.disconnect(&validator.pubkey());
-                            }
-                        }
-
-                        while let Some((addr, packet)) = self.auth_protocol.next_packet() {
-                            self.dataplane_writer.udp_write_unicast(UnicastMsg {
-                                msgs: vec![(addr, packet)],
-                                stride: packet.len(),
-                            });
-                        }
+                        self.update_auth_connections(epoch, Some(self.current_epoch));
 
                         self.current_epoch = epoch;
                         while let Some(entry) = self.epoch_validators.first_entry() {
@@ -523,6 +510,7 @@ where
                             },
                         );
                         assert!(removed.is_none());
+                        self.update_auth_connections(epoch, None);
                     }
                     self.peer_discovery_driver.lock().unwrap().update(
                         PeerDiscoveryEvent::UpdateValidatorSet {
@@ -602,13 +590,15 @@ where
                                 self.redundancy,
                                 &known_addresses,
                             );
-                            let encrypted_chunks = self.encrypt_unicast_msg(
-                                rc_chunks,
-                                &known_addresses,
-                                &self.epoch_validators,
-                                epoch,
-                            );
-                            self.dataplane_writer.udp_write_unicast(encrypted_chunks);
+
+                            for (addr, chunk) in rc_chunks.msgs {
+                                let msg = UnicastMsg {
+                                    msgs: vec![(addr, chunk)],
+                                    stride: rc_chunks.stride,
+                                };
+                                let encrypted_msg = self.encrypt_unicast_msg(msg);
+                                self.dataplane_writer.udp_write_unicast(encrypted_msg);
+                            }
                         }
 
                         RouterTarget::PointToPoint(to) => {
@@ -639,12 +629,7 @@ where
                                     self.redundancy,
                                     &known_addresses,
                                 );
-                                let encrypted_chunks = self.encrypt_unicast_msg(
-                                    rc_chunks,
-                                    &known_addresses,
-                                    &self.epoch_validators,
-                                    self.current_epoch,
-                                );
+                                let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
                                 self.dataplane_writer.udp_write_unicast(encrypted_chunks);
                             }
                         }
@@ -673,16 +658,15 @@ where
                     };
                 }
                 RouterCommand::PublishToFullNodes { epoch, message } => {
-                    let full_nodes_view = self.dedicated_full_nodes.view();
                     if self.is_dynamic_fullnode {
                         debug!("self is dynamic full node, skipping publishing to full nodes");
                         continue;
                     }
 
-                    // self as a dedicated full node will have empty
-                    // full_nodes_view, so it won't attempt to
-                    // publish.
-                    if full_nodes_view.is_empty() {
+                    let full_nodes: Vec<_> =
+                        self.dedicated_full_nodes.view().iter().copied().collect();
+
+                    if full_nodes.is_empty() {
                         debug!("full_nodes view empty, skipping publishing to full nodes");
                         continue;
                     }
@@ -702,7 +686,7 @@ where
                         .lock()
                         .unwrap()
                         .get_known_addresses();
-                    for node in full_nodes_view.iter() {
+                    for node in full_nodes.iter() {
                         if !node_addrs.contains_key(node) {
                             continue;
                         }
@@ -719,12 +703,7 @@ where
                             self.redundancy,
                             &node_addrs,
                         );
-                        let encrypted_chunks = self.encrypt_unicast_msg(
-                            rc_chunks,
-                            &node_addrs,
-                            &self.epoch_validators,
-                            epoch,
-                        );
+                        let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
                         self.dataplane_writer.udp_write_unicast(encrypted_chunks);
                     }
                 }
@@ -843,13 +822,6 @@ where
                 message.src_addr
             );
 
-            let pd_driver = this.peer_discovery_driver.lock().unwrap();
-            let known_addresses = pd_driver.get_known_addresses();
-            drop(pd_driver);
-
-            let addr_to_node: HashMap<SocketAddr, NodeId<CertificateSignaturePubKey<ST>>> =
-                known_addresses.iter().map(|(n, a)| (*a, *n)).collect();
-
             let decrypted_payload = {
                 let mut packet_buf = message.payload.to_vec();
                 match this
@@ -898,10 +870,7 @@ where
                                 let addr = pd_driver.get_addr(&target)?;
 
                                 let mut plaintext = payload.to_vec();
-                                match this
-                                    .auth_protocol
-                                    .encrypt_by_public_key(&target.pubkey(), &mut plaintext)
-                                {
+                                match this.auth_protocol.encrypt_by_socket(&addr, &mut plaintext) {
                                     Ok(header) => {
                                         let header_bytes = header.as_bytes();
                                         let mut packet = Vec::with_capacity(
@@ -913,7 +882,7 @@ where
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            target = ?target,
+                                            addr = ?addr,
                                             error = ?e,
                                             "failed to encrypt rebroadcast message"
                                         );
@@ -1075,42 +1044,34 @@ where
         {
             let mut pd_driver = this.peer_discovery_driver.lock().unwrap();
 
-            let send_peer_disc_msg = |target: NodeId<CertificateSignaturePubKey<ST>>,
-                                      message: PeerDiscoveryMessage<ST>,
-                                      known_addresses: HashMap<
-                NodeId<CertificateSignaturePubKey<ST>>,
-                SocketAddr,
-            >| {
-                let _span = debug_span!("publish discovery").entered();
-                let Ok(router_message) =
-                    OutboundRouterMessage::<OM, ST>::PeerDiscoveryMessage(message).try_serialize()
-                else {
-                    error!("failed to serialize peer discovery message");
-                    return;
-                };
-
-                let unicast_msg = Self::udp_build(
-                    &this.current_epoch,
-                    BuildTarget::<ST>::PointToPoint(&target),
-                    router_message,
-                    this.mtu,
-                    &this.signing_key,
-                    this.redundancy,
-                    &known_addresses,
-                );
-                let encrypted_msg = this.encrypt_unicast_msg(
-                    unicast_msg,
-                    &known_addresses,
-                    &this.epoch_validators,
-                    this.current_epoch,
-                );
-                this.dataplane_writer.udp_write_unicast(encrypted_msg);
-            };
-
             while let Poll::Ready(Some(peer_disc_emit)) = pd_driver.poll_next_unpin(cx) {
                 match peer_disc_emit {
                     PeerDiscoveryEmit::RouterCommand { target, message } => {
-                        send_peer_disc_msg(target, message, pd_driver.get_known_addresses());
+                        let known_addresses = pd_driver.get_known_addresses();
+                        drop(pd_driver);
+
+                        let _span = debug_span!("publish discovery").entered();
+                        let Ok(router_message) =
+                            OutboundRouterMessage::<OM, ST>::PeerDiscoveryMessage(message)
+                                .try_serialize()
+                        else {
+                            error!("failed to serialize peer discovery message");
+                            pd_driver = this.peer_discovery_driver.lock().unwrap();
+                            continue;
+                        };
+
+                        let unicast_msg = Self::udp_build(
+                            &this.current_epoch,
+                            BuildTarget::<ST>::PointToPoint(&target),
+                            router_message,
+                            this.mtu,
+                            &this.signing_key,
+                            this.redundancy,
+                            &known_addresses,
+                        );
+                        let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
+                        this.dataplane_writer.udp_write_unicast(encrypted_msg);
+                        pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::PingPongCommand {
                         target,
@@ -1118,10 +1079,35 @@ where
                         message,
                     } => {
                         let addrs = HashMap::from_iter([(target, SocketAddr::V4(socket_address))]);
-                        send_peer_disc_msg(target, message, addrs);
+                        drop(pd_driver);
+
+                        let _span = debug_span!("publish discovery").entered();
+                        let Ok(router_message) =
+                            OutboundRouterMessage::<OM, ST>::PeerDiscoveryMessage(message)
+                                .try_serialize()
+                        else {
+                            error!("failed to serialize peer discovery message");
+                            pd_driver = this.peer_discovery_driver.lock().unwrap();
+                            continue;
+                        };
+
+                        let unicast_msg = Self::udp_build(
+                            &this.current_epoch,
+                            BuildTarget::<ST>::PointToPoint(&target),
+                            router_message,
+                            this.mtu,
+                            &this.signing_key,
+                            this.redundancy,
+                            &addrs,
+                        );
+                        let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
+                        this.dataplane_writer.udp_write_unicast(encrypted_msg);
+                        pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::MetricsCommand(executor_metrics) => {
+                        drop(pd_driver);
                         this.peer_discovery_metrics = executor_metrics;
+                        pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                 }
             }
@@ -1134,9 +1120,10 @@ where
                 }
                 this.auth_protocol.tick();
                 while let Some((addr, packet)) = this.auth_protocol.next_packet() {
+                    let stride = packet.len() as u16;
                     this.dataplane_writer.udp_write_unicast(UnicastMsg {
                         msgs: vec![(addr, packet)],
-                        stride: packet.len(),
+                        stride,
                     });
                 }
                 this.auth_timer = None;

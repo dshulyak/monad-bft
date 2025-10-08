@@ -5756,6 +5756,7 @@ dependencies = [
 name = "monad-raptorcast"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "alloy-rlp",
  "bitvec",
  "bytes",
@@ -5788,9 +5789,13 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rstest",
+ "serde",
  "thiserror 1.0.69",
+ "tikv-jemallocator",
  "tokio",
+ "toml",
  "tracing",
+ "tracing-manytrace",
  "tracing-subscriber",
  "zerocopy",
 ]
