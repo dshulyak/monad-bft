@@ -157,12 +157,14 @@ where
                 let pdd = PeerDiscoveryDriver::new(peer_discovery_builder);
                 let shared_peer_discovery_driver = Arc::new(Mutex::new(pdd));
                 let (dp_reader, dp_writer) = dataplane_builder.build().split();
+                let auth_protocol = monad_raptorcast::authentication::NoopAuthProtocol::new();
                 Updater::boxed(RaptorCast::<
                     ST,
                     MonadMessage<ST, SCT, MockExecutionProtocol>,
                     VerifiedMonadMessage<ST, SCT, MockExecutionProtocol>,
                     MonadEvent<ST, SCT, MockExecutionProtocol>,
                     NopDiscovery<ST>,
+                    _,
                 >::new(
                     cfg,
                     SecondaryRaptorCastModeConfig::None,
@@ -170,6 +172,7 @@ where
                     dp_writer,
                     shared_peer_discovery_driver,
                     Epoch(0),
+                    auth_protocol,
                 ))
             }
         },

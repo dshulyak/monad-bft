@@ -50,14 +50,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
 //==============================================================================
-pub struct MultiRouter<ST, M, OM, SE, PD>
+pub struct MultiRouter<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: monad_raptorcast::authentication::AuthenticationProtocol<ST>,
 {
-    rc_primary: RaptorCast<ST, M, OM, SE, PD>,
+    rc_primary: RaptorCast<ST, M, OM, SE, PD, AP>,
     rc_secondary: Option<RaptorCastSecondary<ST, M, OM, SE, PD>>,
 
     // raptorcast config is stored for future role change
@@ -71,12 +72,13 @@ where
     phantom: PhantomData<(OM, SE)>,
 }
 
-impl<ST, M, OM, SE, PD> MultiRouter<ST, M, OM, SE, PD>
+impl<ST, M, OM, SE, PD, AP> MultiRouter<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: monad_raptorcast::authentication::AuthenticationProtocol<ST>,
 {
     pub fn new<B>(
         self_node_id: NodeId<CertificateSignaturePubKey<ST>>,
@@ -128,6 +130,7 @@ where
             current_epoch,
         );
 
+        let auth_protocol = monad_raptorcast::authentication::NoopAuthProtocol::new();
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
@@ -135,6 +138,7 @@ where
             dp_writer.clone(),
             shared_pdd.clone(),
             current_epoch,
+            auth_protocol,
         );
         rc_primary.bind_channel_to_secondary_raptorcast(send_net_messages, recv_group_infos);
 
@@ -253,13 +257,14 @@ where
 }
 
 //==============================================================================
-impl<ST, M, OM, SE, PD> Executor for MultiRouter<ST, M, OM, SE, PD>
+impl<ST, M, OM, SE, PD, AP> Executor for MultiRouter<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    RaptorCast<ST, M, OM, SE, PD>: Unpin,
+    AP: monad_raptorcast::authentication::AuthenticationProtocol<ST>,
+    RaptorCast<ST, M, OM, SE, PD, AP>: Unpin,
 {
     type Command = RouterCommand<ST, OM>;
 
@@ -398,14 +403,15 @@ where
 }
 
 //==============================================================================
-impl<ST, M, OM, E, PD> Stream for MultiRouter<ST, M, OM, E, PD>
+impl<ST, M, OM, E, PD, AP> Stream for MultiRouter<ST, M, OM, E, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     E: From<RaptorCastEvent<M::Event, ST>>,
     Self: Unpin,
-    RaptorCast<ST, M, OM, E, PD>: Unpin,
+    AP: monad_raptorcast::authentication::AuthenticationProtocol<ST>,
+    RaptorCast<ST, M, OM, E, PD, AP>: Unpin,
     RaptorCastSecondary<ST, M, OM, E, PD>: Unpin,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     PeerDiscoveryDriver<PD>: Unpin,

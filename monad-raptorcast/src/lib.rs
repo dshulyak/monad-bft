@@ -57,7 +57,10 @@ use monad_peer_discovery::{
 use monad_types::{DropTimer, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget};
 use monad_validator::signature_collection::SignatureCollection;
 use raptorcast_secondary::{group_message::FullNodesGroupMessage, SecondaryRaptorCastModeConfig};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    time::Sleep,
+};
 use tracing::{debug, debug_span, error, warn};
 use util::{
     unix_ts_ms_now, BuildTarget, EpochValidators, FullNodes, Group, ReBroadcastGroupMap, Redundancy,
@@ -73,14 +76,16 @@ pub mod util;
 
 const SIGNATURE_SIZE: usize = 65;
 
-pub struct RaptorCast<ST, M, OM, SE, PD>
+pub struct RaptorCast<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: authentication::AuthenticationProtocol<ST>,
 {
     signing_key: Arc<ST::KeyPairType>,
+    auth_protocol: AP,
     redundancy: Redundancy,
     is_dynamic_fullnode: bool,
 
@@ -103,6 +108,7 @@ where
     channel_to_secondary: Option<UnboundedSender<FullNodesGroupMessage<ST>>>,
     channel_from_secondary: Option<UnboundedReceiver<Group<ST>>>,
 
+    auth_timer: Option<Pin<Box<Sleep>>>,
     waker: Option<Waker>,
     metrics: ExecutorMetrics,
     peer_discovery_metrics: ExecutorMetrics,
@@ -120,12 +126,13 @@ pub enum RaptorCastEvent<E, ST: CertificateSignatureRecoverable> {
     SecondaryRaptorcastPeersUpdate(Vec<NodeId<CertificateSignaturePubKey<ST>>>),
 }
 
-impl<ST, M, OM, SE, PD> RaptorCast<ST, M, OM, SE, PD>
+impl<ST, M, OM, SE, PD, AP> RaptorCast<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: authentication::AuthenticationProtocol<ST>,
 {
     pub fn new(
         config: config::RaptorCastConfig<ST>,
@@ -134,6 +141,7 @@ where
         dataplane_writer: DataplaneWriter,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
+        auth_protocol: AP,
     ) -> Self {
         if config.primary_instance.raptor10_redundancy < 1f32 {
             panic!(
@@ -157,6 +165,7 @@ where
             peer_discovery_driver,
 
             signing_key: config.shared_key.clone(),
+            auth_protocol,
             redundancy: Redundancy::from_f32(config.primary_instance.raptor10_redundancy)
                 .expect("primary raptor10_redundancy doesn't fit"),
 
@@ -171,6 +180,7 @@ where
             channel_to_secondary: None,
             channel_from_secondary: None,
 
+            auth_timer: None,
             waker: None,
             metrics: Default::default(),
             peer_discovery_metrics: Default::default(),
@@ -289,13 +299,60 @@ where
             stride: segment_size,
         }
     }
+
+    fn encrypt_unicast_msg(
+        &mut self,
+        mut unicast_msg: UnicastMsg,
+        known_addresses: &HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddr>,
+        epoch_validators: &BTreeMap<Epoch, EpochValidators<ST>>,
+        current_epoch: Epoch,
+    ) -> UnicastMsg {
+        let addr_to_node: HashMap<SocketAddr, NodeId<CertificateSignaturePubKey<ST>>> =
+            known_addresses.iter().map(|(n, a)| (*a, *n)).collect();
+
+        let encrypted_msgs: Vec<(SocketAddr, Bytes)> = unicast_msg
+            .msgs
+            .into_iter()
+            .filter_map(|(addr, chunk)| {
+                let node_id = addr_to_node.get(&addr)?;
+
+                let mut plaintext = chunk.to_vec();
+                match self
+                    .auth_protocol
+                    .encrypt_by_public_key(&node_id.pubkey(), &mut plaintext)
+                {
+                    Ok(header) => {
+                        let header_bytes = header.as_bytes();
+                        let mut packet = Vec::with_capacity(header_bytes.len() + plaintext.len());
+                        packet.extend_from_slice(header_bytes);
+                        packet.extend_from_slice(&plaintext);
+                        Some((addr, Bytes::from(packet)))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            addr = ?addr,
+                            node_id = ?node_id,
+                            error = ?e,
+                            "failed to encrypt message"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        UnicastMsg {
+            msgs: encrypted_msgs,
+            stride: unicast_msg.stride,
+        }
+    }
 }
 
 pub fn new_defaulted_raptorcast_for_tests<ST, M, OM, SE>(
     local_addr: SocketAddr,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     shared_key: Arc<ST::KeyPairType>,
-) -> RaptorCast<ST, M, OM, SE, NopDiscovery<ST>>
+) -> RaptorCast<ST, M, OM, SE, NopDiscovery<ST>, authentication::NoopAuthProtocol<ST>>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
@@ -333,22 +390,25 @@ where
     };
     let pd = PeerDiscoveryDriver::new(peer_discovery_builder);
     let shared_pd = Arc::new(Mutex::new(pd));
-    RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>>::new(
+    let auth_protocol = authentication::NoopAuthProtocol::new();
+    RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, _>::new(
         config,
         SecondaryRaptorCastModeConfig::None,
         dp_reader,
         dp_writer,
         shared_pd,
         Epoch(0),
+        auth_protocol,
     )
 }
 
-impl<ST, M, OM, SE, PD> Executor for RaptorCast<ST, M, OM, SE, PD>
+impl<ST, M, OM, SE, PD, AP> Executor for RaptorCast<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: authentication::AuthenticationProtocol<ST>,
 {
     type Command = RouterCommand<ST, OM>;
 
@@ -377,6 +437,50 @@ where
                                 .collect();
                             drop(pd_driver);
                             self.dataplane_writer.update_trusted(added, removed);
+                        }
+
+                        {
+                            let pd_driver = self.peer_discovery_driver.lock().unwrap();
+                            let new_validators: std::collections::HashSet<_> = self
+                                .epoch_validators
+                                .get(&epoch)
+                                .into_iter()
+                                .flat_map(|val| val.validators.keys())
+                                .collect();
+                            let old_validators: std::collections::HashSet<_> = self
+                                .epoch_validators
+                                .get(&self.current_epoch)
+                                .into_iter()
+                                .flat_map(|val| val.validators.keys())
+                                .collect();
+
+                            for validator in new_validators.difference(&old_validators) {
+                                if let Some(addr) = pd_driver.get_addr(validator) {
+                                    if let Err(e) = self.auth_protocol.connect(
+                                        &validator.pubkey(),
+                                        addr,
+                                        u64::MAX,
+                                    ) {
+                                        tracing::warn!(
+                                            validator = ?validator,
+                                            addr = ?addr,
+                                            error = ?e,
+                                            "failed to connect to validator"
+                                        );
+                                    }
+                                }
+                            }
+
+                            for validator in old_validators.difference(&new_validators) {
+                                self.auth_protocol.disconnect(&validator.pubkey());
+                            }
+                        }
+
+                        while let Some((addr, packet)) = self.auth_protocol.next_packet() {
+                            self.dataplane_writer.udp_write_unicast(UnicastMsg {
+                                msgs: vec![(addr, packet)],
+                                stride: packet.len(),
+                            });
                         }
 
                         self.current_epoch = epoch;
@@ -498,7 +602,13 @@ where
                                 self.redundancy,
                                 &known_addresses,
                             );
-                            self.dataplane_writer.udp_write_unicast(rc_chunks);
+                            let encrypted_chunks = self.encrypt_unicast_msg(
+                                rc_chunks,
+                                &known_addresses,
+                                &self.epoch_validators,
+                                epoch,
+                            );
+                            self.dataplane_writer.udp_write_unicast(encrypted_chunks);
                         }
 
                         RouterTarget::PointToPoint(to) => {
@@ -529,7 +639,13 @@ where
                                     self.redundancy,
                                     &known_addresses,
                                 );
-                                self.dataplane_writer.udp_write_unicast(rc_chunks);
+                                let encrypted_chunks = self.encrypt_unicast_msg(
+                                    rc_chunks,
+                                    &known_addresses,
+                                    &self.epoch_validators,
+                                    self.current_epoch,
+                                );
+                                self.dataplane_writer.udp_write_unicast(encrypted_chunks);
                             }
                         }
 
@@ -603,7 +719,13 @@ where
                             self.redundancy,
                             &node_addrs,
                         );
-                        self.dataplane_writer.udp_write_unicast(rc_chunks);
+                        let encrypted_chunks = self.encrypt_unicast_msg(
+                            rc_chunks,
+                            &node_addrs,
+                            &self.epoch_validators,
+                            epoch,
+                        );
+                        self.dataplane_writer.udp_write_unicast(encrypted_chunks);
                     }
                 }
                 RouterCommand::GetPeers => {
@@ -683,13 +805,14 @@ fn iter_ips<'a, ST: CertificateSignatureRecoverable, PD: PeerDiscoveryAlgo<Signa
         .map(|socket| socket.ip())
 }
 
-impl<ST, M, OM, E, PD> Stream for RaptorCast<ST, M, OM, E, PD>
+impl<ST, M, OM, E, PD, AP> Stream for RaptorCast<ST, M, OM, E, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     E: From<RaptorCastEvent<M::Event, ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: authentication::AuthenticationProtocol<ST>,
     PeerDiscoveryDriver<PD>: Unpin,
     Self: Unpin,
 {
@@ -720,6 +843,40 @@ where
                 message.src_addr
             );
 
+            let pd_driver = this.peer_discovery_driver.lock().unwrap();
+            let known_addresses = pd_driver.get_known_addresses();
+            drop(pd_driver);
+
+            let addr_to_node: HashMap<SocketAddr, NodeId<CertificateSignaturePubKey<ST>>> =
+                known_addresses.iter().map(|(n, a)| (*a, *n)).collect();
+
+            let decrypted_payload = {
+                let mut packet_buf = message.payload.to_vec();
+                match this
+                    .auth_protocol
+                    .dispatch(&mut packet_buf, message.src_addr)
+                {
+                    Ok(Some(plaintext)) => plaintext,
+                    Ok(None) => {
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            src_addr = ?message.src_addr,
+                            error = ?e,
+                            "failed to decrypt message"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            let decrypted_message = monad_dataplane::RecvUdpMsg {
+                src_addr: message.src_addr,
+                payload: decrypted_payload,
+                stride: message.stride,
+            };
+
             // Enter the received raptorcast chunk into the udp_state for reassembly.
             // If the field "first-hop recipient" in the chunk has our node Id, then
             // we are responsible for broadcasting this chunk to other validators.
@@ -733,21 +890,46 @@ where
                     &this.rebroadcast_map, // contains the NodeIds for all the RC participants for each epoch
                     &this.epoch_validators,
                     |targets, payload, bcast_stride| {
-                        // Callback for re-broadcasting raptorcast chunks to other RaptorCast participants (validator peers)
-                        let target_addrs: Vec<SocketAddr> = targets
+                        let pd_driver = this.peer_discovery_driver.lock().unwrap();
+
+                        let encrypted_msgs: Vec<(SocketAddr, Bytes)> = targets
                             .into_iter()
                             .filter_map(|target| {
-                                this.peer_discovery_driver.lock().unwrap().get_addr(&target)
+                                let addr = pd_driver.get_addr(&target)?;
+
+                                let mut plaintext = payload.to_vec();
+                                match this
+                                    .auth_protocol
+                                    .encrypt_by_public_key(&target.pubkey(), &mut plaintext)
+                                {
+                                    Ok(header) => {
+                                        let header_bytes = header.as_bytes();
+                                        let mut packet = Vec::with_capacity(
+                                            header_bytes.len() + plaintext.len(),
+                                        );
+                                        packet.extend_from_slice(header_bytes);
+                                        packet.extend_from_slice(&plaintext);
+                                        Some((addr, Bytes::from(packet)))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target = ?target,
+                                            error = ?e,
+                                            "failed to encrypt rebroadcast message"
+                                        );
+                                        None
+                                    }
+                                }
                             })
                             .collect();
+                        drop(pd_driver);
 
-                        this.dataplane_writer.udp_write_broadcast(BroadcastMsg {
-                            targets: target_addrs,
-                            payload,
+                        this.dataplane_writer.udp_write_unicast(UnicastMsg {
+                            msgs: encrypted_msgs,
                             stride: bcast_stride,
                         });
                     },
-                    message,
+                    decrypted_message,
                 )
             };
 
@@ -916,7 +1098,13 @@ where
                     this.redundancy,
                     &known_addresses,
                 );
-                this.dataplane_writer.udp_write_unicast(unicast_msg);
+                let encrypted_msg = this.encrypt_unicast_msg(
+                    unicast_msg,
+                    &known_addresses,
+                    &this.epoch_validators,
+                    this.current_epoch,
+                );
+                this.dataplane_writer.udp_write_unicast(encrypted_msg);
             };
 
             while let Poll::Ready(Some(peer_disc_emit)) = pd_driver.poll_next_unpin(cx) {
@@ -936,6 +1124,26 @@ where
                         this.peer_discovery_metrics = executor_metrics;
                     }
                 }
+            }
+        }
+
+        loop {
+            if let Some(timer) = this.auth_timer.as_mut() {
+                if timer.as_mut().poll(cx).is_pending() {
+                    break;
+                }
+                this.auth_protocol.tick();
+                while let Some((addr, packet)) = this.auth_protocol.next_packet() {
+                    this.dataplane_writer.udp_write_unicast(UnicastMsg {
+                        msgs: vec![(addr, packet)],
+                        stride: packet.len(),
+                    });
+                }
+                this.auth_timer = None;
+            } else if let Some(duration) = this.auth_protocol.next_timer() {
+                this.auth_timer = Some(Box::pin(tokio::time::sleep(duration)));
+            } else {
+                break;
             }
         }
 

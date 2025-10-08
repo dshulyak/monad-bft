@@ -17,6 +17,8 @@ pub trait AuthenticationProtocol<ST: CertificateSignatureRecoverable> {
         retry_attempts: u64,
     ) -> Result<(), Self::Error>;
 
+    fn disconnect(&mut self, remote_public_key: &CertificateSignaturePubKey<ST>);
+
     fn dispatch(
         &mut self,
         packet: &mut [u8],
@@ -68,6 +70,11 @@ impl AuthenticationProtocol<monad_secp::SecpSignature> for WireAuthProtocol {
         let wireauth_pubkey = remote_public_key.to_inner().into();
         self.api
             .connect(wireauth_pubkey, remote_addr, retry_attempts)
+    }
+
+    fn disconnect(&mut self, remote_public_key: &monad_secp::PubKey) {
+        let wireauth_pubkey = remote_public_key.to_inner().into();
+        self.api.disconnect(&wireauth_pubkey)
     }
 
     fn dispatch(
@@ -134,6 +141,8 @@ impl<ST: CertificateSignatureRecoverable> AuthenticationProtocol<ST> for NoopAut
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    fn disconnect(&mut self, _remote_public_key: &CertificateSignaturePubKey<ST>) {}
 
     fn dispatch(
         &mut self,
