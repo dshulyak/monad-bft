@@ -39,7 +39,8 @@ use monad_crypto::{
 };
 use monad_dataplane::{
     udp::{segment_size_for_mtu, DEFAULT_MTU},
-    DataplaneBuilder, DataplaneReader, DataplaneWriter, RecvTcpMsg, TcpMsg, UnicastMsg,
+    BroadcastMsg, DataplaneBuilder, DataplaneReader, DataplaneWriter, RecvTcpMsg, TcpMsg,
+    UdpSocketHandle, UnicastMsg,
 };
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{
@@ -76,6 +77,8 @@ pub mod util;
 
 const SIGNATURE_SIZE: usize = 65;
 
+const RAPTORCAST_SOCKET: &str = "raptorcast";
+
 pub struct RaptorCast<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
@@ -89,7 +92,6 @@ where
     redundancy: Redundancy,
     is_dynamic_fullnode: bool,
 
-    // Raptorcast group with stake information. For the send side (i.e., initiating proposals)
     epoch_validators: BTreeMap<Epoch, EpochValidators<ST>>,
     rebroadcast_map: ReBroadcastGroupMap<ST>,
 
@@ -103,6 +105,7 @@ where
 
     dataplane_reader: DataplaneReader,
     dataplane_writer: DataplaneWriter,
+    udp_socket: UdpSocketHandle,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
     channel_to_secondary: Option<UnboundedSender<FullNodesGroupMessage<ST>>>,
@@ -139,6 +142,7 @@ where
         secondary_mode: SecondaryRaptorCastModeConfig,
         dataplane_reader: DataplaneReader,
         dataplane_writer: DataplaneWriter,
+        udp_socket: UdpSocketHandle,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
         auth_protocol: AP,
@@ -176,6 +180,7 @@ where
 
             dataplane_reader,
             dataplane_writer,
+            udp_socket,
             pending_events: Default::default(),
             channel_to_secondary: None,
             channel_from_secondary: None,
@@ -254,7 +259,7 @@ where
 
         while let Some((addr, packet)) = self.auth_protocol.next_packet() {
             let stride = packet.len() as u16;
-            self.dataplane_writer.udp_write_unicast(UnicastMsg {
+            self.udp_socket.write_unicast(UnicastMsg {
                 msgs: vec![(addr, packet)],
                 stride,
             });
@@ -393,8 +398,11 @@ where
         ..Default::default()
     };
     let up_bandwidth_mbps = 1_000;
-    let dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps).build();
+    let mut dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps).build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
+    let udp_socket = dp
+        .take_udp_socket_handle(RAPTORCAST_SOCKET)
+        .expect("raptorcast socket");
     let (dp_reader, dp_writer) = dp.split();
     let config = config::RaptorCastConfig {
         shared_key,
@@ -426,6 +434,7 @@ where
         SecondaryRaptorCastModeConfig::None,
         dp_reader,
         dp_writer,
+        udp_socket,
         shared_pd,
         Epoch(0),
         auth_protocol,
@@ -592,15 +601,8 @@ where
                                 &known_addresses,
                                 AP::HEADER_SIZE,
                             );
-
-                            for (addr, chunk) in rc_chunks.msgs {
-                                let msg = UnicastMsg {
-                                    msgs: vec![(addr, chunk)],
-                                    stride: rc_chunks.stride,
-                                };
-                                let encrypted_msg = self.encrypt_unicast_msg(msg);
-                                self.dataplane_writer.udp_write_unicast(encrypted_msg);
-                            }
+                            let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
+                            self.udp_socket.write_unicast(encrypted_chunks);
                         }
 
                         RouterTarget::PointToPoint(to) => {
@@ -633,7 +635,7 @@ where
                                     AP::HEADER_SIZE,
                                 );
                                 let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
-                                self.dataplane_writer.udp_write_unicast(encrypted_chunks);
+                                self.udp_socket.write_unicast(encrypted_chunks);
                             }
                         }
 
@@ -708,7 +710,7 @@ where
                             AP::HEADER_SIZE,
                         );
                         let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
-                        self.dataplane_writer.udp_write_unicast(encrypted_chunks);
+                        self.udp_socket.write_unicast(encrypted_chunks);
                     }
                 }
                 RouterCommand::GetPeers => {
@@ -815,8 +817,7 @@ where
         }
 
         loop {
-            let dataplane = &mut this.dataplane_reader;
-            let Poll::Ready(message) = pin!(dataplane.udp_read()).poll_unpin(cx) else {
+            let Poll::Ready(message) = pin!(this.udp_socket.recv()).poll_unpin(cx) else {
                 break;
             };
 
@@ -897,7 +898,7 @@ where
                             .collect();
                         drop(pd_driver);
 
-                        this.dataplane_writer.udp_write_unicast(UnicastMsg {
+                        this.udp_socket.write_unicast(UnicastMsg {
                             msgs: encrypted_msgs,
                             stride: bcast_stride,
                         });
@@ -1075,7 +1076,7 @@ where
                             AP::HEADER_SIZE,
                         );
                         let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
-                        this.dataplane_writer.udp_write_unicast(encrypted_msg);
+                        this.udp_socket.write_unicast(encrypted_msg);
                         pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::PingPongCommand {
@@ -1107,7 +1108,7 @@ where
                             AP::HEADER_SIZE,
                         );
                         let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
-                        this.dataplane_writer.udp_write_unicast(encrypted_msg);
+                        this.udp_socket.write_unicast(encrypted_msg);
                         pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::MetricsCommand(executor_metrics) => {
@@ -1127,7 +1128,7 @@ where
                 this.auth_protocol.tick();
                 while let Some((addr, packet)) = this.auth_protocol.next_packet() {
                     let stride = packet.len() as u16;
-                    this.dataplane_writer.udp_write_unicast(UnicastMsg {
+                    this.udp_socket.write_unicast(UnicastMsg {
                         msgs: vec![(addr, packet)],
                         stride,
                     });
