@@ -10,6 +10,8 @@ pub trait AuthenticationProtocol<ST: CertificateSignatureRecoverable> {
     type Error: std::fmt::Debug;
     type Header: AsBytes;
 
+    const HEADER_SIZE: u16;
+
     fn connect(
         &mut self,
         remote_public_key: &CertificateSignaturePubKey<ST>,
@@ -66,6 +68,8 @@ impl WireAuthProtocol {
 impl AuthenticationProtocol<monad_secp::SecpSignature> for WireAuthProtocol {
     type Error = monad_wireauth_api::Error;
     type Header = monad_wireauth_protocol::messages::DataPacketHeader;
+
+    const HEADER_SIZE: u16 = 32;
 
     fn connect(
         &mut self,
@@ -146,6 +150,8 @@ impl<ST: CertificateSignatureRecoverable> Default for NoopAuthProtocol<ST> {
 impl<ST: CertificateSignatureRecoverable> AuthenticationProtocol<ST> for NoopAuthProtocol<ST> {
     type Error = std::convert::Infallible;
     type Header = NoopHeader;
+
+    const HEADER_SIZE: u16 = 0;
 
     fn connect(
         &mut self,

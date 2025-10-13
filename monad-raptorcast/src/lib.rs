@@ -322,6 +322,7 @@ where
         signing_key: &Arc<ST::KeyPairType>,
         redundancy: Redundancy,
         known_addresses: &HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddr>,
+        header_size: u16,
     ) -> UnicastMsg {
         let segment_size = segment_size_for_mtu(mtu);
 
@@ -329,7 +330,7 @@ where
 
         let messages = udp::build_messages::<ST>(
             signing_key,
-            segment_size - 32,
+            segment_size - header_size,
             outbound_message,
             redundancy,
             epoch.0,
@@ -589,6 +590,7 @@ where
                                 &self.signing_key,
                                 self.redundancy,
                                 &known_addresses,
+                                AP::HEADER_SIZE,
                             );
 
                             for (addr, chunk) in rc_chunks.msgs {
@@ -628,6 +630,7 @@ where
                                     &self.signing_key,
                                     self.redundancy,
                                     &known_addresses,
+                                    AP::HEADER_SIZE,
                                 );
                                 let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
                                 self.dataplane_writer.udp_write_unicast(encrypted_chunks);
@@ -702,6 +705,7 @@ where
                             &self.signing_key,
                             self.redundancy,
                             &node_addrs,
+                            AP::HEADER_SIZE,
                         );
                         let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
                         self.dataplane_writer.udp_write_unicast(encrypted_chunks);
@@ -1068,6 +1072,7 @@ where
                             &this.signing_key,
                             this.redundancy,
                             &known_addresses,
+                            AP::HEADER_SIZE,
                         );
                         let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
                         this.dataplane_writer.udp_write_unicast(encrypted_msg);
@@ -1099,6 +1104,7 @@ where
                             &this.signing_key,
                             this.redundancy,
                             &addrs,
+                            AP::HEADER_SIZE,
                         );
                         let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
                         this.dataplane_writer.udp_write_unicast(encrypted_msg);
