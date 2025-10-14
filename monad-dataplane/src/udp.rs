@@ -160,12 +160,12 @@ async fn rx_single_socket(socket: UdpSocket, udp_ingress_tx: mpsc::Sender<RecvUd
         let buf = BytesMut::with_capacity(ETHERNET_SEGMENT_SIZE.into());
 
         match socket.recv_from(buf).await {
-            (Ok((len, src_addr)), buf) => {
-                let payload = buf.freeze();
+            (Ok((len, src_addr)), mut buf) => {
+                buf.truncate(len);
 
                 let msg = RecvUdpMsg {
                     src_addr,
-                    payload,
+                    payload: buf,
                     stride: len.max(1).try_into().unwrap(),
                 };
 

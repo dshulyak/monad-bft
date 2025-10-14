@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -48,12 +48,12 @@ where
         loop {
             let message = self.socket.recv().await;
 
-            let mut packet_buf = message.payload.to_vec();
+            let mut packet_buf = message.payload;
             match self.auth_protocol.dispatch(&mut packet_buf, message.src_addr) {
                 Ok(Some(plaintext)) => {
                     return Ok(RecvUdpMsg {
                         src_addr: message.src_addr,
-                        payload: plaintext,
+                        payload: BytesMut::from(plaintext),
                         stride: message.stride,
                     })
                 }
@@ -66,16 +66,14 @@ where
     }
 
     pub fn write_unicast(&mut self, msg: UnicastMsg) {
-        let encrypted_msgs: Vec<(SocketAddr, Bytes)> = msg
-            .msgs
-            .into_iter()
-            .filter_map(|(addr, chunk)| self.encrypt_packet(addr, chunk))
-            .collect();
-
-        self.socket.write_unicast(UnicastMsg {
-            msgs: encrypted_msgs,
-            stride: msg.stride,
-        });
+        for (addr, chunk) in msg.msgs {
+            if let Some((addr, encrypted_chunk)) = self.encrypt_packet(addr, chunk) {
+                self.socket.write_unicast(UnicastMsg {
+                    msgs: vec![(addr, encrypted_chunk)],
+                    stride: msg.stride,
+                });
+            }
+        }
     }
 
     pub fn connect(
@@ -144,10 +142,10 @@ where
         match self.auth_protocol.encrypt_by_socket(&addr, &mut plaintext) {
             Ok(header) => {
                 let header_bytes = header.as_bytes();
-                let mut packet = Vec::with_capacity(header_bytes.len() + plaintext.len());
+                let mut packet = BytesMut::with_capacity(header_bytes.len() + plaintext.len());
                 packet.extend_from_slice(header_bytes);
                 packet.extend_from_slice(&plaintext);
-                Some((addr, Bytes::from(packet)))
+                Some((addr, packet.freeze()))
             }
             Err(e) => {
                 tracing::warn!(

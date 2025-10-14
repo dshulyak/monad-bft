@@ -25,7 +25,7 @@ use std::{
 };
 
 use addrlist::Addrlist;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
 use monoio::{spawn, time::Instant, IoUringDriver, RuntimeBuilder};
 use tcp::{TcpConfig, TcpControl, TcpRateLimit};
@@ -473,7 +473,7 @@ impl UnicastMsg {
 #[derive(Clone)]
 pub struct RecvUdpMsg {
     pub src_addr: SocketAddr,
-    pub payload: Bytes,
+    pub payload: BytesMut,
     pub stride: u16,
 }
 

@@ -122,23 +122,24 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
         let self_id = self.self_id;
         let self_hash = compute_hash(&self_id);
 
+        let payload = message.payload.freeze();
         let mut broadcast_batcher =
-            BroadcastBatcher::new(self_id, rebroadcast, &message.payload, message.stride);
+            BroadcastBatcher::new(self_id, rebroadcast, &payload, message.stride);
 
         let mut messages = Vec::new(); // The return result; decoded messages
 
-        for payload_start_idx in (0..message.payload.len()).step_by(message.stride.into()) {
+        for payload_start_idx in (0..payload.len()).step_by(message.stride.into()) {
             // scoped variables are dropped in reverse order of declaration.
             // when *batch_guard is dropped, packets can get flushed
             let mut batch_guard = broadcast_batcher.create_flush_guard();
 
             let payload_end_idx =
-                (payload_start_idx + usize::from(message.stride)).min(message.payload.len());
-            let payload = message.payload.slice(payload_start_idx..payload_end_idx);
+                (payload_start_idx + usize::from(message.stride)).min(payload.len());
+            let payload_slice = payload.slice(payload_start_idx..payload_end_idx);
             // "message" here means a raptor-casted chunk (AKA r10 symbol), not the whole final message (proposal)
             let parsed_message = match parse_message::<ST>(
                 &mut self.signature_cache,
-                payload,
+                payload_slice,
                 self.max_age_ms,
             ) {
                 Ok(message) => message,
@@ -1506,7 +1507,7 @@ mod tests {
         let mut udp_state = UdpState::<SignatureType>::new(self_id, u64::MAX);
 
         // payload will fail to parse but shouldn't panic on index error
-        let payload: Bytes = vec![1_u8; 1024 * 8 + 1].into();
+        let payload = BytesMut::from(&vec![1_u8; 1024 * 8 + 1][..]);
         let recv_msg = RecvUdpMsg {
             src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
             payload,
