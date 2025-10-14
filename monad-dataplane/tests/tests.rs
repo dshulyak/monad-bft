@@ -30,8 +30,8 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 const UP_BANDWIDTH_MBPS: u64 = 1_000;
 
-const LEGACY_SOCKET: &str = "legacy";
-const DIRECT_SOCKET: &str = "direct";
+const AUTHENTICATED_SOCKET: &str = "authenticated";
+const NON_AUTHENTICATED_SOCKET: &str = "non-authenticated";
 
 static ONCE_SETUP: Once = Once::new();
 
@@ -63,8 +63,8 @@ fn udp_broadcast() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let tx_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
     tx_socket.write_broadcast(BroadcastMsg {
         targets: vec![rx_addr; num_msgs],
@@ -99,8 +99,8 @@ fn udp_unicast() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let tx_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
     tx_socket.write_unicast(UnicastMsg {
         msgs: vec![(rx_addr, payload.clone().into()); num_msgs],
@@ -134,13 +134,13 @@ fn udp_direct_socket() {
     let mut rx = DataplaneBuilder::new(&rx_addr, UP_BANDWIDTH_MBPS)
         .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
             socket_addr: rx_direct_addr,
-            label: DIRECT_SOCKET.to_string(),
+            label: NON_AUTHENTICATED_SOCKET.to_string(),
         }])
         .build();
     let mut tx = DataplaneBuilder::new(&tx_addr, UP_BANDWIDTH_MBPS)
         .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
             socket_addr: tx_direct_addr,
-            label: DIRECT_SOCKET.to_string(),
+            label: NON_AUTHENTICATED_SOCKET.to_string(),
         }])
         .build();
 
@@ -151,29 +151,29 @@ fn udp_direct_socket() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_legacy_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let mut rx_direct_socket = rx.take_udp_socket_handle(DIRECT_SOCKET).unwrap();
-    let tx_legacy_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_direct_socket = tx.take_udp_socket_handle(DIRECT_SOCKET).unwrap();
+    let mut rx_authenticated_socket = rx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let mut rx_non_authenticated_socket = rx.take_udp_socket_handle(NON_AUTHENTICATED_SOCKET).unwrap();
+    let tx_authenticated_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let tx_non_authenticated_socket = tx.take_udp_socket_handle(NON_AUTHENTICATED_SOCKET).unwrap();
 
-    tx_legacy_socket.write_broadcast(BroadcastMsg {
+    tx_authenticated_socket.write_broadcast(BroadcastMsg {
         targets: vec![rx_addr; num_msgs / 2],
         payload: payload.clone().into(),
         stride: DEFAULT_SEGMENT_SIZE,
     });
 
     for _ in 0..num_msgs / 2 {
-        tx_direct_socket.write(rx_direct_addr, payload.clone().into(), DEFAULT_SEGMENT_SIZE);
+        tx_non_authenticated_socket.write(rx_direct_addr, payload.clone().into(), DEFAULT_SEGMENT_SIZE);
     }
 
     for _ in 0..num_msgs / 2 {
-        let msg: RecvUdpMsg = executor::block_on(rx_legacy_socket.recv());
+        let msg: RecvUdpMsg = executor::block_on(rx_authenticated_socket.recv());
         assert_eq!(msg.src_addr, tx_addr);
         assert_eq!(msg.payload, payload);
     }
 
     for _ in 0..num_msgs / 2 {
-        let msg: RecvUdpMsg = executor::block_on(rx_direct_socket.recv());
+        let msg: RecvUdpMsg = executor::block_on(rx_non_authenticated_socket.recv());
         assert_eq!(msg.src_addr.ip(), tx_addr.ip());
         assert_eq!(msg.payload, payload);
     }
@@ -528,8 +528,8 @@ fn broadcast_all_strides() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let tx_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
     for stride in MINIMUM_SEGMENT_SIZE..=DEFAULT_SEGMENT_SIZE {
         tx_socket.write_broadcast(BroadcastMsg {
@@ -576,8 +576,8 @@ fn unicast_all_strides() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let mut rx_socket = rx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let mut rx_socket = rx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
+    let tx_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
     for stride in MINIMUM_SEGMENT_SIZE..=DEFAULT_SEGMENT_SIZE {
         tx_socket.write_unicast(UnicastMsg {
@@ -817,7 +817,7 @@ fn udp_large_stride() {
         .map(|_| rand::thread_rng().gen_range(0..255))
         .collect();
 
-    let tx_socket = tx.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+    let tx_socket = tx.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
     tx_socket.write_broadcast(BroadcastMsg {
         targets: vec![rx_addr],

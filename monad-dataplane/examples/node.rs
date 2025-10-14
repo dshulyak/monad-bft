@@ -29,7 +29,7 @@ use monad_dataplane::{
     UdpSocketHandle,
 };
 
-const LEGACY_SOCKET: &str = "legacy";
+const AUTHENTICATED_SOCKET: &str = "authenticated";
 use rand::Rng;
 
 const NODE_ONE_ADDR: &str = "127.0.0.1:60000";
@@ -120,7 +120,7 @@ struct Node {
 impl Node {
     pub fn new(addr: &SocketAddr, target_addr: &str) -> Self {
         let mut dataplane = DataplaneBuilder::new(addr, 1_000).build();
-        let udp_socket = dataplane.take_udp_socket_handle(LEGACY_SOCKET);
+        let udp_socket = dataplane.take_udp_socket_handle(AUTHENTICATED_SOCKET);
         Self {
             dataplane,
             udp_socket,

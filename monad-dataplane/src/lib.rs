@@ -74,7 +74,7 @@ impl DataplaneBuilder {
             ban_duration: Duration::from_secs(5 * 60),
             udp_sockets: vec![UdpSocketConfig {
                 socket_addr: *local_addr,
-                label: "legacy".to_string(),
+                label: "authenticated".to_string(),
             }],
         }
     }

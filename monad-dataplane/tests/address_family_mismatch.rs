@@ -21,7 +21,7 @@ use tracing::debug;
 /// 1_000 = 1 Gbps, 10_000 = 10 Gbps
 const UP_BANDWIDTH_MBPS: u64 = 1_000;
 
-const LEGACY_SOCKET: &str = "legacy";
+const AUTHENTICATED_SOCKET: &str = "authenticated";
 
 const BIND_ADDRS: [&str; 2] = ["0.0.0.0:19100", "127.0.0.1:19101"];
 
@@ -47,7 +47,7 @@ fn address_family_mismatch() {
 
         assert!(dataplane.block_until_ready(Duration::from_secs(1)));
 
-        let socket = dataplane.take_udp_socket_handle(LEGACY_SOCKET).unwrap();
+        let socket = dataplane.take_udp_socket_handle(AUTHENTICATED_SOCKET).unwrap();
 
         for tx_addr in TX_ADDRS {
             debug!("sending to {} from {}", tx_addr, addr);
