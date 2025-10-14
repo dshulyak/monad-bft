@@ -577,8 +577,7 @@ where
                                 &known_addresses,
                                 AP::HEADER_SIZE,
                             );
-                            let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
-                            self.udp_socket.write_unicast(encrypted_chunks);
+                            self.authenticated_socket.write_unicast(rc_chunks);
                         }
 
                         RouterTarget::PointToPoint(to) => {
@@ -610,8 +609,11 @@ where
                                     &known_addresses,
                                     AP::HEADER_SIZE,
                                 );
-                                let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
-                                self.udp_socket.write_unicast(encrypted_chunks);
+                                if self.is_validator(&to) {
+                                    self.authenticated_socket.write_unicast(rc_chunks);
+                                } else {
+                                    self.non_authenticated_socket.write_unicast(rc_chunks);
+                                }
                             }
                         }
 
@@ -683,10 +685,9 @@ where
                             &self.signing_key,
                             self.redundancy,
                             &node_addrs,
-                            AP::HEADER_SIZE,
+                            0,
                         );
-                        let encrypted_chunks = self.encrypt_unicast_msg(rc_chunks);
-                        self.udp_socket.write_unicast(encrypted_chunks);
+                        self.non_authenticated_socket.write_unicast(rc_chunks);
                     }
                 }
                 RouterCommand::GetPeers => {
@@ -793,8 +794,21 @@ where
         }
 
         loop {
-            let Poll::Ready(message) = pin!(this.udp_socket.recv()).poll_unpin(cx) else {
-                break;
+            let message = {
+                let mut auth_recv = pin!(this.authenticated_socket.recv());
+                let mut non_auth_recv = pin!(this.non_authenticated_socket.recv());
+
+                match auth_recv.poll_unpin(cx) {
+                    Poll::Ready(Ok(msg)) => msg,
+                    Poll::Ready(Err(e)) => {
+                        tracing::warn!(error = ?e, "authenticated socket recv error");
+                        continue;
+                    }
+                    Poll::Pending => match non_auth_recv.poll_unpin(cx) {
+                        Poll::Ready(msg) => msg,
+                        Poll::Pending => break,
+                    },
+                }
             };
 
             tracing::trace!(
@@ -803,32 +817,7 @@ where
                 message.src_addr
             );
 
-            let decrypted_payload = {
-                let mut packet_buf = message.payload.to_vec();
-                match this
-                    .auth_protocol
-                    .dispatch(&mut packet_buf, message.src_addr)
-                {
-                    Ok(Some(plaintext)) => plaintext,
-                    Ok(None) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            src_addr = ?message.src_addr,
-                            error = ?e,
-                            "failed to decrypt message"
-                        );
-                        continue;
-                    }
-                }
-            };
-
-            let decrypted_message = monad_dataplane::RecvUdpMsg {
-                src_addr: message.src_addr,
-                payload: decrypted_payload,
-                stride: message.stride,
-            };
+            let decrypted_message = message;
 
             // Enter the received raptorcast chunk into the udp_state for reassembly.
             // If the field "first-hop recipient" in the chunk has our node Id, then
@@ -845,37 +834,17 @@ where
                     |targets, payload, bcast_stride| {
                         let pd_driver = this.peer_discovery_driver.lock().unwrap();
 
-                        let encrypted_msgs: Vec<(SocketAddr, Bytes)> = targets
+                        let msgs: Vec<(SocketAddr, Bytes)> = targets
                             .into_iter()
                             .filter_map(|target| {
                                 let addr = pd_driver.get_addr(&target)?;
-
-                                let mut plaintext = payload.to_vec();
-                                match this.auth_protocol.encrypt_by_socket(&addr, &mut plaintext) {
-                                    Ok(header) => {
-                                        let header_bytes = header.as_bytes();
-                                        let mut packet = Vec::with_capacity(
-                                            header_bytes.len() + plaintext.len(),
-                                        );
-                                        packet.extend_from_slice(header_bytes);
-                                        packet.extend_from_slice(&plaintext);
-                                        Some((addr, Bytes::from(packet)))
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            addr = ?addr,
-                                            error = ?e,
-                                            "failed to encrypt rebroadcast message"
-                                        );
-                                        None
-                                    }
-                                }
+                                Some((addr, payload.clone()))
                             })
                             .collect();
                         drop(pd_driver);
 
-                        this.udp_socket.write_unicast(UnicastMsg {
-                            msgs: encrypted_msgs,
+                        this.authenticated_socket.write_unicast(UnicastMsg {
+                            msgs,
                             stride: bcast_stride,
                         });
                     },
@@ -1051,8 +1020,11 @@ where
                             &known_addresses,
                             AP::HEADER_SIZE,
                         );
-                        let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
-                        this.udp_socket.write_unicast(encrypted_msg);
+                        if this.is_validator(&target) {
+                            this.authenticated_socket.write_unicast(unicast_msg);
+                        } else {
+                            this.non_authenticated_socket.write_unicast(unicast_msg);
+                        }
                         pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::PingPongCommand {
@@ -1083,8 +1055,11 @@ where
                             &addrs,
                             AP::HEADER_SIZE,
                         );
-                        let encrypted_msg = this.encrypt_unicast_msg(unicast_msg);
-                        this.udp_socket.write_unicast(encrypted_msg);
+                        if this.is_validator(&target) {
+                            this.authenticated_socket.write_unicast(unicast_msg);
+                        } else {
+                            this.non_authenticated_socket.write_unicast(unicast_msg);
+                        }
                         pd_driver = this.peer_discovery_driver.lock().unwrap();
                     }
                     PeerDiscoveryEmit::MetricsCommand(executor_metrics) => {
@@ -1096,26 +1071,7 @@ where
             }
         }
 
-        loop {
-            if let Some(timer) = this.auth_timer.as_mut() {
-                if timer.as_mut().poll(cx).is_pending() {
-                    break;
-                }
-                this.auth_protocol.tick();
-                while let Some((addr, packet)) = this.auth_protocol.next_packet() {
-                    let stride = packet.len() as u16;
-                    this.udp_socket.write_unicast(UnicastMsg {
-                        msgs: vec![(addr, packet)],
-                        stride,
-                    });
-                }
-                this.auth_timer = None;
-            } else if let Some(duration) = this.auth_protocol.next_timer() {
-                this.auth_timer = Some(Box::pin(tokio::time::sleep(duration)));
-            } else {
-                break;
-            }
-        }
+        this.authenticated_socket.poll_auth_timer(cx);
 
         // The secondary Raptorcast instance (Client) will be periodically sending us
         // updates about new raptorcast groups that we should use when re-broadcasting
