@@ -91,13 +91,18 @@ where
     where
         B: PeerDiscoveryAlgoBuilder<PeerDiscoveryAlgoType = PD>,
     {
-        // Peer discovery needs to be shared among primary and secondary
         let pdd = PeerDiscoveryDriver::new(peer_discovery_builder);
         let shared_pdd = Arc::new(Mutex::new(pdd));
 
-        let dp = dataplane_builder.build();
+        let mut dp = dataplane_builder.build();
         assert!(dp.block_until_ready(Duration::from_secs(1)));
-        let (dp_reader, dp_writer) = dp.split();
+        let authenticated_socket = dp
+            .take_udp_socket_handle("legacy")
+            .expect("legacy socket");
+        let non_authenticated_socket = dp
+            .take_udp_socket_handle("direct")
+            .expect("direct socket");
+        let (dp_reader, dp_writer, _udp_dataplane) = dp.split();
 
         // Create a channel between primary and secondary raptorcast instances.
         // Fundamentally this is needed because, while both can send, only the
@@ -136,6 +141,8 @@ where
             secondary_mode,
             dp_reader,
             dp_writer.clone(),
+            authenticated_socket,
+            non_authenticated_socket,
             shared_pdd.clone(),
             current_epoch,
             auth_protocol,

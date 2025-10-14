@@ -601,6 +601,7 @@ where
     if let Some(buffer_size) = network_config.buffer_size {
         dp_builder = dp_builder.with_udp_buffer_size(buffer_size);
     }
+    let direct_address = SocketAddr::new(bind_address.ip(), bind_address.port() + 1000);
     dp_builder = dp_builder
         .with_tcp_connections_limit(
             network_config.tcp_connections_limit,
@@ -609,7 +610,11 @@ where
         .with_tcp_rps_burst(
             network_config.tcp_rate_limit_rps,
             network_config.tcp_rate_limit_burst,
-        );
+        )
+        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
+            socket_addr: direct_address,
+            label: "direct".to_string(),
+        }]);
 
     let self_id = NodeId::new(identity.pubkey());
     let self_record = NameRecord {

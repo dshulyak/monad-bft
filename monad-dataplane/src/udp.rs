@@ -119,7 +119,19 @@ pub(crate) fn spawn_multi_socket_tasks(
 }
 
 fn create_socket_pair(addr: SocketAddr, buffer_size: Option<usize>) -> (UdpSocket, UdpSocket) {
-    let rx = UdpSocket::bind(addr).unwrap();
+    let socket2_socket = socket2::Socket::new(
+        match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        },
+        socket2::Type::DGRAM,
+        None,
+    )
+    .unwrap();
+    socket2_socket.set_reuse_address(true).unwrap();
+    socket2_socket.bind(&addr.into()).unwrap();
+    let std_socket: std::net::UdpSocket = socket2_socket.into();
+    let rx = UdpSocket::from_std(std_socket).unwrap();
     configure_socket(&rx, buffer_size);
     let tx =
         UdpSocket::from_std(unsafe { std::net::UdpSocket::from_raw_fd(rx.as_raw_fd()) }).unwrap();
