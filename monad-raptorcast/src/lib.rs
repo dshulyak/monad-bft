@@ -37,6 +37,7 @@ use monad_crypto::{
     },
     signing_domain,
 };
+use zerocopy::IntoBytes;
 use monad_dataplane::{
     udp::{segment_size_for_mtu, DEFAULT_MTU},
     BroadcastMsg, DataplaneBuilder, DataplaneReader, DataplaneWriter, RecvTcpMsg, TcpMsg,
@@ -65,7 +66,6 @@ use tracing::{debug, debug_span, error, warn};
 use util::{
     unix_ts_ms_now, BuildTarget, EpochValidators, FullNodes, Group, ReBroadcastGroupMap, Redundancy,
 };
-use zerocopy::AsBytes;
 
 pub mod authentication;
 pub mod config;
@@ -401,9 +401,9 @@ where
     let mut dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps).build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
     let udp_socket = dp
-        .take_udp_socket_handle(RAPTORCAST_SOCKET)
-        .expect("raptorcast socket");
-    let (dp_reader, dp_writer) = dp.split();
+        .take_udp_socket_handle("legacy")
+        .expect("legacy socket");
+    let (dp_reader, dp_writer, _udp_dataplane) = dp.split();
     let config = config::RaptorCastConfig {
         shared_key,
         mtu: DEFAULT_MTU,

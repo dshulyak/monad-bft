@@ -4,11 +4,11 @@ use bytes::Bytes;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub trait AuthenticationProtocol<ST: CertificateSignatureRecoverable> {
     type Error: std::fmt::Debug;
-    type Header: AsBytes;
+    type Header: IntoBytes + Immutable;
 
     const HEADER_SIZE: u16;
 
@@ -126,7 +126,7 @@ impl AuthenticationProtocol<monad_secp::SecpSignature> for WireAuthProtocol {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, AsBytes, FromBytes, FromZeroes)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct NoopHeader;
 
 pub struct NoopAuthProtocol<ST: CertificateSignatureRecoverable> {

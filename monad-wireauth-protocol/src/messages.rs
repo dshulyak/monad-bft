@@ -1,12 +1,12 @@
 use std::convert::TryFrom;
 
 use bytes::Bytes;
-use zerocopy::{AsBytes, FromBytes, FromZeroes, LE, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, LE, U32, U64};
 
 use crate::{common::*, errors::MessageError};
 
 /// Trait for messages that have MAC1 and MAC2 fields
-pub trait MacMessage: AsBytes {
+pub trait MacMessage: IntoBytes {
     fn mac1(&self) -> &MacTag;
     fn mac2(&self) -> &MacTag;
     fn mac1_input(&self) -> &[u8];
@@ -21,7 +21,7 @@ pub const TYPE_DATA: u8 = 4;
 pub const TIMESTAMP_SIZE: usize = 12;
 
 #[repr(C, packed)]
-#[derive(FromZeroes, FromBytes, AsBytes, Clone)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone)]
 pub struct HandshakeInitiation {
     pub message_type: u8,
     pub reserved: [u8; 3],
@@ -37,7 +37,8 @@ pub struct HandshakeInitiation {
 
 impl Default for HandshakeInitiation {
     fn default() -> Self {
-        let mut msg = Self::new_zeroed();
+        let bytes = [0u8; Self::SIZE];
+        let mut msg = Self::read_from_bytes(&bytes).unwrap();
         msg.message_type = TYPE_HANDSHAKE_INITIATION;
         msg
     }
@@ -118,7 +119,7 @@ impl From<HandshakeInitiation> for Bytes {
 }
 
 #[repr(C, packed)]
-#[derive(FromZeroes, FromBytes, AsBytes, Clone)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone)]
 pub struct HandshakeResponse {
     pub message_type: u8,
     pub reserved: [u8; 3],
@@ -132,7 +133,8 @@ pub struct HandshakeResponse {
 
 impl Default for HandshakeResponse {
     fn default() -> Self {
-        let mut msg = Self::new_zeroed();
+        let bytes = [0u8; Self::SIZE];
+        let mut msg = Self::read_from_bytes(&bytes).unwrap();
         msg.message_type = TYPE_HANDSHAKE_RESPONSE;
         msg
     }
@@ -200,7 +202,7 @@ impl From<HandshakeResponse> for Bytes {
 }
 
 #[repr(C, packed)]
-#[derive(FromZeroes, FromBytes, AsBytes, Clone)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone)]
 pub struct CookieReply {
     pub message_type: u8,
     pub reserved: [u8; 3],
@@ -212,7 +214,8 @@ pub struct CookieReply {
 
 impl Default for CookieReply {
     fn default() -> Self {
-        let mut msg = Self::new_zeroed();
+        let bytes = [0u8; Self::SIZE];
+        let mut msg = Self::read_from_bytes(&bytes).unwrap();
         msg.message_type = TYPE_COOKIE_REPLY;
         msg
     }
@@ -257,7 +260,7 @@ impl From<CookieReply> for Bytes {
 }
 
 #[repr(C, packed)]
-#[derive(FromZeroes, FromBytes, AsBytes, Clone)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone)]
 pub struct DataPacketHeader {
     pub message_type: u8,
     pub reserved: [u8; 3],
@@ -268,7 +271,8 @@ pub struct DataPacketHeader {
 
 impl Default for DataPacketHeader {
     fn default() -> Self {
-        let mut msg = Self::new_zeroed();
+        let bytes = [0u8; Self::SIZE];
+        let mut msg = Self::read_from_bytes(&bytes).unwrap();
         msg.message_type = TYPE_DATA;
         msg
     }

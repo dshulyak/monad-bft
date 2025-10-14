@@ -95,7 +95,7 @@ mod tests {
     use std::convert::TryFrom;
 
     use rand::rngs::OsRng;
-    use zerocopy::AsBytes;
+    use zerocopy::IntoBytes;
 
     use super::*;
     use crate::messages::{CookieReply, HandshakeInitiation, HandshakeResponse};

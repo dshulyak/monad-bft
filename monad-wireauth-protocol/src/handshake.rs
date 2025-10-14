@@ -343,7 +343,7 @@ mod tests {
 
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use serde::Serialize;
-    use zerocopy::AsBytes;
+    use zerocopy::IntoBytes;
 
     use super::*;
 

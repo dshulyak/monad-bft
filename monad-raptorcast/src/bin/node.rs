@@ -237,6 +237,7 @@ where
         match value {
             RaptorCastEvent::Message(event) => event,
             RaptorCastEvent::PeerManagerResponse(_) => unimplemented!(),
+            RaptorCastEvent::SecondaryRaptorcastPeersUpdate(_) => unimplemented!(),
         }
     }
 }
@@ -423,10 +424,13 @@ async fn run_producer(
         my_config.tcp_addr.port(),
     ));
 
-    let dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
+    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
-    let (dataplane_reader, dataplane_writer) = dataplane.split();
+    let udp_socket = dataplane
+        .take_udp_socket_handle("legacy")
+        .expect("legacy socket");
+    let (dataplane_reader, dataplane_writer, _udp_dataplane) = dataplane.split();
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
@@ -466,6 +470,7 @@ async fn run_producer(
         SecondaryRaptorCastModeConfig::None,
         dataplane_reader,
         dataplane_writer,
+        udp_socket,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
         auth_protocol,
@@ -610,10 +615,13 @@ async fn run_node(
         my_config.tcp_addr.port(),
     ));
 
-    let dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
+    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
-    let (dataplane_reader, dataplane_writer) = dataplane.split();
+    let udp_socket = dataplane
+        .take_udp_socket_handle("legacy")
+        .expect("legacy socket");
+    let (dataplane_reader, dataplane_writer, _udp_dataplane) = dataplane.split();
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
@@ -653,6 +661,7 @@ async fn run_node(
         SecondaryRaptorCastModeConfig::None,
         dataplane_reader,
         dataplane_writer,
+        udp_socket,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
         auth_protocol,

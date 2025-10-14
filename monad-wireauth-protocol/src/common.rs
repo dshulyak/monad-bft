@@ -1,4 +1,4 @@
-use zerocopy::{AsBytes, FromBytes, FromZeroes, LE, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, LE, U32};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::errors::CryptoError;
@@ -76,7 +76,7 @@ impl AsRef<[u8; 16]> for CipherKey {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, FromZeroes, FromBytes, AsBytes, Debug)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Debug)]
 pub struct CipherNonce(pub [u8; 16]);
 
 impl From<u64> for CipherNonce {
@@ -115,7 +115,7 @@ impl AsRef<[u8; 32]> for HashOutput {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, FromZeroes, FromBytes, AsBytes, Eq)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Eq)]
 pub struct MacTag(pub [u8; 16]);
 
 impl AsRef<[u8]> for MacTag {
@@ -163,7 +163,7 @@ impl From<HashOutput> for MacTag {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, FromZeroes, FromBytes, AsBytes)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct SerializedPublicKey([u8; 33]);
 
 impl SerializedPublicKey {
