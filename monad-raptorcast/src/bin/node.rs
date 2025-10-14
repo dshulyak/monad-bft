@@ -424,12 +424,21 @@ async fn run_producer(
         my_config.tcp_addr.port(),
     ));
 
-    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
+    let non_authenticated_address = SocketAddr::new(server_address.ip(), server_address.port() + 1);
+    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW)
+        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
+            socket_addr: non_authenticated_address,
+            label: "non-authenticated".to_string(),
+        }])
+        .build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
-    let udp_socket = dataplane
-        .take_udp_socket_handle("legacy")
-        .expect("legacy socket");
+    let authenticated_socket = dataplane
+        .take_udp_socket_handle("authenticated")
+        .expect("authenticated socket");
+    let non_authenticated_socket = dataplane
+        .take_udp_socket_handle("non-authenticated")
+        .expect("non-authenticated socket");
     let (dataplane_reader, dataplane_writer, _udp_dataplane) = dataplane.split();
 
     let mut known_addresses = std::collections::HashMap::new();
@@ -470,7 +479,8 @@ async fn run_producer(
         SecondaryRaptorCastModeConfig::None,
         dataplane_reader,
         dataplane_writer,
-        udp_socket,
+        authenticated_socket,
+        non_authenticated_socket,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
         auth_protocol,
@@ -615,12 +625,21 @@ async fn run_node(
         my_config.tcp_addr.port(),
     ));
 
-    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW).build();
+    let non_authenticated_address = SocketAddr::new(server_address.ip(), server_address.port() + 1);
+    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW)
+        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
+            socket_addr: non_authenticated_address,
+            label: "non-authenticated".to_string(),
+        }])
+        .build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
-    let udp_socket = dataplane
-        .take_udp_socket_handle("legacy")
-        .expect("legacy socket");
+    let authenticated_socket = dataplane
+        .take_udp_socket_handle("authenticated")
+        .expect("authenticated socket");
+    let non_authenticated_socket = dataplane
+        .take_udp_socket_handle("non-authenticated")
+        .expect("non-authenticated socket");
     let (dataplane_reader, dataplane_writer, _udp_dataplane) = dataplane.split();
 
     let mut known_addresses = std::collections::HashMap::new();
@@ -661,7 +680,8 @@ async fn run_node(
         SecondaryRaptorCastModeConfig::None,
         dataplane_reader,
         dataplane_writer,
-        udp_socket,
+        authenticated_socket,
+        non_authenticated_socket,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
         auth_protocol,

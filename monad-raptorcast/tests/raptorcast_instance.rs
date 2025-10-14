@@ -53,9 +53,9 @@ type PubKeyType = CertificateSignaturePubKey<SignatureType>;
 // A previous version of the R10 managed decoder did not handle this correctly and would panic.
 #[test]
 pub fn different_symbol_sizes() {
-    let tx_addr = "127.0.0.1:10000".parse().unwrap();
-    let rx_addr = "127.0.0.1:10001".parse().unwrap();
-    let rebroadcast_addr = "127.0.0.1:10002".parse().unwrap();
+    let tx_addr = find_unused_address();
+    let rx_addr = find_unused_address();
+    let rebroadcast_addr = find_unused_address();
 
     let (tx_nodeid, tx_keypair, rx_nodeid, known_addresses) =
         set_up_test(&tx_addr, &rx_addr, Some(&rebroadcast_addr));
@@ -133,8 +133,8 @@ pub fn different_symbol_sizes() {
 // of buffer indices in the decoder and panic the decoder.
 #[test]
 pub fn buffer_count_overflow() {
-    let tx_addr = "127.0.0.1:10003".parse().unwrap();
-    let rx_addr = "127.0.0.1:10004".parse().unwrap();
+    let tx_addr = find_unused_address();
+    let rx_addr = find_unused_address();
 
     let (tx_nodeid, tx_keypair, rx_nodeid, known_addresses) = set_up_test(&tx_addr, &rx_addr, None);
 
@@ -184,8 +184,8 @@ pub fn buffer_count_overflow() {
 // would fail.
 #[test]
 pub fn oversized_message() {
-    let tx_addr = "127.0.0.1:10005".parse().unwrap();
-    let rx_addr = "127.0.0.1:10006".parse().unwrap();
+    let tx_addr = find_unused_address();
+    let rx_addr = find_unused_address();
 
     let (tx_nodeid, tx_keypair, rx_nodeid, known_addresses) = set_up_test(&tx_addr, &rx_addr, None);
 
@@ -235,8 +235,8 @@ pub fn oversized_message() {
 // which would then call .step_by(0) on (0..0), which panics.
 #[test]
 pub fn zero_sized_packet() {
-    let tx_addr = "127.0.0.1:10007".parse().unwrap();
-    let rx_addr = "127.0.0.1:10008".parse().unwrap();
+    let tx_addr = find_unused_address();
+    let rx_addr = find_unused_address();
 
     let (_tx_nodeid, _tx_keypair, _rx_nodeid, _known_addresses) =
         set_up_test(&tx_addr, &rx_addr, None);
@@ -257,9 +257,9 @@ pub fn zero_sized_packet() {
 // exactly once.
 #[test]
 pub fn valid_rebroadcast() {
-    let tx_addr = "127.0.0.1:10009".parse().unwrap();
-    let rx_addr = "127.0.0.1:10010".parse().unwrap();
-    let rebroadcast_addr = "127.0.0.1:10011".parse().unwrap();
+    let tx_addr = find_unused_address();
+    let rx_addr = find_unused_address();
+    let rebroadcast_addr = find_unused_address();
 
     let (tx_nodeid, tx_keypair, rx_nodeid, known_addresses) =
         set_up_test(&tx_addr, &rx_addr, Some(&rebroadcast_addr));
@@ -319,6 +319,11 @@ pub fn valid_rebroadcast() {
 }
 
 static ONCE_SETUP: Once = Once::new();
+
+fn find_unused_address() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.local_addr().unwrap()
+}
 
 #[cfg(test)]
 pub fn set_up_test(
@@ -547,15 +552,24 @@ async fn publish_to_full_nodes() {
     // 1. Set up nodes
     let validator_keypair = keypair(1);
     let validator_nodeid = NodeId::new(validator_keypair.pubkey());
-    let validator_addr = "127.0.0.1:10020".parse().unwrap();
+    let validator_addr = match find_unused_address() {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => panic!("expected ipv4 address"),
+    };
 
     let full_node1_keypair = keypair(2);
     let full_node1_id = NodeId::new(full_node1_keypair.pubkey());
-    let full_node1_addr = "127.0.0.1:10021".parse().unwrap();
+    let full_node1_addr = match find_unused_address() {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => panic!("expected ipv4 address"),
+    };
 
     let full_node2_keypair = keypair(3);
     let full_node2_id = NodeId::new(full_node2_keypair.pubkey());
-    let full_node2_addr = "127.0.0.1:10022".parse().unwrap();
+    let full_node2_addr = match find_unused_address() {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => panic!("expected ipv4 address"),
+    };
 
     let known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4> = [
         (validator_nodeid, validator_addr),
@@ -628,7 +642,10 @@ async fn publish_to_full_nodes() {
 async fn delete_expired_groups() {
     let node_keypair = keypair(1);
     let node_id = NodeId::new(node_keypair.pubkey());
-    let node_addr = "127.0.0.1:10030".parse().unwrap();
+    let node_addr = match find_unused_address() {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => panic!("expected ipv4 address"),
+    };
 
     let mut raptorcast = setup_raptorcast_service(node_keypair, node_addr, &HashMap::new());
     raptorcast.exec(vec![RouterCommand::UpdateCurrentRound(Epoch(1), Round(1))]);

@@ -370,14 +370,20 @@ where
         ..Default::default()
     };
     let up_bandwidth_mbps = 1_000;
-    let mut dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps).build();
+    let non_authenticated_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
+    let mut dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps)
+        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
+            socket_addr: non_authenticated_addr,
+            label: "non-authenticated".to_string(),
+        }])
+        .build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
     let authenticated_socket = dp
-        .take_udp_socket_handle("legacy")
-        .expect("legacy socket");
+        .take_udp_socket_handle("authenticated")
+        .expect("authenticated socket");
     let non_authenticated_socket = dp
-        .take_udp_socket_handle("direct")
-        .expect("direct socket");
+        .take_udp_socket_handle("non-authenticated")
+        .expect("non-authenticated socket");
     let (dp_reader, dp_writer, _udp_dataplane) = dp.split();
     let config = config::RaptorCastConfig {
         shared_key,
