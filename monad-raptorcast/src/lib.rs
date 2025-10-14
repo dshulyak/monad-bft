@@ -89,7 +89,6 @@ where
     AP: authentication::AuthenticationProtocol<ST>,
 {
     signing_key: Arc<ST::KeyPairType>,
-    auth_protocol: AP,
     redundancy: Redundancy,
     is_dynamic_fullnode: bool,
 
@@ -106,13 +105,13 @@ where
 
     dataplane_reader: DataplaneReader,
     dataplane_writer: DataplaneWriter,
-    udp_socket: UdpSocketHandle,
+    authenticated_socket: authenticated_socket::AuthenticatedSocketHandle<ST, AP>,
+    non_authenticated_socket: UdpSocketHandle,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
     channel_to_secondary: Option<UnboundedSender<FullNodesGroupMessage<ST>>>,
     channel_from_secondary: Option<UnboundedReceiver<Group<ST>>>,
 
-    auth_timer: Option<Pin<Box<Sleep>>>,
     waker: Option<Waker>,
     metrics: ExecutorMetrics,
     peer_discovery_metrics: ExecutorMetrics,
@@ -143,7 +142,8 @@ where
         secondary_mode: SecondaryRaptorCastModeConfig,
         dataplane_reader: DataplaneReader,
         dataplane_writer: DataplaneWriter,
-        udp_socket: UdpSocketHandle,
+        authenticated_socket: UdpSocketHandle,
+        non_authenticated_socket: UdpSocketHandle,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
         auth_protocol: AP,
@@ -170,7 +170,6 @@ where
             peer_discovery_driver,
 
             signing_key: config.shared_key.clone(),
-            auth_protocol,
             redundancy: Redundancy::from_f32(config.primary_instance.raptor10_redundancy)
                 .expect("primary raptor10_redundancy doesn't fit"),
 
@@ -181,12 +180,15 @@ where
 
             dataplane_reader,
             dataplane_writer,
-            udp_socket,
+            authenticated_socket: authenticated_socket::AuthenticatedSocketHandle::new(
+                authenticated_socket,
+                auth_protocol,
+            ),
+            non_authenticated_socket,
             pending_events: Default::default(),
             channel_to_secondary: None,
             channel_from_secondary: None,
 
-            auth_timer: None,
             waker: None,
             metrics: Default::default(),
             peer_discovery_metrics: Default::default(),
@@ -240,7 +242,7 @@ where
         for validator in new_validators.difference(&old_validators) {
             if let Some(addr) = pd_driver.get_addr(validator) {
                 if let Err(e) = self
-                    .auth_protocol
+                    .authenticated_socket
                     .connect(&validator.pubkey(), addr, u64::MAX)
                 {
                     tracing::warn!(
@@ -254,17 +256,11 @@ where
         }
 
         for validator in old_validators.difference(&new_validators) {
-            self.auth_protocol.disconnect(&validator.pubkey());
+            self.authenticated_socket.disconnect(&validator.pubkey());
         }
         drop(pd_driver);
 
-        while let Some((addr, packet)) = self.auth_protocol.next_packet() {
-            let stride = packet.len() as u16;
-            self.udp_socket.write_unicast(UnicastMsg {
-                msgs: vec![(addr, packet)],
-                stride,
-            });
-        }
+        self.authenticated_socket.flush_auth_packets();
     }
 
     fn enqueue_message_to_self(
@@ -351,36 +347,11 @@ where
         }
     }
 
-    fn encrypt_unicast_msg(&mut self, unicast_msg: UnicastMsg) -> UnicastMsg {
-        let encrypted_msgs: Vec<(SocketAddr, Bytes)> = unicast_msg
-            .msgs
-            .into_iter()
-            .filter_map(|(addr, chunk)| {
-                let mut plaintext = chunk.to_vec();
-                match self.auth_protocol.encrypt_by_socket(&addr, &mut plaintext) {
-                    Ok(header) => {
-                        let header_bytes = header.as_bytes();
-                        let mut packet = Vec::with_capacity(header_bytes.len() + plaintext.len());
-                        packet.extend_from_slice(header_bytes);
-                        packet.extend_from_slice(&plaintext);
-                        Some((addr, Bytes::from(packet)))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            addr = ?addr,
-                            error = ?e,
-                            "failed to encrypt message"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        UnicastMsg {
-            msgs: encrypted_msgs,
-            stride: unicast_msg.stride,
-        }
+    fn is_validator(&self, node_id: &NodeId<CertificateSignaturePubKey<ST>>) -> bool {
+        self.epoch_validators
+            .get(&self.current_epoch)
+            .map(|validators| validators.validators.contains_key(node_id))
+            .unwrap_or(false)
     }
 }
 
@@ -401,14 +372,17 @@ where
     let up_bandwidth_mbps = 1_000;
     let mut dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps).build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
-    let udp_socket = dp
+    let authenticated_socket = dp
         .take_udp_socket_handle("legacy")
         .expect("legacy socket");
+    let non_authenticated_socket = dp
+        .take_udp_socket_handle("direct")
+        .expect("direct socket");
     let (dp_reader, dp_writer, _udp_dataplane) = dp.split();
     let config = config::RaptorCastConfig {
         shared_key,
         mtu: DEFAULT_MTU,
-        udp_message_max_age_ms: u64::MAX, // No timestamp validation for tests
+        udp_message_max_age_ms: u64::MAX,
         primary_instance: Default::default(),
         secondary_instance: FullNodeRaptorCastConfig {
             enable_publisher: false,
@@ -435,7 +409,8 @@ where
         SecondaryRaptorCastModeConfig::None,
         dp_reader,
         dp_writer,
-        udp_socket,
+        authenticated_socket,
+        non_authenticated_socket,
         shared_pd,
         Epoch(0),
         auth_protocol,
