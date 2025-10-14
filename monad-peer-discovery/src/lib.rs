@@ -44,6 +44,7 @@ pub use message::PeerDiscoveryMessage;
 pub enum PortTag {
     TCP = 0,
     UDP = 1,
+    AUTHENTICATED_UDP = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, RlpEncodable, RlpDecodable)]
@@ -64,6 +65,7 @@ impl Port {
         match self.tag {
             0 => Some(PortTag::TCP),
             1 => Some(PortTag::UDP),
+            2 => Some(PortTag::AUTHENTICATED_UDP),
             _ => None,
         }
     }
@@ -126,16 +128,21 @@ pub struct NameRecord {
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
     pub udp_port: u16,
+    pub authenticated_udp_port: Option<u16>,
     pub capabilities: u64,
     pub seq: u64,
 }
 
 impl Encodable for NameRecord {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let ports = vec![
+        let mut ports = vec![
             Port::new(PortTag::TCP, self.tcp_port),
             Port::new(PortTag::UDP, self.udp_port),
         ];
+
+        if let Some(authenticated_udp_port) = self.authenticated_udp_port {
+            ports.push(Port::new(PortTag::AUTHENTICATED_UDP, authenticated_udp_port));
+        }
 
         let wire = WireNameRecord {
             ip: self.ip,
@@ -154,6 +161,7 @@ impl Decodable for NameRecord {
 
         let mut tcp_port = None;
         let mut udp_port = None;
+        let mut authenticated_udp_port = None;
         let mut seen_tags = std::collections::HashSet::new();
 
         for port in &wire.ports {
@@ -164,6 +172,7 @@ impl Decodable for NameRecord {
             match port.tag_enum() {
                 Some(PortTag::TCP) => tcp_port = Some(port.port),
                 Some(PortTag::UDP) => udp_port = Some(port.port),
+                Some(PortTag::AUTHENTICATED_UDP) => authenticated_udp_port = Some(port.port),
                 None => return Err(alloy_rlp::Error::Custom("Invalid port tag")),
             }
         }
@@ -175,6 +184,7 @@ impl Decodable for NameRecord {
             ip: wire.ip,
             tcp_port,
             udp_port,
+            authenticated_udp_port,
             capabilities: wire.capabilities,
             seq: wire.seq,
         })
@@ -190,6 +200,11 @@ impl NameRecord {
         SocketAddrV4::new(self.ip, self.udp_port)
     }
 
+    pub fn authenticated_udp_socket(&self) -> Option<SocketAddrV4> {
+        self.authenticated_udp_port
+            .map(|port| SocketAddrV4::new(self.ip, port))
+    }
+
     pub fn check_capability(&self, capability: Capability) -> bool {
         (self.capabilities & (1u64 << (capability as u8))) != 0
     }
@@ -200,7 +215,9 @@ impl NameRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Capability {}
+pub enum Capability {
+    AuthenticatedUdpSupport = 0,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, RlpEncodable, RlpDecodable, Eq)]
 pub struct MonadNameRecord<ST: CertificateSignatureRecoverable> {
@@ -499,6 +516,7 @@ mod tests {
             ip: Ipv4Addr::from_str("1.1.1.1").unwrap(),
             tcp_port: 8000,
             udp_port: 8001,
+            authenticated_udp_port: None,
             capabilities: 0,
             seq: 2,
         };
@@ -517,6 +535,7 @@ mod tests {
             ip: Ipv4Addr::from_str("1.1.1.1").unwrap(),
             tcp_port: 8000,
             udp_port: 8001,
+            authenticated_udp_port: None,
             capabilities: 0,
             seq: 1,
         };
@@ -573,6 +592,7 @@ mod tests {
             ip: Ipv4Addr::from_str("192.168.1.1").unwrap(),
             tcp_port: 8080,
             udp_port: 8081,
+            authenticated_udp_port: None,
             capabilities: 0,
             seq: 42,
         };
@@ -589,6 +609,7 @@ mod tests {
             ip: Ipv4Addr::from_str("172.16.0.1").unwrap(),
             tcp_port: 7000,
             udp_port: 7001,
+            authenticated_udp_port: None,
             capabilities: 255,
             seq: 999,
         };
@@ -606,6 +627,7 @@ mod tests {
             ip: Ipv4Addr::from_str("127.0.0.1").unwrap(),
             tcp_port: 8000,
             udp_port: 8001,
+            authenticated_udp_port: None,
             capabilities: 0,
             seq: 1,
         };

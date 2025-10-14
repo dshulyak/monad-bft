@@ -621,6 +621,7 @@ where
         ip: *name_record_address.ip(),
         tcp_port: name_record_address.port(),
         udp_port: name_record_address.port(),
+        authenticated_udp_port: None,
         capabilities: 0,
         seq: peer_discovery_config.self_record_seq_num,
     };
@@ -650,6 +651,7 @@ where
                 ip: *address.ip(),
                 tcp_port: address.port(),
                 udp_port: address.port(),
+                authenticated_udp_port: None,
                 capabilities: 0,
                 seq: peer.record_seq_num,
             };

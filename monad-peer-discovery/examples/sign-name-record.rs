@@ -73,6 +73,7 @@ fn main() {
         ip: *self_address.ip(),
         tcp_port: self_address.port(),
         udp_port: self_address.port(),
+        authenticated_udp_port: None,
         capabilities: 0,
         seq: self_record_seq_num,
     };

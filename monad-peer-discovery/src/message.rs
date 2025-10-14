@@ -165,6 +165,7 @@ mod test {
                     ip: *SocketAddrV4::from_str("127.0.0.1:8000").unwrap().ip(),
                     tcp_port: 8000,
                     udp_port: 8000,
+                    authenticated_udp_port: None,
                     capabilities: 0,
                     seq: 2,
                 },

@@ -403,7 +403,11 @@ async fn run_producer(
         let node_id = NodeId::new(participant_pubkey);
 
         let name_record = NameRecord {
-            address: participant.udp_addr,
+            ip: *participant.udp_addr.ip(),
+            tcp_port: participant.tcp_addr.port(),
+            udp_port: participant.udp_addr.port(),
+            authenticated_udp_port: Some(participant.udp_addr.port() + 1),
+            capabilities: 0,
             seq: 0,
         };
         let monad_name_record =
@@ -414,18 +418,22 @@ async fn run_producer(
     }
 
     let my_name_record = NameRecord {
-        address: my_config.udp_addr,
+        ip: *my_config.udp_addr.ip(),
+        tcp_port: my_config.tcp_addr.port(),
+        udp_port: my_config.udp_addr.port(),
+        authenticated_udp_port: Some(my_config.udp_addr.port() + 1),
+        capabilities: 0,
         seq: 0,
     };
     let _my_monad_name_record = MonadNameRecord::<SignatureType>::new(my_name_record, &keypair);
 
-    let server_address = SocketAddr::V4(SocketAddrV4::new(
+    let non_authenticated_address = SocketAddr::V4(SocketAddrV4::new(
         std::net::Ipv4Addr::new(0, 0, 0, 0),
-        my_config.tcp_addr.port(),
+        my_config.udp_addr.port(),
     ));
 
-    let non_authenticated_address = SocketAddr::new(server_address.ip(), server_address.port() + 1);
-    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW)
+    let authenticated_address = SocketAddr::new(non_authenticated_address.ip(), my_config.udp_addr.port() + 1);
+    let mut dataplane = DataplaneBuilder::new(&authenticated_address, UDP_BW)
         .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
             socket_addr: non_authenticated_address,
             label: "non-authenticated".to_string(),
@@ -443,7 +451,7 @@ async fn run_producer(
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
-        known_addresses.insert(*node_id, record.name_record.address);
+        known_addresses.insert(*node_id, record.name_record.tcp_socket());
     }
 
     let noop_builder = NopDiscoveryBuilder {
@@ -496,8 +504,9 @@ async fn run_producer(
 
     tracing::info!(
         node_id = ?my_node_id,
-        tcp_addr = ?server_address,
-        udp_addr = ?my_config.udp_addr,
+        tcp_addr = ?my_config.tcp_addr,
+        authenticated_udp_addr = ?authenticated_address,
+        non_authenticated_udp_addr = ?non_authenticated_address,
         interval = ?interval,
         message_size = size,
         "started producer node"
@@ -604,7 +613,11 @@ async fn run_node(
         let node_id = NodeId::new(participant_pubkey);
 
         let name_record = NameRecord {
-            address: participant.udp_addr,
+            ip: *participant.udp_addr.ip(),
+            tcp_port: participant.tcp_addr.port(),
+            udp_port: participant.udp_addr.port(),
+            authenticated_udp_port: Some(participant.udp_addr.port() + 1),
+            capabilities: 0,
             seq: 0,
         };
         let monad_name_record =
@@ -615,18 +628,22 @@ async fn run_node(
     }
 
     let my_name_record = NameRecord {
-        address: my_config.udp_addr,
+        ip: *my_config.udp_addr.ip(),
+        tcp_port: my_config.tcp_addr.port(),
+        udp_port: my_config.udp_addr.port(),
+        authenticated_udp_port: Some(my_config.udp_addr.port() + 1),
+        capabilities: 0,
         seq: 0,
     };
     let _my_monad_name_record = MonadNameRecord::<SignatureType>::new(my_name_record, &keypair);
 
-    let server_address = SocketAddr::V4(SocketAddrV4::new(
+    let non_authenticated_address = SocketAddr::V4(SocketAddrV4::new(
         std::net::Ipv4Addr::new(0, 0, 0, 0),
-        my_config.tcp_addr.port(),
+        my_config.udp_addr.port(),
     ));
 
-    let non_authenticated_address = SocketAddr::new(server_address.ip(), server_address.port() + 1);
-    let mut dataplane = DataplaneBuilder::new(&server_address, UDP_BW)
+    let authenticated_address = SocketAddr::new(non_authenticated_address.ip(), my_config.udp_addr.port() + 1);
+    let mut dataplane = DataplaneBuilder::new(&authenticated_address, UDP_BW)
         .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
             socket_addr: non_authenticated_address,
             label: "non-authenticated".to_string(),
@@ -644,7 +661,7 @@ async fn run_node(
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
-        known_addresses.insert(*node_id, record.name_record.address);
+        known_addresses.insert(*node_id, record.name_record.tcp_socket());
     }
 
     let noop_builder = NopDiscoveryBuilder {
@@ -697,8 +714,9 @@ async fn run_node(
 
     tracing::info!(
         node_id = ?my_node_id,
-        tcp_addr = ?server_address,
-        udp_addr = ?my_config.udp_addr,
+        tcp_addr = ?my_config.tcp_addr,
+        authenticated_udp_addr = ?authenticated_address,
+        non_authenticated_udp_addr = ?non_authenticated_address,
         "Started node with raptorcast and discovery"
     );
 

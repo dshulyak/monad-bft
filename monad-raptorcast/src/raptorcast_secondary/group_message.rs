@@ -146,6 +146,7 @@ mod tests {
                         ip,
                         tcp_port: port,
                         udp_port: port,
+                        authenticated_udp_port: None,
                         capabilities: 0,
                         seq: (seed + 200) as u64,
                     },

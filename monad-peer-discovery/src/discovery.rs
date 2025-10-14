@@ -1386,6 +1386,7 @@ where
                     ip: *peer.addr.ip(),
                     tcp_port: peer.addr.port(),
                     udp_port: peer.addr.port(),
+                    authenticated_udp_port: None,
                     capabilities: 0,
                     seq: peer.record_seq_num,
                 },
@@ -1526,6 +1527,7 @@ mod tests {
             ip: *DUMMY_ADDR.ip(),
             tcp_port: DUMMY_ADDR.port(),
             udp_port: DUMMY_ADDR.port(),
+            authenticated_udp_port: None,
             capabilities: 0,
             seq: seq_num,
         };
@@ -2191,6 +2193,7 @@ mod tests {
             ip: *addr.ip(),
             tcp_port: addr.port(),
             udp_port: addr.port(),
+            authenticated_udp_port: None,
             capabilities: 0,
             seq,
         }

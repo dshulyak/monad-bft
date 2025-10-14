@@ -134,6 +134,7 @@ fn generate_name_record(keypair: &KeyPairType) -> MonadNameRecord<SignatureType>
         ip: ipaddr_v4,
         tcp_port: 8000,
         udp_port: 8000,
+        authenticated_udp_port: None,
         capabilities: 0,
         seq: 0,
     };
@@ -367,6 +368,7 @@ fn test_update_name_record() {
         ip: *SocketAddrV4::from_str("2.2.2.2:8000").unwrap().ip(),
         tcp_port: 8000,
         udp_port: 8000,
+        authenticated_udp_port: None,
         capabilities: 0,
         seq: 1,
     };

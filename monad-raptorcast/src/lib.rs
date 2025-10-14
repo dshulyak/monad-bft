@@ -239,17 +239,26 @@ where
             .flat_map(|val| val.validators.keys())
             .collect();
 
+        let name_records = pd_driver.get_name_records();
+
         for validator in new_validators.difference(&old_validators) {
-            if let Some(addr) = pd_driver.get_addr(validator) {
-                if let Err(e) = self
-                    .authenticated_socket
-                    .connect(&validator.pubkey(), addr, u64::MAX)
-                {
-                    tracing::warn!(
+            if let Some(name_record) = name_records.get(validator) {
+                if let Some(auth_addr) = name_record.name_record.authenticated_udp_socket() {
+                    if let Err(e) = self
+                        .authenticated_socket
+                        .connect(&validator.pubkey(), SocketAddr::V4(auth_addr), u64::MAX)
+                    {
+                        tracing::warn!(
+                            validator = ?validator,
+                            auth_addr = ?auth_addr,
+                            error = ?e,
+                            "failed to connect to validator authenticated endpoint"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
                         validator = ?validator,
-                        addr = ?addr,
-                        error = ?e,
-                        "failed to connect to validator"
+                        "validator does not have authenticated udp endpoint, skipping connection"
                     );
                 }
             }
