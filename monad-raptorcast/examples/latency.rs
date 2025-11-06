@@ -43,7 +43,7 @@ use monad_peer_discovery::{
 use monad_raptorcast::{
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
     raptorcast_secondary::SecondaryRaptorCastModeConfig,
-    RaptorCast, RaptorCastEvent, RAPTORCAST_SOCKET,
+    RaptorCast, RaptorCastEvent, AUTHENTICATED_RAPTORCAST_SOCKET, RAPTORCAST_SOCKET,
 };
 use monad_secp::{KeyPair, SecpSignature};
 use monad_types::{Deserializable, Epoch, NodeId, RouterTarget, Serializable, Stake};
@@ -342,6 +342,9 @@ struct NodeSetup {
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
+        monad_raptorcast::authentication::NoopAuthProtocol<
+            CertificateSignaturePubKey<SignatureType>,
+        >,
     >,
     node_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
     tcp_addr: SocketAddrV4,
@@ -407,20 +410,30 @@ fn setup_node(
     }
 
     let udp_addr = SocketAddr::V4(my_config.udp_addr);
+    let non_authenticated_addr = SocketAddr::new(udp_addr.ip(), udp_addr.port() + 1);
 
     let dataplane = DataplaneBuilder::new(&udp_addr, UDP_BW)
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
-            socket_addr: udp_addr,
-            label: RAPTORCAST_SOCKET.to_string(),
-        }])
+        .extend_udp_sockets(vec![
+            monad_dataplane::UdpSocketConfig {
+                socket_addr: udp_addr,
+                label: AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
+            },
+            monad_dataplane::UdpSocketConfig {
+                socket_addr: non_authenticated_addr,
+                label: RAPTORCAST_SOCKET.to_string(),
+            },
+        ])
         .build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
     let (tcp_socket, mut udp_dataplane, dataplane_control) = dataplane.split();
     let (tcp_reader, tcp_writer) = tcp_socket.split();
-    let udp_socket = udp_dataplane
+    let authenticated_socket = udp_dataplane
+        .take_socket(AUTHENTICATED_RAPTORCAST_SOCKET)
+        .expect("authenticated socket not found");
+    let non_authenticated_socket = udp_dataplane
         .take_socket(RAPTORCAST_SOCKET)
-        .expect("raptorcast socket not found");
+        .expect("non-authenticated socket not found");
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
@@ -429,12 +442,14 @@ fn setup_node(
 
     let noop_builder = NopDiscoveryBuilder {
         known_addresses,
+        name_records: std::collections::HashMap::new(),
         pd: std::marker::PhantomData,
     };
 
     let pd = PeerDiscoveryDriver::new(noop_builder);
 
     let keypair_arc = Arc::new(keypair);
+    let auth_protocol = monad_raptorcast::authentication::NoopAuthProtocol::new();
 
     let mut raptorcast = RaptorCast::<
         SignatureType,
@@ -442,15 +457,20 @@ fn setup_node(
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
+        monad_raptorcast::authentication::NoopAuthProtocol<
+            CertificateSignaturePubKey<SignatureType>,
+        >,
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
         tcp_reader,
         tcp_writer,
-        udp_socket,
+        authenticated_socket,
+        non_authenticated_socket,
         dataplane_control,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
+        auth_protocol,
     );
 
     raptorcast.exec(vec![RouterCommand::AddEpochValidatorSet {
