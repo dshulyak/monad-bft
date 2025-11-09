@@ -9,6 +9,7 @@ use std::{
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use itertools::Itertools;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
@@ -18,10 +19,13 @@ use monad_peer_discovery::{MonadNameRecord, NameRecord};
 use monad_raptorcast::RaptorCastEvent;
 use monad_secp::{KeyPair, SecpSignature};
 use monad_types::{Deserializable, Epoch, NodeId, Serializable, Stake};
+use rstest::rstest;
 use tracing_subscriber::EnvFilter;
 
-type SignatureType = SecpSignature;
-type PubKeyType = CertificateSignaturePubKey<SignatureType>;
+const UP_BANDWIDTH_MBPS: u64 = 1_000;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const NUM_NODES: usize = 10;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -51,7 +55,7 @@ impl MockMessage {
 }
 
 impl Message for MockMessage {
-    type NodeIdPubKey = PubKeyType;
+    type NodeIdPubKey = CertificateSignaturePubKey<SecpSignature>;
     type Event = MockEvent<Self::NodeIdPubKey>;
 
     fn event(self, from: NodeId<Self::NodeIdPubKey>) -> Self::Event {
@@ -93,96 +97,174 @@ where
     fn from(value: RaptorCastEvent<MockEvent<CertificateSignaturePubKey<ST>>, ST>) -> Self {
         match value {
             RaptorCastEvent::Message(event) => event,
-            RaptorCastEvent::PeerManagerResponse(_) => {
-                unimplemented!()
-            }
-            RaptorCastEvent::SecondaryRaptorcastPeersUpdate { .. } => {
-                unimplemented!()
-            }
+            RaptorCastEvent::PeerManagerResponse(_) => unimplemented!(),
+            RaptorCastEvent::SecondaryRaptorcastPeersUpdate { .. } => unimplemented!(),
         }
     }
 }
 
 struct ValidatorChannels {
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<RouterCommand<SignatureType, MockMessage>>,
-    event_rx: tokio::sync::mpsc::UnboundedReceiver<MockEvent<PubKeyType>>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RouterCommand<SecpSignature, MockMessage>>,
+    event_rx:
+        tokio::sync::mpsc::UnboundedReceiver<MockEvent<CertificateSignaturePubKey<SecpSignature>>>,
     ready_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
-fn spawn_noop_validator(
-    keypair: KeyPair,
+#[derive(Clone)]
+struct ValidatorInfo {
+    keypair: Arc<KeyPair>,
+    nodeid: NodeId<CertificateSignaturePubKey<SecpSignature>>,
+    pubkey: monad_secp::PubKey,
     auth_addr: SocketAddrV4,
-    known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4>,
-    name_records: HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>>,
+    non_auth_addr: SocketAddrV4,
+}
+
+impl ValidatorInfo {
+    fn new(seed: u8) -> Self {
+        let kp = keypair(seed);
+        let nodeid = NodeId::new(kp.pubkey());
+        let pubkey = kp.pubkey();
+        let auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), find_free_port());
+        let non_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), find_free_port());
+        Self {
+            keypair: Arc::new(kp),
+            nodeid,
+            pubkey,
+            auth_addr,
+            non_auth_addr,
+        }
+    }
+
+    fn create_name_record(&self, with_auth: bool) -> MonadNameRecord<SecpSignature> {
+        let name_record = if with_auth {
+            NameRecord::new_with_authentication(
+                Ipv4Addr::new(127, 0, 0, 1),
+                8000 + (self.nodeid.pubkey().bytes()[0] as u16),
+                self.non_auth_addr.port(),
+                self.auth_addr.port(),
+                1,
+            )
+        } else {
+            NameRecord::new(Ipv4Addr::new(127, 0, 0, 1), self.non_auth_addr.port(), 1)
+        };
+        MonadNameRecord::new(name_record, &*self.keypair)
+    }
+}
+
+fn create_raptorcast_config(
+    keypair: Arc<KeyPair>,
+) -> monad_raptorcast::config::RaptorCastConfig<SecpSignature> {
+    monad_raptorcast::config::RaptorCastConfig {
+        shared_key: keypair,
+        mtu: monad_dataplane::udp::DEFAULT_MTU,
+        udp_message_max_age_ms: u64::MAX,
+        primary_instance: Default::default(),
+        secondary_instance: monad_node_config::FullNodeRaptorCastConfig {
+            enable_publisher: false,
+            enable_client: false,
+            raptor10_fullnode_redundancy_factor: 2f32,
+            full_nodes_prioritized: monad_node_config::FullNodeConfig { identities: vec![] },
+            round_span: monad_types::Round(10),
+            invite_lookahead: monad_types::Round(5),
+            max_invite_wait: monad_types::Round(3),
+            deadline_round_dist: monad_types::Round(3),
+            init_empty_round_span: monad_types::Round(1),
+            max_group_size: 10,
+            max_num_group: 5,
+            invite_future_dist_min: monad_types::Round(1),
+            invite_future_dist_max: monad_types::Round(5),
+            invite_accept_heartbeat_ms: 100,
+        },
+    }
+}
+
+fn create_dataplane(
+    auth_addr: SocketAddrV4,
+    non_auth_addr: SocketAddrV4,
+) -> (
+    monad_dataplane::TcpSocketHandle,
+    monad_dataplane::UdpSocketHandle,
+    monad_dataplane::UdpSocketHandle,
+    monad_dataplane::DataplaneControl,
+) {
+    let dp = monad_dataplane::DataplaneBuilder::new(&SocketAddr::V4(auth_addr), UP_BANDWIDTH_MBPS)
+        .extend_udp_sockets(vec![
+            monad_dataplane::UdpSocketConfig {
+                socket_addr: SocketAddr::V4(auth_addr),
+                label: monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
+            },
+            monad_dataplane::UdpSocketConfig {
+                socket_addr: SocketAddr::V4(non_auth_addr),
+                label: monad_raptorcast::RAPTORCAST_SOCKET.to_string(),
+            },
+        ])
+        .build();
+    assert!(dp.block_until_ready(Duration::from_secs(1)));
+
+    let (tcp_socket, mut udp_dataplane, control) = dp.split();
+    let authenticated_socket = udp_dataplane
+        .take_socket(monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET)
+        .expect("authenticated socket");
+    let non_authenticated_socket = udp_dataplane
+        .take_socket(monad_raptorcast::RAPTORCAST_SOCKET)
+        .expect("non-authenticated socket");
+
+    (
+        tcp_socket,
+        authenticated_socket,
+        non_authenticated_socket,
+        control,
+    )
+}
+
+fn create_peer_discovery(
+    known_addresses: HashMap<NodeId<CertificateSignaturePubKey<SecpSignature>>, SocketAddrV4>,
+    name_records: HashMap<
+        NodeId<CertificateSignaturePubKey<SecpSignature>>,
+        MonadNameRecord<SecpSignature>,
+    >,
+) -> Arc<
+    std::sync::Mutex<
+        monad_peer_discovery::driver::PeerDiscoveryDriver<
+            monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
+        >,
+    >,
+> {
+    let mut builder = monad_peer_discovery::mock::NopDiscoveryBuilder::default();
+    builder.known_addresses = known_addresses;
+    builder.name_records = name_records;
+    let pd = monad_peer_discovery::driver::PeerDiscoveryDriver::new(builder);
+    Arc::new(std::sync::Mutex::new(pd))
+}
+
+fn spawn_noop_validator(
+    keypair: Arc<KeyPair>,
+    auth_addr: SocketAddrV4,
+    non_auth_addr: SocketAddrV4,
+    known_addresses: HashMap<NodeId<CertificateSignaturePubKey<SecpSignature>>, SocketAddrV4>,
+    name_records: HashMap<
+        NodeId<CertificateSignaturePubKey<SecpSignature>>,
+        MonadNameRecord<SecpSignature>,
+    >,
 ) -> ValidatorChannels {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
     tokio::task::spawn_local(async move {
-        let mut builder = monad_peer_discovery::mock::NopDiscoveryBuilder::default();
-        builder.known_addresses = known_addresses;
-        builder.name_records = name_records;
-
-        let pd = monad_peer_discovery::driver::PeerDiscoveryDriver::new(builder);
-        let shared_pd = Arc::new(std::sync::Mutex::new(pd));
-
-        let up_bandwidth_mbps = 1_000;
-        let non_auth_addr = SocketAddr::new((*auth_addr.ip()).into(), auth_addr.port() + 1);
-        let dp =
-            monad_dataplane::DataplaneBuilder::new(&SocketAddr::V4(auth_addr), up_bandwidth_mbps)
-                .extend_udp_sockets(vec![
-                    monad_dataplane::UdpSocketConfig {
-                        socket_addr: SocketAddr::V4(auth_addr),
-                        label: monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
-                    },
-                    monad_dataplane::UdpSocketConfig {
-                        socket_addr: non_auth_addr,
-                        label: monad_raptorcast::RAPTORCAST_SOCKET.to_string(),
-                    },
-                ])
-                .build();
-        assert!(dp.block_until_ready(Duration::from_secs(1)));
-        let (tcp_socket, mut udp_dataplane, control) = dp.split();
-        let authenticated_socket = udp_dataplane
-            .take_socket(monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET)
-            .expect("authenticated socket");
-        let non_authenticated_socket = udp_dataplane
-            .take_socket(monad_raptorcast::RAPTORCAST_SOCKET)
-            .expect("non-authenticated socket");
+        let shared_pd = create_peer_discovery(known_addresses, name_records);
+        let (tcp_socket, authenticated_socket, non_authenticated_socket, control) =
+            create_dataplane(auth_addr, non_auth_addr);
         let (tcp_reader, tcp_writer) = tcp_socket.split();
-
-        let config = monad_raptorcast::config::RaptorCastConfig {
-            shared_key: Arc::new(keypair),
-            mtu: monad_dataplane::udp::DEFAULT_MTU,
-            udp_message_max_age_ms: u64::MAX,
-            primary_instance: Default::default(),
-            secondary_instance: monad_node_config::FullNodeRaptorCastConfig {
-                enable_publisher: false,
-                enable_client: false,
-                raptor10_fullnode_redundancy_factor: 2f32,
-                full_nodes_prioritized: monad_node_config::FullNodeConfig { identities: vec![] },
-                round_span: monad_types::Round(10),
-                invite_lookahead: monad_types::Round(5),
-                max_invite_wait: monad_types::Round(3),
-                deadline_round_dist: monad_types::Round(3),
-                init_empty_round_span: monad_types::Round(1),
-                max_group_size: 10,
-                max_num_group: 5,
-                invite_future_dist_min: monad_types::Round(1),
-                invite_future_dist_max: monad_types::Round(5),
-                invite_accept_heartbeat_ms: 100,
-            },
-        };
-
-        let auth_protocol = monad_raptorcast::authentication::NoopAuthProtocol::new();
+        let config = create_raptorcast_config(keypair);
+        let auth_protocol = monad_raptorcast::auth::NoopAuthProtocol::new();
 
         let mut validator_rc = monad_raptorcast::RaptorCast::<
-            SignatureType,
+            SecpSignature,
             MockMessage,
             MockMessage,
-            MockEvent<PubKeyType>,
-            monad_peer_discovery::mock::NopDiscovery<SignatureType>,
+            MockEvent<CertificateSignaturePubKey<SecpSignature>>,
+            monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
             _,
         >::new(
             config,
@@ -222,10 +304,14 @@ fn spawn_noop_validator(
 }
 
 fn spawn_wireauth_validator(
-    keypair: KeyPair,
+    keypair: Arc<KeyPair>,
     auth_addr: SocketAddrV4,
-    known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4>,
-    name_records: HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>>,
+    non_auth_addr: SocketAddrV4,
+    known_addresses: HashMap<NodeId<CertificateSignaturePubKey<SecpSignature>>, SocketAddrV4>,
+    name_records: HashMap<
+        NodeId<CertificateSignaturePubKey<SecpSignature>>,
+        MonadNameRecord<SecpSignature>,
+    >,
     peers_to_check: Vec<(SocketAddrV4, monad_secp::PubKey)>,
 ) -> ValidatorChannels {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -233,73 +319,21 @@ fn spawn_wireauth_validator(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
     tokio::task::spawn_local(async move {
-        let mut builder = monad_peer_discovery::mock::NopDiscoveryBuilder::default();
-        builder.known_addresses = known_addresses;
-        builder.name_records = name_records;
-
-        let pd = monad_peer_discovery::driver::PeerDiscoveryDriver::new(builder);
-        let shared_pd = Arc::new(std::sync::Mutex::new(pd));
-
-        let up_bandwidth_mbps = 1_000;
-        let non_auth_addr = SocketAddr::new((*auth_addr.ip()).into(), auth_addr.port() + 1);
-        let dp =
-            monad_dataplane::DataplaneBuilder::new(&SocketAddr::V4(auth_addr), up_bandwidth_mbps)
-                .extend_udp_sockets(vec![
-                    monad_dataplane::UdpSocketConfig {
-                        socket_addr: SocketAddr::V4(auth_addr),
-                        label: monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
-                    },
-                    monad_dataplane::UdpSocketConfig {
-                        socket_addr: non_auth_addr,
-                        label: monad_raptorcast::RAPTORCAST_SOCKET.to_string(),
-                    },
-                ])
-                .build();
-        assert!(dp.block_until_ready(Duration::from_secs(1)));
-        let (tcp_socket, mut udp_dataplane, control) = dp.split();
-        let authenticated_socket = udp_dataplane
-            .take_socket(monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET)
-            .expect("authenticated socket");
-        let non_authenticated_socket = udp_dataplane
-            .take_socket(monad_raptorcast::RAPTORCAST_SOCKET)
-            .expect("non-authenticated socket");
+        let shared_pd = create_peer_discovery(known_addresses, name_records);
+        let (tcp_socket, authenticated_socket, non_authenticated_socket, control) =
+            create_dataplane(auth_addr, non_auth_addr);
         let (tcp_reader, tcp_writer) = tcp_socket.split();
-
-        let config = monad_raptorcast::config::RaptorCastConfig {
-            shared_key: Arc::new(keypair),
-            mtu: monad_dataplane::udp::DEFAULT_MTU,
-            udp_message_max_age_ms: u64::MAX,
-            primary_instance: Default::default(),
-            secondary_instance: monad_node_config::FullNodeRaptorCastConfig {
-                enable_publisher: false,
-                enable_client: false,
-                raptor10_fullnode_redundancy_factor: 2f32,
-                full_nodes_prioritized: monad_node_config::FullNodeConfig { identities: vec![] },
-                round_span: monad_types::Round(10),
-                invite_lookahead: monad_types::Round(5),
-                max_invite_wait: monad_types::Round(3),
-                deadline_round_dist: monad_types::Round(3),
-                init_empty_round_span: monad_types::Round(1),
-                max_group_size: 10,
-                max_num_group: 5,
-                invite_future_dist_min: monad_types::Round(1),
-                invite_future_dist_max: monad_types::Round(5),
-                invite_accept_heartbeat_ms: 100,
-            },
-        };
-
+        let config = create_raptorcast_config(keypair.clone());
         let wireauth_config = monad_wireauth::Config::default();
-        let auth_protocol = monad_raptorcast::authentication::WireAuthProtocol::new(
-            wireauth_config,
-            &config.shared_key,
-        );
+        let auth_protocol =
+            monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, &keypair);
 
         let mut validator_rc = monad_raptorcast::RaptorCast::<
-            SignatureType,
+            SecpSignature,
             MockMessage,
             MockMessage,
-            MockEvent<PubKeyType>,
-            monad_peer_discovery::mock::NopDiscovery<SignatureType>,
+            MockEvent<CertificateSignaturePubKey<SecpSignature>>,
+            monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
             _,
         >::new(
             config,
@@ -315,6 +349,7 @@ fn spawn_wireauth_validator(
         );
 
         let mut cmd_rx = cmd_rx;
+        let check_connections = !peers_to_check.is_empty();
         let mut ready_tx = Some(ready_tx);
         let mut check_interval = tokio::time::interval(Duration::from_millis(100));
 
@@ -328,7 +363,7 @@ fn spawn_wireauth_validator(
                         break;
                     }
                 }
-                _ = check_interval.tick() => {
+                _ = check_interval.tick(), if check_connections => {
                     if let Some(tx) = ready_tx.take() {
                         let all_connected = peers_to_check.iter().all(|(addr, pubkey)| {
                             validator_rc.is_connected_to(&SocketAddr::V4(*addr), pubkey)
@@ -352,733 +387,199 @@ fn spawn_wireauth_validator(
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_wireauth_message_exchange() {
-    init_tracing();
+async fn establish_connections(
+    cmd_txs: &[&tokio::sync::mpsc::UnboundedSender<RouterCommand<SecpSignature, MockMessage>>],
+    ready_rxs: Vec<tokio::sync::oneshot::Receiver<()>>,
+    epoch: Epoch,
+    validator_set: Vec<(NodeId<CertificateSignaturePubKey<SecpSignature>>, Stake)>,
+    event_rxs: &mut [&mut tokio::sync::mpsc::UnboundedReceiver<
+        MockEvent<CertificateSignaturePubKey<SecpSignature>>,
+    >],
+) {
+    for cmd_tx in cmd_txs {
+        cmd_tx
+            .send(RouterCommand::AddEpochValidatorSet {
+                epoch,
+                validator_set: validator_set.clone(),
+            })
+            .unwrap();
+    }
 
-    let local = tokio::task::LocalSet::new();
+    let setup_message = MockMessage::new(1, 100);
+    for cmd_tx in cmd_txs {
+        cmd_tx
+            .send(RouterCommand::Publish {
+                target: monad_types::RouterTarget::Broadcast(epoch),
+                message: setup_message,
+            })
+            .unwrap();
+    }
 
-    local
-        .run_until(async {
-            let auth_port1 = find_free_port();
-            let auth_port2 = find_free_port();
+    for ready_rx in ready_rxs {
+        tokio::time::timeout(CONNECTION_TIMEOUT, ready_rx)
+            .await
+            .expect("connection timeout")
+            .expect("ready channel closed");
+    }
 
-            let validator1_keypair = keypair(1);
-            let validator1_nodeid = NodeId::new(validator1_keypair.pubkey());
-            let validator1_pubkey = validator1_keypair.pubkey();
-            let validator1_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port1);
-
-            let validator2_keypair = keypair(2);
-            let validator2_nodeid = NodeId::new(validator2_keypair.pubkey());
-            let validator2_pubkey = validator2_keypair.pubkey();
-            let validator2_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port2);
-
-            let name_record1 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8000,
-                validator1_auth_addr.port() + 1,
-                validator1_auth_addr.port(),
-                1,
-            );
-            let monad_name_record1 = MonadNameRecord::new(name_record1, &validator1_keypair);
-
-            let name_record2 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8002,
-                validator2_auth_addr.port() + 1,
-                validator2_auth_addr.port(),
-                1,
-            );
-            let monad_name_record2 = MonadNameRecord::new(name_record2, &validator2_keypair);
-
-            let mut name_records = HashMap::new();
-            name_records.insert(validator1_nodeid, monad_name_record1);
-            name_records.insert(validator2_nodeid, monad_name_record2);
-
-            let known_addresses = HashMap::from([
-                (
-                    validator1_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator1_auth_addr.port() + 1),
-                ),
-                (
-                    validator2_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator2_auth_addr.port() + 1),
-                ),
-            ]);
-
-            let validator1 = spawn_wireauth_validator(
-                validator1_keypair,
-                validator1_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![(validator2_auth_addr, validator2_pubkey)],
-            );
-
-            let validator2 = spawn_wireauth_validator(
-                validator2_keypair,
-                validator2_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![(validator1_auth_addr, validator1_pubkey)],
-            );
-
-            let epoch = Epoch(0);
-            let validator_set = vec![
-                (validator1_nodeid, Stake::ONE),
-                (validator2_nodeid, Stake::ONE),
-            ];
-
-            validator1
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            validator2
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            let setup_message = MockMessage::new(1, 100);
-            for validator in [&validator1, &validator2] {
-                validator
-                    .cmd_tx
-                    .send(RouterCommand::Publish {
-                        target: monad_types::RouterTarget::Broadcast(epoch),
-                        message: setup_message,
-                    })
-                    .unwrap();
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let ready_timeout = Duration::from_secs(5);
-            tokio::time::timeout(ready_timeout, validator1.ready_rx)
-                .await
-                .expect("validator1 connection timeout")
-                .expect("validator1 ready channel closed");
-
-            tokio::time::timeout(ready_timeout, validator2.ready_rx)
-                .await
-                .expect("validator2 connection timeout")
-                .expect("validator2 ready channel closed");
-
-            let mut validator1_event_rx = validator1.event_rx;
-            let mut validator2_event_rx = validator2.event_rx;
-            while validator1_event_rx.try_recv().is_ok() {}
-            while validator2_event_rx.try_recv().is_ok() {}
-
-            let message = MockMessage::new(42, 1000);
-            validator1
-                .cmd_tx
-                .send(RouterCommand::PublishWithPriority {
-                    target: monad_types::RouterTarget::PointToPoint(validator2_nodeid),
-                    message,
-                    priority: monad_types::UdpPriority::Regular,
-                })
-                .unwrap();
-
-            let timeout = Duration::from_secs(5);
-            let event = tokio::time::timeout(timeout, validator2_event_rx.recv())
-                .await
-                .expect("timeout waiting for message")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event;
-            assert_eq!(from, validator1_nodeid);
-            assert_eq!(msg_id, 42);
-
-            let message = MockMessage::new(43, 1000);
-            validator2
-                .cmd_tx
-                .send(RouterCommand::PublishWithPriority {
-                    target: monad_types::RouterTarget::PointToPoint(validator1_nodeid),
-                    message,
-                    priority: monad_types::UdpPriority::Regular,
-                })
-                .unwrap();
-
-            let event = tokio::time::timeout(timeout, validator1_event_rx.recv())
-                .await
-                .expect("timeout waiting for message")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event;
-            assert_eq!(from, validator2_nodeid);
-            assert_eq!(msg_id, 43);
-        })
-        .await;
+    for event_rx in event_rxs {
+        while event_rx.try_recv().is_ok() {}
+    }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_wireauth_three_node_raptorcast() {
-    init_tracing();
-
-    let local = tokio::task::LocalSet::new();
-
-    local
-        .run_until(async {
-            let auth_port1 = find_free_port();
-            let auth_port2 = find_free_port();
-            let auth_port3 = find_free_port();
-
-            let validator1_keypair = keypair(1);
-            let validator1_nodeid = NodeId::new(validator1_keypair.pubkey());
-            let validator1_pubkey = validator1_keypair.pubkey();
-            let validator1_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port1);
-
-            let validator2_keypair = keypair(2);
-            let validator2_nodeid = NodeId::new(validator2_keypair.pubkey());
-            let validator2_pubkey = validator2_keypair.pubkey();
-            let validator2_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port2);
-
-            let validator3_keypair = keypair(3);
-            let validator3_nodeid = NodeId::new(validator3_keypair.pubkey());
-            let validator3_pubkey = validator3_keypair.pubkey();
-            let validator3_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port3);
-
-            let name_record1 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8000,
-                validator1_auth_addr.port() + 1,
-                validator1_auth_addr.port(),
-                1,
-            );
-            let monad_name_record1 = MonadNameRecord::new(name_record1, &validator1_keypair);
-
-            let name_record2 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8002,
-                validator2_auth_addr.port() + 1,
-                validator2_auth_addr.port(),
-                1,
-            );
-            let monad_name_record2 = MonadNameRecord::new(name_record2, &validator2_keypair);
-
-            let name_record3 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8004,
-                validator3_auth_addr.port() + 1,
-                validator3_auth_addr.port(),
-                1,
-            );
-            let monad_name_record3 = MonadNameRecord::new(name_record3, &validator3_keypair);
-
-            let mut name_records = HashMap::new();
-            name_records.insert(validator1_nodeid, monad_name_record1);
-            name_records.insert(validator2_nodeid, monad_name_record2);
-            name_records.insert(validator3_nodeid, monad_name_record3);
-
-            let known_addresses = HashMap::from([
-                (
-                    validator1_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator1_auth_addr.port() + 1),
-                ),
-                (
-                    validator2_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator2_auth_addr.port() + 1),
-                ),
-                (
-                    validator3_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator3_auth_addr.port() + 1),
-                ),
-            ]);
-
-            let validator1 = spawn_wireauth_validator(
-                validator1_keypair,
-                validator1_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![
-                    (validator2_auth_addr, validator2_pubkey),
-                    (validator3_auth_addr, validator3_pubkey),
-                ],
-            );
-
-            let validator2 = spawn_wireauth_validator(
-                validator2_keypair,
-                validator2_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![
-                    (validator1_auth_addr, validator1_pubkey),
-                    (validator3_auth_addr, validator3_pubkey),
-                ],
-            );
-
-            let validator3 = spawn_wireauth_validator(
-                validator3_keypair,
-                validator3_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![
-                    (validator1_auth_addr, validator1_pubkey),
-                    (validator2_auth_addr, validator2_pubkey),
-                ],
-            );
-
-            let epoch = Epoch(0);
-            let validator_set = vec![
-                (validator1_nodeid, Stake::ONE),
-                (validator2_nodeid, Stake::ONE),
-                (validator3_nodeid, Stake::ONE),
-            ];
-
-            validator1
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            validator2
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            validator3
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            let setup_message = MockMessage::new(1, 100);
-            for validator in [&validator1, &validator2, &validator3] {
-                validator
-                    .cmd_tx
-                    .send(RouterCommand::Publish {
-                        target: monad_types::RouterTarget::Broadcast(epoch),
-                        message: setup_message,
-                    })
-                    .unwrap();
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let ready_timeout = Duration::from_secs(5);
-            tokio::time::timeout(ready_timeout, validator1.ready_rx)
-                .await
-                .expect("validator1 connection timeout")
-                .expect("validator1 ready channel closed");
-
-            tokio::time::timeout(ready_timeout, validator2.ready_rx)
-                .await
-                .expect("validator2 connection timeout")
-                .expect("validator2 ready channel closed");
-
-            tokio::time::timeout(ready_timeout, validator3.ready_rx)
-                .await
-                .expect("validator3 connection timeout")
-                .expect("validator3 ready channel closed");
-
-            let mut validator1_event_rx = validator1.event_rx;
-            let mut validator2_event_rx = validator2.event_rx;
-            let mut validator3_event_rx = validator3.event_rx;
-            while validator1_event_rx.try_recv().is_ok() {}
-            while validator2_event_rx.try_recv().is_ok() {}
-            while validator3_event_rx.try_recv().is_ok() {}
-
-            let message = MockMessage::new(100, 10000);
-            validator1
-                .cmd_tx
-                .send(RouterCommand::Publish {
-                    target: monad_types::RouterTarget::Raptorcast(epoch),
-                    message,
-                })
-                .unwrap();
-
-            let timeout = Duration::from_secs(5);
-            let event2 = tokio::time::timeout(timeout, validator2_event_rx.recv())
-                .await
-                .expect("timeout waiting for validator2")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event2;
-            assert_eq!(from, validator1_nodeid);
-            assert_eq!(msg_id, 100);
-
-            let event3 = tokio::time::timeout(timeout, validator3_event_rx.recv())
-                .await
-                .expect("timeout waiting for validator3")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event3;
-            assert_eq!(from, validator1_nodeid);
-            assert_eq!(msg_id, 100);
-        })
-        .await;
+#[derive(Clone, Copy)]
+enum RoutingType {
+    PointToPoint,
+    Raptorcast,
+    Broadcast,
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_wireauth_mixed_three_node() {
-    init_tracing();
+async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, message_size: usize) {
+    let validator_infos: Vec<_> = (1..=NUM_NODES as u8).map(ValidatorInfo::new).collect();
 
-    let local = tokio::task::LocalSet::new();
+    let name_records: HashMap<_, _> = validator_infos
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.nodeid, v.create_name_record(i < num_auth_nodes)))
+        .collect();
 
-    local
-        .run_until(async {
-            let auth_port1 = find_free_port();
-            let auth_port2 = find_free_port();
-            let auth_port3 = find_free_port();
+    let known_addresses: HashMap<_, _> = validator_infos
+        .iter()
+        .map(|v| (v.nodeid, v.non_auth_addr))
+        .collect();
 
-            let validator1_keypair = keypair(1);
-            let validator1_nodeid = NodeId::new(validator1_keypair.pubkey());
-            let validator1_pubkey = validator1_keypair.pubkey();
-            let validator1_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port1);
+    let peers_for_check: Vec<_> = validator_infos
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i < num_auth_nodes)
+        .map(|(_, v)| (v.auth_addr, v.pubkey))
+        .collect();
 
-            let validator2_keypair = keypair(2);
-            let validator2_nodeid = NodeId::new(validator2_keypair.pubkey());
-            let validator2_pubkey = validator2_keypair.pubkey();
-            let validator2_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port2);
-
-            let validator3_keypair = keypair(3);
-            let validator3_nodeid = NodeId::new(validator3_keypair.pubkey());
-            let validator3_auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port3);
-
-            let name_record1 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8000,
-                validator1_auth_addr.port() + 1,
-                validator1_auth_addr.port(),
-                1,
-            );
-            let monad_name_record1 = MonadNameRecord::new(name_record1, &validator1_keypair);
-
-            let name_record2 = NameRecord::new_with_authentication(
-                Ipv4Addr::new(127, 0, 0, 1),
-                8002,
-                validator2_auth_addr.port() + 1,
-                validator2_auth_addr.port(),
-                1,
-            );
-            let monad_name_record2 = MonadNameRecord::new(name_record2, &validator2_keypair);
-
-            let name_record3 = NameRecord::new(
-                Ipv4Addr::new(127, 0, 0, 1),
-                validator3_auth_addr.port() + 1,
-                1,
-            );
-            let monad_name_record3 = MonadNameRecord::new(name_record3, &validator3_keypair);
-
-            let mut name_records = HashMap::new();
-            name_records.insert(validator1_nodeid, monad_name_record1);
-            name_records.insert(validator2_nodeid, monad_name_record2);
-            name_records.insert(validator3_nodeid, monad_name_record3);
-
-            let known_addresses = HashMap::from([
-                (
-                    validator1_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator1_auth_addr.port() + 1),
-                ),
-                (
-                    validator2_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator2_auth_addr.port() + 1),
-                ),
-                (
-                    validator3_nodeid,
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), validator3_auth_addr.port() + 1),
-                ),
-            ]);
-
-            let validator1 = spawn_wireauth_validator(
-                validator1_keypair,
-                validator1_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![(validator2_auth_addr, validator2_pubkey)],
-            );
-
-            let validator2 = spawn_wireauth_validator(
-                validator2_keypair,
-                validator2_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-                vec![(validator1_auth_addr, validator1_pubkey)],
-            );
-
-            let validator3 = spawn_noop_validator(
-                validator3_keypair,
-                validator3_auth_addr,
-                known_addresses.clone(),
-                name_records.clone(),
-            );
-
-            let epoch = Epoch(0);
-            let validator_set = vec![
-                (validator1_nodeid, Stake::ONE),
-                (validator2_nodeid, Stake::ONE),
-                (validator3_nodeid, Stake::ONE),
-            ];
-
-            validator1
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            validator2
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            validator3
-                .cmd_tx
-                .send(RouterCommand::AddEpochValidatorSet {
-                    epoch,
-                    validator_set: validator_set.clone(),
-                })
-                .unwrap();
-
-            let setup_message = MockMessage::new(1, 100);
-            for validator in [&validator1, &validator2, &validator3] {
-                validator
-                    .cmd_tx
-                    .send(RouterCommand::Publish {
-                        target: monad_types::RouterTarget::Broadcast(epoch),
-                        message: setup_message,
-                    })
-                    .unwrap();
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let ready_timeout = Duration::from_secs(5);
-            tokio::time::timeout(ready_timeout, validator1.ready_rx)
-                .await
-                .expect("validator1 connection timeout")
-                .expect("validator1 ready channel closed");
-
-            tokio::time::timeout(ready_timeout, validator2.ready_rx)
-                .await
-                .expect("validator2 connection timeout")
-                .expect("validator2 ready channel closed");
-
-            tokio::time::timeout(ready_timeout, validator3.ready_rx)
-                .await
-                .expect("validator3 connection timeout")
-                .expect("validator3 ready channel closed");
-
-            let mut validator1_event_rx = validator1.event_rx;
-            let mut validator2_event_rx = validator2.event_rx;
-            let mut validator3_event_rx = validator3.event_rx;
-            while validator1_event_rx.try_recv().is_ok() {}
-            while validator2_event_rx.try_recv().is_ok() {}
-            while validator3_event_rx.try_recv().is_ok() {}
-
-            let message = MockMessage::new(200, 10000);
-            validator1
-                .cmd_tx
-                .send(RouterCommand::Publish {
-                    target: monad_types::RouterTarget::Raptorcast(epoch),
-                    message,
-                })
-                .unwrap();
-
-            let timeout = Duration::from_secs(5);
-            let event2 = tokio::time::timeout(timeout, validator2_event_rx.recv())
-                .await
-                .expect("timeout waiting for validator2")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event2;
-            assert_eq!(from, validator1_nodeid);
-            assert_eq!(msg_id, 200);
-
-            let event3 = tokio::time::timeout(timeout, validator3_event_rx.recv())
-                .await
-                .expect("timeout waiting for validator3")
-                .expect("channel closed");
-
-            let MockEvent((from, msg_id)) = event3;
-            assert_eq!(from, validator1_nodeid);
-            assert_eq!(msg_id, 200);
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_wireauth_ten_node_mixed() {
-    init_tracing();
-
-    let local = tokio::task::LocalSet::new();
-
-    local
-        .run_until(async {
-            let mut validators = Vec::new();
-            let mut validator_infos = Vec::new();
-
-            for i in 1..=10 {
-                let keypair = keypair(i);
-                let nodeid = NodeId::new(keypair.pubkey());
-                let pubkey = keypair.pubkey();
-                let auth_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), find_free_port());
-
-                validator_infos.push((keypair, nodeid, pubkey, auth_addr));
-            }
-
-            let mut name_records = HashMap::new();
-            let mut known_addresses = HashMap::new();
-
-            for (keypair, nodeid, _pubkey, auth_addr) in &validator_infos {
-                let name_record = if validator_infos
+    let validators: Vec<_> = validator_infos
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i < num_auth_nodes {
+                let peers = peers_for_check
                     .iter()
-                    .position(|(_, id, _, _)| id == nodeid)
-                    .unwrap()
-                    < 5
-                {
-                    NameRecord::new_with_authentication(
-                        Ipv4Addr::new(127, 0, 0, 1),
-                        8000 + (nodeid.pubkey().bytes()[0] as u16),
-                        auth_addr.port() + 1,
-                        auth_addr.port(),
-                        1,
-                    )
-                } else {
-                    NameRecord::new(Ipv4Addr::new(127, 0, 0, 1), auth_addr.port() + 1, 1)
-                };
-                let monad_name_record = MonadNameRecord::new(name_record, keypair);
-                name_records.insert(*nodeid, monad_name_record);
-                let non_auth_addr = SocketAddrV4::new(*auth_addr.ip(), auth_addr.port() + 1);
-                known_addresses.insert(*nodeid, non_auth_addr);
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, p)| *p)
+                    .collect();
+                spawn_wireauth_validator(
+                    v.keypair.clone(),
+                    v.auth_addr,
+                    v.non_auth_addr,
+                    known_addresses.clone(),
+                    name_records.clone(),
+                    peers,
+                )
+            } else {
+                spawn_noop_validator(
+                    v.keypair.clone(),
+                    v.auth_addr,
+                    v.non_auth_addr,
+                    known_addresses.clone(),
+                    name_records.clone(),
+                )
             }
+        })
+        .collect();
 
-            let validator_infos_for_peers: Vec<_> = validator_infos
-                .iter()
-                .map(|(_, _, pk, addr)| (*addr, *pk))
-                .collect();
+    let epoch = Epoch(0);
+    let validator_set: Vec<_> = validator_infos
+        .iter()
+        .map(|v| (v.nodeid, Stake::ONE))
+        .collect();
 
-            for (i, (keypair, nodeid, _pubkey, auth_addr)) in
-                validator_infos.into_iter().enumerate()
-            {
-                let peers_to_check: Vec<_> = if i < 5 {
-                    validator_infos_for_peers
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j < 5 && *j != i)
-                        .map(|(_, (addr, pk))| (*addr, *pk))
-                        .collect()
-                } else {
-                    vec![]
-                };
+    let (cmd_txs, ready_rxs, mut event_rxs): (Vec<_>, Vec<_>, Vec<_>) = validators
+        .into_iter()
+        .map(|v| (v.cmd_tx, v.ready_rx, v.event_rx))
+        .multiunzip();
 
-                let validator = if i < 5 {
-                    spawn_wireauth_validator(
-                        keypair,
-                        auth_addr,
-                        known_addresses.clone(),
-                        name_records.clone(),
-                        peers_to_check,
-                    )
-                } else {
-                    spawn_noop_validator(
-                        keypair,
-                        auth_addr,
-                        known_addresses.clone(),
-                        name_records.clone(),
-                    )
-                };
+    let cmd_tx_refs: Vec<_> = cmd_txs.iter().collect();
+    let mut event_rx_refs: Vec<_> = event_rxs.iter_mut().collect();
 
-                validators.push((nodeid, validator));
-            }
+    establish_connections(
+        &cmd_tx_refs,
+        ready_rxs,
+        epoch,
+        validator_set,
+        &mut event_rx_refs,
+    )
+    .await;
 
-            let epoch = Epoch(0);
-            let validator_set: Vec<_> = validators
-                .iter()
-                .map(|(nodeid, _)| (*nodeid, Stake::ONE))
-                .collect();
+    let sender_idx = 0;
+    let sender_nodeid = validator_infos[sender_idx].nodeid;
 
-            for (_nodeid, validator) in &validators {
-                validator
-                    .cmd_tx
-                    .send(RouterCommand::AddEpochValidatorSet {
-                        epoch,
-                        validator_set: validator_set.clone(),
-                    })
-                    .unwrap();
-            }
-
-            let setup_message = MockMessage::new(1, 100);
-            for (_nodeid, validator) in &validators {
-                validator
-                    .cmd_tx
-                    .send(RouterCommand::Publish {
-                        target: monad_types::RouterTarget::Broadcast(epoch),
-                        message: setup_message,
-                    })
-                    .unwrap();
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let ready_timeout = Duration::from_secs(5);
-            for (_nodeid, validator) in validators.iter_mut() {
-                tokio::time::timeout(ready_timeout, &mut validator.ready_rx)
-                    .await
-                    .expect("connection timeout")
-                    .expect("ready channel closed");
-            }
-
-            let cmd_txs: Vec<_> = validators
-                .iter()
-                .map(|(_nodeid, validator)| validator.cmd_tx.clone())
-                .collect();
-
-            let mut event_rxs: Vec<_> = validators
-                .into_iter()
-                .map(|(nodeid, validator)| (nodeid, validator.event_rx))
-                .collect();
-
-            for (_nodeid, event_rx) in &mut event_rxs {
-                while event_rx.try_recv().is_ok() {}
-            }
-
-            let timeout = Duration::from_secs(10);
-
-            for sender_idx in 0..10 {
-                let message = MockMessage::new(1000 + sender_idx as u32, 2_000_000);
+    match routing_type {
+        RoutingType::PointToPoint => {
+            for receiver_idx in 1..NUM_NODES {
+                let message = MockMessage::new(1000 + receiver_idx as u32, message_size);
                 cmd_txs[sender_idx]
                     .send(RouterCommand::Publish {
-                        target: monad_types::RouterTarget::Raptorcast(epoch),
+                        target: monad_types::RouterTarget::PointToPoint(
+                            validator_infos[receiver_idx].nodeid,
+                        ),
                         message,
                     })
                     .unwrap();
 
-                for receiver_idx in 0..10 {
-                    let event = tokio::time::timeout(timeout, event_rxs[receiver_idx].1.recv())
-                        .await
-                        .expect("timeout waiting for message")
-                        .expect("channel closed");
+                let event = tokio::time::timeout(MESSAGE_TIMEOUT, event_rxs[receiver_idx].recv())
+                    .await
+                    .expect("timeout waiting for message")
+                    .expect("channel closed");
 
-                    let MockEvent((_from, msg_id)) = event;
-                    assert_eq!(
-                        msg_id,
-                        1000 + sender_idx as u32,
-                        "receiver {} expected message {} from sender {}, got {}",
-                        receiver_idx,
-                        1000 + sender_idx as u32,
-                        sender_idx,
-                        msg_id
-                    );
-                }
-
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let MockEvent((from, msg_id)) = event;
+                assert_eq!(from, sender_nodeid);
+                assert_eq!(msg_id, 1000 + receiver_idx as u32);
             }
-        })
+        }
+        RoutingType::Raptorcast | RoutingType::Broadcast => {
+            let message = MockMessage::new(1000, message_size);
+            let target = match routing_type {
+                RoutingType::Raptorcast => monad_types::RouterTarget::Raptorcast(epoch),
+                RoutingType::Broadcast => monad_types::RouterTarget::Broadcast(epoch),
+                _ => unreachable!(),
+            };
+
+            cmd_txs[sender_idx]
+                .send(RouterCommand::Publish { target, message })
+                .unwrap();
+
+            for receiver_idx in 0..NUM_NODES {
+                let event = tokio::time::timeout(MESSAGE_TIMEOUT, event_rxs[receiver_idx].recv())
+                    .await
+                    .expect("timeout waiting for message")
+                    .expect("channel closed");
+
+                let MockEvent((from, msg_id)) = event;
+                assert_eq!(from, sender_nodeid);
+                assert_eq!(msg_id, 1000);
+            }
+        }
+    }
+}
+
+#[rstest]
+#[case(10, RoutingType::Raptorcast, 2_000_000)]
+#[case(5, RoutingType::Raptorcast, 2_000_000)]
+#[case(0, RoutingType::Raptorcast, 2_000_000)]
+#[case(5, RoutingType::Broadcast, 10_000)]
+#[case(5, RoutingType::PointToPoint, 1_000)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_wireauth_matrix(
+    #[case] num_auth_nodes: usize,
+    #[case] routing_type: RoutingType,
+    #[case] message_size: usize,
+) {
+    init_tracing();
+
+    tokio::task::LocalSet::new()
+        .run_until(run_test_scenario(
+            num_auth_nodes,
+            routing_type,
+            message_size,
+        ))
         .await;
 }

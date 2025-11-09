@@ -342,9 +342,7 @@ struct NodeSetup {
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
-        monad_raptorcast::authentication::NoopAuthProtocol<
-            CertificateSignaturePubKey<SignatureType>,
-        >,
+        monad_raptorcast::auth::NoopAuthProtocol<CertificateSignaturePubKey<SignatureType>>,
     >,
     node_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
     tcp_addr: SocketAddrV4,
@@ -449,7 +447,7 @@ fn setup_node(
     let pd = PeerDiscoveryDriver::new(noop_builder);
 
     let keypair_arc = Arc::new(keypair);
-    let auth_protocol = monad_raptorcast::authentication::NoopAuthProtocol::new();
+    let auth_protocol = monad_raptorcast::auth::NoopAuthProtocol::new();
 
     let mut raptorcast = RaptorCast::<
         SignatureType,
@@ -457,9 +455,7 @@ fn setup_node(
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
-        monad_raptorcast::authentication::NoopAuthProtocol<
-            CertificateSignaturePubKey<SignatureType>,
-        >,
+        monad_raptorcast::auth::NoopAuthProtocol<CertificateSignaturePubKey<SignatureType>>,
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
