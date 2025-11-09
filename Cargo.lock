@@ -5604,6 +5604,7 @@ dependencies = [
  "monad-updaters",
  "monad-validator",
  "monad-wal",
+ "monad-wireauth",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
@@ -5762,6 +5763,11 @@ dependencies = [
  "monad-testutil",
  "monad-types",
  "monad-validator",
+ "monad-wireauth",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_distr",
@@ -5773,6 +5779,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]

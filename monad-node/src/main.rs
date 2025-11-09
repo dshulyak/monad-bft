@@ -35,9 +35,7 @@ use monad_consensus_types::{
 };
 use monad_control_panel::{ipc::ControlPanelIpcReceiver, TracingReload};
 use monad_crypto::{
-    certificate_signature::{
-        CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
-    },
+    certificate_signature::{CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey},
     signing_domain,
 };
 use monad_dataplane::DataplaneBuilder;
@@ -58,7 +56,7 @@ use monad_peer_discovery::{
 use monad_pprof::start_pprof_server;
 use monad_raptorcast::{
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
-    RAPTORCAST_SOCKET,
+    AUTHENTICATED_RAPTORCAST_SOCKET, RAPTORCAST_SOCKET,
 };
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
@@ -565,9 +563,16 @@ fn build_raptorcast_router<ST, SCT, M, OM>(
     locked_epoch_validators: Vec<ValidatorSetDataWithEpoch<SCT>>,
     current_epoch: Epoch,
     current_round: Round,
-) -> MultiRouter<ST, M, OM, MonadEvent<ST, SCT, ExecutionProtocolType>, PeerDiscovery<ST>>
+) -> MultiRouter<
+    ST,
+    M,
+    OM,
+    MonadEvent<ST, SCT, ExecutionProtocolType>,
+    PeerDiscovery<ST>,
+    monad_raptorcast::auth::WireAuthProtocol,
+>
 where
-    ST: CertificateSignatureRecoverable,
+    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>>
         + Decodable
@@ -581,6 +586,10 @@ where
         IpAddr::V4(node_config.network.bind_address_host),
         node_config.network.bind_address_port,
     );
+    let authenticated_bind_address = SocketAddr::new(
+        IpAddr::V4(node_config.network.bind_address_host),
+        node_config.network.authenticated_bind_address_port,
+    );
     let Some(SocketAddr::V4(name_record_address)) = resolve_domain_v4(
         &NodeId::new(identity.pubkey()),
         &peer_discovery_config.self_address,
@@ -593,6 +602,7 @@ where
 
     tracing::debug!(
         ?bind_address,
+        ?authenticated_bind_address,
         ?name_record_address,
         "Monad-node starting, pid: {}",
         process::id()
@@ -612,16 +622,25 @@ where
         .with_tcp_rps_burst(
             network_config.tcp_rate_limit_rps,
             network_config.tcp_rate_limit_burst,
-        )
-        .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
+        );
+
+    dp_builder = dp_builder.extend_udp_sockets(vec![
+        monad_dataplane::UdpSocketConfig {
+            socket_addr: authenticated_bind_address,
+            label: AUTHENTICATED_RAPTORCAST_SOCKET.to_string(),
+        },
+        monad_dataplane::UdpSocketConfig {
             socket_addr: bind_address,
             label: RAPTORCAST_SOCKET.to_string(),
-        }]);
+        },
+    ]);
 
     let self_id = NodeId::new(identity.pubkey());
-    let self_record = NameRecord::new(
+    let self_record = NameRecord::new_with_authentication(
         *name_record_address.ip(),
         name_record_address.port(),
+        network_config.bind_address_port,
+        network_config.authenticated_bind_address_port,
         peer_discovery_config.self_record_seq_num,
     );
     let self_record = MonadNameRecord::new(self_record, &identity);
@@ -721,10 +740,14 @@ where
         rng: ChaCha8Rng::from_entropy(),
     };
 
+    let shared_key = Arc::new(identity);
+    let wireauth_config = monad_wireauth::Config::default();
+    let auth_protocol = monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, &shared_key);
+
     MultiRouter::new(
         self_id,
         RaptorCastConfig {
-            shared_key: Arc::new(identity),
+            shared_key,
             mtu: network_config.mtu,
             udp_message_max_age_ms: network_config.udp_message_max_age_ms,
             primary_instance: RaptorCastConfigPrimary {
@@ -740,6 +763,7 @@ where
         peer_discovery_builder,
         current_epoch,
         epoch_validators,
+        auth_protocol,
     )
 }
 
