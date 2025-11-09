@@ -21,6 +21,7 @@ monad-raptor = { workspace = true }
 monad-secp = { workspace = true }
 monad-types = { workspace = true }
 monad-validator = { workspace = true }
+monad-wireauth = { workspace = true }
 
 alloy-rlp = { workspace = true }
 bitvec = { workspace = true }
@@ -36,7 +37,8 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+zerocopy = { workspace = true }
 
 [dev-dependencies]
 monad-testutil = { workspace = true }
