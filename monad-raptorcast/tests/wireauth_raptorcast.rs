@@ -444,6 +444,19 @@ async fn test_wireauth_message_exchange() {
                 })
                 .unwrap();
 
+            let setup_message = MockMessage::new(1, 100);
+            for validator in [&validator1, &validator2] {
+                validator
+                    .cmd_tx
+                    .send(RouterCommand::Publish {
+                        target: monad_types::RouterTarget::Broadcast(epoch),
+                        message: setup_message,
+                    })
+                    .unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
             let ready_timeout = Duration::from_secs(5);
             tokio::time::timeout(ready_timeout, validator1.ready_rx)
                 .await
@@ -454,6 +467,11 @@ async fn test_wireauth_message_exchange() {
                 .await
                 .expect("validator2 connection timeout")
                 .expect("validator2 ready channel closed");
+
+            let mut validator1_event_rx = validator1.event_rx;
+            let mut validator2_event_rx = validator2.event_rx;
+            while validator1_event_rx.try_recv().is_ok() {}
+            while validator2_event_rx.try_recv().is_ok() {}
 
             let message = MockMessage::new(42, 1000);
             validator1
@@ -466,7 +484,6 @@ async fn test_wireauth_message_exchange() {
                 .unwrap();
 
             let timeout = Duration::from_secs(5);
-            let mut validator2_event_rx = validator2.event_rx;
             let event = tokio::time::timeout(timeout, validator2_event_rx.recv())
                 .await
                 .expect("timeout waiting for message")
@@ -486,7 +503,6 @@ async fn test_wireauth_message_exchange() {
                 })
                 .unwrap();
 
-            let mut validator1_event_rx = validator1.event_rx;
             let event = tokio::time::timeout(timeout, validator1_event_rx.recv())
                 .await
                 .expect("timeout waiting for message")
@@ -637,6 +653,19 @@ async fn test_wireauth_three_node_raptorcast() {
                 })
                 .unwrap();
 
+            let setup_message = MockMessage::new(1, 100);
+            for validator in [&validator1, &validator2, &validator3] {
+                validator
+                    .cmd_tx
+                    .send(RouterCommand::Publish {
+                        target: monad_types::RouterTarget::Broadcast(epoch),
+                        message: setup_message,
+                    })
+                    .unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
             let ready_timeout = Duration::from_secs(5);
             tokio::time::timeout(ready_timeout, validator1.ready_rx)
                 .await
@@ -653,6 +682,13 @@ async fn test_wireauth_three_node_raptorcast() {
                 .expect("validator3 connection timeout")
                 .expect("validator3 ready channel closed");
 
+            let mut validator1_event_rx = validator1.event_rx;
+            let mut validator2_event_rx = validator2.event_rx;
+            let mut validator3_event_rx = validator3.event_rx;
+            while validator1_event_rx.try_recv().is_ok() {}
+            while validator2_event_rx.try_recv().is_ok() {}
+            while validator3_event_rx.try_recv().is_ok() {}
+
             let message = MockMessage::new(100, 10000);
             validator1
                 .cmd_tx
@@ -663,7 +699,6 @@ async fn test_wireauth_three_node_raptorcast() {
                 .unwrap();
 
             let timeout = Duration::from_secs(5);
-            let mut validator2_event_rx = validator2.event_rx;
             let event2 = tokio::time::timeout(timeout, validator2_event_rx.recv())
                 .await
                 .expect("timeout waiting for validator2")
@@ -673,7 +708,6 @@ async fn test_wireauth_three_node_raptorcast() {
             assert_eq!(from, validator1_nodeid);
             assert_eq!(msg_id, 100);
 
-            let mut validator3_event_rx = validator3.event_rx;
             let event3 = tokio::time::timeout(timeout, validator3_event_rx.recv())
                 .await
                 .expect("timeout waiting for validator3")
@@ -811,6 +845,19 @@ async fn test_wireauth_mixed_three_node() {
                 })
                 .unwrap();
 
+            let setup_message = MockMessage::new(1, 100);
+            for validator in [&validator1, &validator2, &validator3] {
+                validator
+                    .cmd_tx
+                    .send(RouterCommand::Publish {
+                        target: monad_types::RouterTarget::Broadcast(epoch),
+                        message: setup_message,
+                    })
+                    .unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
             let ready_timeout = Duration::from_secs(5);
             tokio::time::timeout(ready_timeout, validator1.ready_rx)
                 .await
@@ -827,6 +874,13 @@ async fn test_wireauth_mixed_three_node() {
                 .expect("validator3 connection timeout")
                 .expect("validator3 ready channel closed");
 
+            let mut validator1_event_rx = validator1.event_rx;
+            let mut validator2_event_rx = validator2.event_rx;
+            let mut validator3_event_rx = validator3.event_rx;
+            while validator1_event_rx.try_recv().is_ok() {}
+            while validator2_event_rx.try_recv().is_ok() {}
+            while validator3_event_rx.try_recv().is_ok() {}
+
             let message = MockMessage::new(200, 10000);
             validator1
                 .cmd_tx
@@ -837,7 +891,6 @@ async fn test_wireauth_mixed_three_node() {
                 .unwrap();
 
             let timeout = Duration::from_secs(5);
-            let mut validator2_event_rx = validator2.event_rx;
             let event2 = tokio::time::timeout(timeout, validator2_event_rx.recv())
                 .await
                 .expect("timeout waiting for validator2")
@@ -847,7 +900,6 @@ async fn test_wireauth_mixed_three_node() {
             assert_eq!(from, validator1_nodeid);
             assert_eq!(msg_id, 200);
 
-            let mut validator3_event_rx = validator3.event_rx;
             let event3 = tokio::time::timeout(timeout, validator3_event_rx.recv())
                 .await
                 .expect("timeout waiting for validator3")
@@ -902,8 +954,7 @@ async fn test_wireauth_ten_node_mixed() {
                 };
                 let monad_name_record = MonadNameRecord::new(name_record, keypair);
                 name_records.insert(*nodeid, monad_name_record);
-                let non_auth_addr =
-                    SocketAddrV4::new(*auth_addr.ip(), auth_addr.port() + 1);
+                let non_auth_addr = SocketAddrV4::new(*auth_addr.ip(), auth_addr.port() + 1);
                 known_addresses.insert(*nodeid, non_auth_addr);
             }
 
@@ -912,7 +963,8 @@ async fn test_wireauth_ten_node_mixed() {
                 .map(|(_, _, pk, addr)| (*addr, *pk))
                 .collect();
 
-            for (i, (keypair, nodeid, _pubkey, auth_addr)) in validator_infos.into_iter().enumerate()
+            for (i, (keypair, nodeid, _pubkey, auth_addr)) in
+                validator_infos.into_iter().enumerate()
             {
                 let peers_to_check: Vec<_> = if i < 5 {
                     validator_infos_for_peers
@@ -961,6 +1013,19 @@ async fn test_wireauth_ten_node_mixed() {
                     .unwrap();
             }
 
+            let setup_message = MockMessage::new(1, 100);
+            for (_nodeid, validator) in &validators {
+                validator
+                    .cmd_tx
+                    .send(RouterCommand::Publish {
+                        target: monad_types::RouterTarget::Broadcast(epoch),
+                        message: setup_message,
+                    })
+                    .unwrap();
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
             let ready_timeout = Duration::from_secs(5);
             for (_nodeid, validator) in validators.iter_mut() {
                 tokio::time::timeout(ready_timeout, &mut validator.ready_rx)
@@ -978,6 +1043,10 @@ async fn test_wireauth_ten_node_mixed() {
                 .into_iter()
                 .map(|(nodeid, validator)| (nodeid, validator.event_rx))
                 .collect();
+
+            for (_nodeid, event_rx) in &mut event_rxs {
+                while event_rx.try_recv().is_ok() {}
+            }
 
             let timeout = Duration::from_secs(10);
 

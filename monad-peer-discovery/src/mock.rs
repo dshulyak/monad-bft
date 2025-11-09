@@ -283,4 +283,11 @@ where
     ) -> HashMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>> {
         self.name_records.clone()
     }
+
+    fn get_name_record(
+        &self,
+        id: &NodeId<CertificateSignaturePubKey<ST>>,
+    ) -> Option<&MonadNameRecord<ST>> {
+        self.name_records.get(id)
+    }
 }

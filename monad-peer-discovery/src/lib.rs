@@ -700,6 +700,11 @@ pub trait PeerDiscoveryAlgo {
         NodeId<CertificateSignaturePubKey<Self::SignatureType>>,
         MonadNameRecord<Self::SignatureType>,
     >;
+
+    fn get_name_record(
+        &self,
+        id: &NodeId<CertificateSignaturePubKey<Self::SignatureType>>,
+    ) -> Option<&MonadNameRecord<Self::SignatureType>>;
 }
 
 pub trait PeerDiscoveryAlgoBuilder {

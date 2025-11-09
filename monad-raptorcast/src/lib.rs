@@ -77,6 +77,7 @@ pub mod udp;
 pub mod util;
 
 const SIGNATURE_SIZE: usize = 65;
+const DEFAULT_RETRY_ATTEMPTS: u64 = 3;
 
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
 pub const RAPTORCAST_SOCKET: &str = "raptorcast";
@@ -250,54 +251,6 @@ where
             .is_connected_socket_and_public_key(socket_addr, public_key)
     }
 
-    fn update_auth_connections(&mut self, new_epoch: Epoch, old_epoch: Option<Epoch>) {
-        let pd_driver = self.peer_discovery_driver.lock().unwrap();
-        let new_validators: std::collections::HashSet<_> = self
-            .epoch_validators
-            .get(&new_epoch)
-            .into_iter()
-            .flat_map(|val| val.validators.keys())
-            .collect();
-        let old_validators: std::collections::HashSet<_> = old_epoch
-            .and_then(|epoch| self.epoch_validators.get(&epoch))
-            .into_iter()
-            .flat_map(|val| val.validators.keys())
-            .collect();
-
-        let name_records = pd_driver.get_name_records();
-
-        for validator in new_validators.difference(&old_validators) {
-            if let Some(name_record) = name_records.get(validator) {
-                if let Some(auth_addr) = name_record.name_record.authenticated_udp_socket() {
-                    if let Err(e) = self.dual_socket.connect(
-                        &validator.pubkey(),
-                        SocketAddr::V4(auth_addr),
-                        u64::MAX,
-                    ) {
-                        warn!(
-                            validator=?validator,
-                            auth_addr=?auth_addr,
-                            error=?e,
-                            "failed to connect to validator authenticated endpoint"
-                        );
-                    }
-                } else {
-                    debug!(
-                        validator=?validator,
-                        "validator does not have authenticated udp endpoint, skipping connection"
-                    );
-                }
-            }
-        }
-
-        for validator in old_validators.difference(&new_validators) {
-            self.dual_socket.disconnect(&validator.pubkey());
-        }
-        drop(pd_driver);
-
-        self.dual_socket.flush();
-    }
-
     fn enqueue_message_to_self(
         message: OM,
         pending_events: &mut VecDeque<RaptorCastEvent<M::Event, ST>>,
@@ -363,7 +316,7 @@ where
 
         match target {
             RouterTarget::Broadcast(epoch) | RouterTarget::Raptorcast(epoch) => {
-                let Some(epoch_validators) = self.epoch_validators.get_mut(&epoch) else {
+                let Some(epoch_validators) = self.epoch_validators.get(&epoch) else {
                     error!(
                         "don't have epoch validators populated for epoch: {:?}",
                         epoch
@@ -379,6 +332,16 @@ where
                         self_id,
                     );
                 }
+
+                ensure_authenticated_sessions(
+                    &mut self.dual_socket,
+                    &self.peer_discovery_driver,
+                    epoch_validators
+                        .validators
+                        .keys()
+                        .filter(|&id| *id != self_id),
+                );
+
                 let epoch_validators_without_self = epoch_validators.view_without(vec![&self_id]);
 
                 if epoch_validators_without_self.is_empty() {
@@ -413,6 +376,7 @@ where
                         "long time to build raptorcast/broadcast message"
                     )
                 });
+
                 let dual_socket_cell = RefCell::new(&mut self.dual_socket);
                 let mut sink = UdpMessageBatcher::new(UNICAST_MSG_BATCH_SIZE, |rc_chunks| {
                     dual_socket_cell
@@ -456,6 +420,12 @@ where
                             "long time to build point-to-point message"
                         )
                     });
+
+                    ensure_authenticated_sessions(
+                        &mut self.dual_socket,
+                        &self.peer_discovery_driver,
+                        std::iter::once(&to),
+                    );
 
                     let dual_socket_cell = RefCell::new(&mut self.dual_socket);
                     let mut sink = UdpMessageBatcher::new(UNICAST_MSG_BATCH_SIZE, |rc_chunks| {
@@ -689,8 +659,6 @@ where
                             self.dataplane_control.update_trusted(added, removed);
                         }
 
-                        self.update_auth_connections(epoch, Some(self.current_epoch));
-
                         self.current_epoch = epoch;
                         self.message_builder.set_epoch_no(epoch);
 
@@ -733,7 +701,6 @@ where
                             },
                         );
                         assert!(removed.is_none());
-                        self.update_auth_connections(epoch, None);
                     }
                     self.peer_discovery_driver.lock().unwrap().update(
                         PeerDiscoveryEvent::UpdateValidatorSet {
@@ -881,6 +848,50 @@ where
     }
 }
 
+fn ensure_authenticated_sessions<'a, ST, PD, AP>(
+    dual_socket: &mut authenticated_socket::DualSocketHandle<AP>,
+    peer_discovery_driver: &Arc<Mutex<PeerDiscoveryDriver<PD>>>,
+    targets: impl Iterator<Item = &'a NodeId<CertificateSignaturePubKey<ST>>>,
+) where
+    ST: CertificateSignatureRecoverable,
+    PD: PeerDiscoveryAlgo<SignatureType = ST>,
+    AP: authentication::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+{
+    let pd_driver = peer_discovery_driver.lock().unwrap();
+
+    targets
+        .filter_map(|target| {
+            pd_driver
+                .get_name_record(target)
+                .and_then(|record| record.name_record.authenticated_udp_socket())
+                .map(|addr| (target, addr))
+        })
+        .for_each(|(target, auth_addr)| {
+            // we don't do filter because of the dual_socket borrowing
+            if dual_socket
+                .get_socket_by_public_key(&target.pubkey())
+                .is_some()
+            {
+                return;
+            }
+
+            if let Err(e) = dual_socket.connect(
+                &target.pubkey(),
+                SocketAddr::V4(auth_addr),
+                DEFAULT_RETRY_ATTEMPTS,
+            ) {
+                warn!(
+                    target=?target,
+                    auth_addr=?auth_addr,
+                    error=?e,
+                    "failed to connect to authenticated endpoint"
+                );
+            }
+        });
+
+    dual_socket.flush();
+}
+
 fn iter_ips<'a, ST: CertificateSignatureRecoverable, PD: PeerDiscoveryAlgo<SignatureType = ST>>(
     validators: &'a EpochValidators<ST>,
     peer_discovery: &'a PeerDiscoveryDriver<PD>,
@@ -918,7 +929,6 @@ where
         if let Some(event) = this.pending_events.pop_front() {
             return Poll::Ready(Some(event.into()));
         }
-
 
         this.dual_socket.poll_timer();
 
