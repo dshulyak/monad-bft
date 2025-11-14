@@ -5757,6 +5757,7 @@ dependencies = [
  "monad-merkle",
  "monad-node-config",
  "monad-peer-discovery",
+ "monad-pprof",
  "monad-raptor",
  "monad-secp",
  "monad-testutil",

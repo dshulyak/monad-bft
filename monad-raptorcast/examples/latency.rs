@@ -16,6 +16,10 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16,prof_leak:true\0";
+
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -40,6 +44,7 @@ use monad_peer_discovery::{
     mock::{NopDiscovery, NopDiscoveryBuilder},
     MonadNameRecord, NameRecord,
 };
+use monad_pprof::start_pprof_server;
 use monad_raptorcast::{
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
     raptorcast_secondary::SecondaryRaptorCastModeConfig,
@@ -96,6 +101,12 @@ enum Commands {
             help = "interval for recording metrics"
         )]
         metrics_interval: Duration,
+        #[arg(
+            long,
+            help = "listen address for pprof server. pprof server won't be enabled if address is empty",
+            default_value = ""
+        )]
+        pprof: String,
     },
     #[command(
         about = "run as producer (sends and receives messages). if NODE_INDEX env variable is set, it overwrites --index"
@@ -123,6 +134,12 @@ enum Commands {
             help = "interval for recording metrics"
         )]
         metrics_interval: Duration,
+        #[arg(
+            long,
+            help = "listen address for pprof server. pprof server won't be enabled if address is empty",
+            default_value = ""
+        )]
+        pprof: String,
     },
     Generate {
         #[arg(long)]
@@ -437,6 +454,7 @@ async fn async_main() -> Result<()> {
             index,
             otel_endpoint,
             metrics_interval,
+            pprof,
         } => {
             run_consumer(
                 cluster,
@@ -444,6 +462,7 @@ async fn async_main() -> Result<()> {
                 index,
                 otel_endpoint,
                 metrics_interval,
+                pprof,
             )
             .await
         }
@@ -455,6 +474,7 @@ async fn async_main() -> Result<()> {
             size,
             otel_endpoint,
             metrics_interval,
+            pprof,
         } => {
             run_producer(
                 cluster,
@@ -464,6 +484,7 @@ async fn async_main() -> Result<()> {
                 size,
                 otel_endpoint,
                 metrics_interval,
+                pprof,
             )
             .await
         }
@@ -678,6 +699,7 @@ async fn run_producer(
     size: usize,
     otel_endpoint: Option<String>,
     metrics_interval: Duration,
+    pprof: String,
 ) -> Result<()> {
     let node_index = get_node_index(index_arg)?;
     let NodeSetup {
@@ -694,8 +716,27 @@ async fn run_producer(
         interval = ?interval,
         message_size = size,
         otel_endpoint = ?otel_endpoint,
+        pprof = ?pprof,
         "started producer node"
     );
+
+    if !pprof.is_empty() {
+        tokio::spawn({
+            let pprof_addr = pprof.clone();
+            async move {
+                let server = match start_pprof_server(pprof_addr) {
+                    Ok(server) => server,
+                    Err(err) => {
+                        tracing::error!("failed to start pprof server: {}", err);
+                        return;
+                    }
+                };
+                if let Err(err) = server.await {
+                    tracing::error!("pprof server failed: {}", err);
+                }
+            }
+        });
+    }
 
     let (maybe_otel_meter_provider, mut maybe_metrics_ticker) = otel_endpoint
         .map(|endpoint| {
@@ -776,6 +817,7 @@ async fn run_consumer(
     index_arg: Option<usize>,
     otel_endpoint: Option<String>,
     metrics_interval: Duration,
+    pprof: String,
 ) -> Result<()> {
     let node_index = get_node_index(index_arg)?;
     let NodeSetup {
@@ -790,8 +832,27 @@ async fn run_consumer(
         tcp_addr = ?tcp_addr,
         udp_addr = ?udp_addr,
         otel_endpoint = ?otel_endpoint,
+        pprof = ?pprof,
         "started consumer node"
     );
+
+    if !pprof.is_empty() {
+        tokio::spawn({
+            let pprof_addr = pprof.clone();
+            async move {
+                let server = match start_pprof_server(pprof_addr) {
+                    Ok(server) => server,
+                    Err(err) => {
+                        tracing::error!("failed to start pprof server: {}", err);
+                        return;
+                    }
+                };
+                if let Err(err) = server.await {
+                    tracing::error!("pprof server failed: {}", err);
+                }
+            }
+        });
+    }
 
     let (maybe_otel_meter_provider, mut maybe_metrics_ticker) = otel_endpoint
         .map(|endpoint| {
