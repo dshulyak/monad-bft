@@ -24,6 +24,7 @@ use std::{
 use bytes::BytesMut;
 use futures::future::join_all;
 use monoio::{net::udp::UdpSocket, spawn, time};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
@@ -36,24 +37,55 @@ pub(crate) enum UdpMessageType {
     Direct,
 }
 
+const PRIORITY_QUEUE_BYTES_CAPACITY: usize = 100 * 1024 * 1024;
+
+#[derive(Error, Debug)]
+#[error("priority queue capacity exceeded: priority={priority} current={current_bytes} capacity={capacity_bytes}")]
+struct QueueCapacityError {
+    priority: usize,
+    current_bytes: usize,
+    capacity_bytes: usize,
+}
+
 struct PriorityQueues {
     queues: [VecDeque<UdpMsg>; 2],
+    current_bytes: [usize; 2],
+    capacity_bytes: usize,
 }
 
 impl PriorityQueues {
     fn new() -> Self {
+        Self::with_bytes_capacity(PRIORITY_QUEUE_BYTES_CAPACITY)
+    }
+
+    fn with_bytes_capacity(capacity_bytes: usize) -> Self {
         Self {
             queues: [VecDeque::new(), VecDeque::new()],
+            current_bytes: [0, 0],
+            capacity_bytes,
         }
     }
 
-    fn push(&mut self, msg: UdpMsg) {
-        self.queues[msg.priority as usize].push_back(msg);
+    fn try_push(&mut self, msg: UdpMsg) -> Result<(), QueueCapacityError> {
+        let msg_bytes = msg.payload.len();
+        let priority_idx = msg.priority as usize;
+        if self.current_bytes[priority_idx] + msg_bytes > self.capacity_bytes {
+            return Err(QueueCapacityError {
+                priority: priority_idx,
+                current_bytes: self.current_bytes[priority_idx],
+                capacity_bytes: self.capacity_bytes,
+            });
+        }
+        self.current_bytes[priority_idx] += msg_bytes;
+        self.queues[priority_idx].push_back(msg);
+        Ok(())
     }
 
     fn pop_highest_priority(&mut self) -> Option<UdpMsg> {
-        for queue in self.queues.iter_mut() {
+        for (priority_idx, queue) in self.queues.iter_mut().enumerate() {
             if let Some(msg) = queue.pop_front() {
+                self.current_bytes[priority_idx] =
+                    self.current_bytes[priority_idx].saturating_sub(msg.payload.len());
                 return Some(msg);
             }
         }
@@ -270,7 +302,9 @@ async fn tx(
                 .min(max_batch_bytes);
 
             if chunk_size + total_bytes > max_batch_bytes {
-                priority_queues.push(msg);
+                if let Err(err) = priority_queues.try_push(msg) {
+                    warn!(?err, "failed to re-queue message");
+                }
                 break;
             }
 
@@ -286,7 +320,9 @@ async fn tx(
             let msg_type = msg.msg_type;
 
             if !msg.payload.is_empty() {
-                priority_queues.push(msg);
+                if let Err(err) = priority_queues.try_push(msg) {
+                    warn!(?err, "failed to re-queue message with remaining payload");
+                }
             }
 
             trace!(
@@ -347,7 +383,9 @@ async fn fill_message_queues(
     while priority_queues.is_empty() || !udp_egress_rx.is_empty() {
         match udp_egress_rx.recv().await {
             Some(udp_msg) => {
-                priority_queues.push(udp_msg);
+                if let Err(err) = priority_queues.try_push(udp_msg) {
+                    warn!(?err, "priority queue capacity exceeded, dropping message");
+                }
             }
             None => return Err(()),
         }
@@ -362,11 +400,87 @@ fn max_write_size_for_segment_size(segment_size: u16) -> u16 {
     (MAX_AGGREGATED_WRITE_SIZE / segment_size).min(MAX_AGGREGATED_SEGMENTS) * segment_size
 }
 
-// This is very very ugly, but there is no other way to figure this out.
 fn is_eafnosupport(err: &Error) -> bool {
     const EAFNOSUPPORT: &str = "Address family not supported by protocol";
 
     let err = format!("{}", err);
 
     err.len() >= EAFNOSUPPORT.len() && &err[0..EAFNOSUPPORT.len()] == EAFNOSUPPORT
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use bytes::Bytes;
+    use monad_types::UdpPriority;
+
+    use super::*;
+
+    fn create_test_msg(priority: UdpPriority, payload_size: usize) -> UdpMsg {
+        UdpMsg {
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            payload: Bytes::from(vec![0u8; payload_size]),
+            stride: 1024,
+            priority,
+            msg_type: UdpMessageType::Broadcast,
+        }
+    }
+
+    #[test]
+    fn test_try_push_success() {
+        let mut queue = PriorityQueues::with_bytes_capacity(1024);
+        let msg = create_test_msg(UdpPriority::High, 512);
+
+        assert!(queue.try_push(msg).is_ok());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 512);
+        assert_eq!(queue.current_bytes[UdpPriority::Regular as usize], 0);
+    }
+
+    #[test]
+    fn test_try_push_capacity_exceeded_per_priority() {
+        let mut queue = PriorityQueues::with_bytes_capacity(1000);
+        let msg1 = create_test_msg(UdpPriority::High, 600);
+        let msg2 = create_test_msg(UdpPriority::High, 500);
+
+        assert!(queue.try_push(msg1).is_ok());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 600);
+
+        let result = queue.try_push(msg2);
+        assert!(result.is_err());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 600);
+
+        queue.pop_highest_priority();
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 0);
+
+        let msg3 = create_test_msg(UdpPriority::High, 500);
+        assert!(queue.try_push(msg3).is_ok());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 500);
+    }
+
+    #[test]
+    fn test_per_priority_capacity_independent() {
+        let mut queue = PriorityQueues::with_bytes_capacity(1000);
+
+        let high_msg1 = create_test_msg(UdpPriority::High, 800);
+        let regular_msg1 = create_test_msg(UdpPriority::Regular, 800);
+
+        assert!(queue.try_push(high_msg1).is_ok());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 800);
+        assert_eq!(queue.current_bytes[UdpPriority::Regular as usize], 0);
+
+        assert!(queue.try_push(regular_msg1).is_ok());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 800);
+        assert_eq!(queue.current_bytes[UdpPriority::Regular as usize], 800);
+
+        let high_msg2 = create_test_msg(UdpPriority::High, 300);
+        let result = queue.try_push(high_msg2);
+        assert!(result.is_err());
+        assert_eq!(queue.current_bytes[UdpPriority::High as usize], 800);
+
+        let regular_msg2 = create_test_msg(UdpPriority::Regular, 300);
+        let result = queue.try_push(regular_msg2);
+        assert!(result.is_err());
+        assert_eq!(queue.current_bytes[UdpPriority::Regular as usize], 800);
+    }
 }
