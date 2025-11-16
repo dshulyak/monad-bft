@@ -82,7 +82,7 @@ impl Filter {
             // tick on filter is expected to be called more often than the reset interval
             if let Some(elapsed) = duration_since_start.checked_sub(expected_reset_time) {
                 let elapsed_ms = elapsed.as_millis();
-                if elapsed_ms > 5 {
+                if elapsed_ms > 100 {
                     warn!(
                         elapsed_ms=elapsed_ms,
                         last_reset=?self.last_reset,

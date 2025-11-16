@@ -22,7 +22,7 @@ use std::{
 use bytes::Bytes;
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain};
 use monad_secp::PubKey;
-use tracing::{debug, instrument, trace, warn, Level};
+use tracing::{debug, error, instrument, trace, warn, Level};
 
 use crate::{
     context::Context,
@@ -34,7 +34,7 @@ use crate::{
         ControlPacket, CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation,
         HandshakeResponse, Plaintext,
     },
-    session::{Config, InitiatorState, ResponderState, SessionIndex},
+    session::{Config, InitiatorState, RenewedTimer, ResponderState, SessionIndex},
     state::State,
 };
 
@@ -137,6 +137,14 @@ impl<C: Context> API<C> {
         )
     }
 
+    fn replace_timer(&mut self, timer: RenewedTimer, session_index: SessionIndex) {
+        if let Some(previous) = timer.previous {
+            self.timers.remove(&(previous, session_index));
+        }
+        self.timers.insert((timer.current, session_index));
+        self.metrics[GAUGE_WIREAUTH_STATE_TIMERS_SIZE] = self.timers.len() as u64;
+    }
+
     #[instrument(level = Level::TRACE, skip(self), fields(local_public_key = ?self.local_serialized_public))]
     pub fn tick(&mut self) {
         self.metrics[GAUGE_WIREAUTH_API_TICK] += 1;
@@ -172,7 +180,7 @@ impl<C: Context> API<C> {
                     elapsed_ms=elapsed_ms,
                     "timer triggered"
                 );
-                if elapsed_ms > 10 {
+                if elapsed_ms > 100 {
                     warn!(
                         session_id=?session_id,
                         elapsed_ms=elapsed_ms,
@@ -180,7 +188,7 @@ impl<C: Context> API<C> {
                     );
                 }
             } else {
-                warn!(
+                error!(
                     session_id=?session_id,
                     deadline_duration=?duration,
                     duration_since_start=?duration_since_start,
@@ -494,7 +502,7 @@ impl<C: Context> API<C> {
         let nonce: u64 = data_packet.header().nonce.into();
         trace!(local_session_id=?receiver_index, nonce, "decrypting data packet");
 
-        let (timer, remote_public_key, plaintext) = if let Some(transport) =
+        let (remote_public_key, plaintext) = if let Some(transport) =
             self.state.get_transport_mut(&receiver_index)
         {
             let duration_since_start = self.context.duration_since_start();
@@ -506,7 +514,8 @@ impl<C: Context> API<C> {
                     e.with_addr(remote_addr)
                 })?;
             let remote_public_key = transport.remote_public_key;
-            (timer, remote_public_key, plaintext)
+            self.replace_timer(timer, receiver_index);
+            (remote_public_key, plaintext)
         } else if let Some(responder) = self.state.get_responder_mut(&receiver_index) {
             let duration_since_start = self.context.duration_since_start();
             match responder.decrypt(&self.config, duration_since_start, data_packet) {
@@ -517,7 +526,9 @@ impl<C: Context> API<C> {
                         responder.establish(self.context.rng(), &self.config, duration_since_start);
                     debug!(local_session_id=?receiver_index, "responder session established");
                     self.state.insert_transport(receiver_index, transport);
-                    (establish_timer, remote_public_key, plaintext)
+                    self.timers.insert((establish_timer, receiver_index));
+                    self.metrics[GAUGE_WIREAUTH_STATE_TIMERS_SIZE] = self.timers.len() as u64;
+                    (remote_public_key, plaintext)
                 }
                 Err(e) => {
                     self.metrics[GAUGE_WIREAUTH_ERROR_DECRYPT] += 1;
@@ -531,9 +542,6 @@ impl<C: Context> API<C> {
                 index: receiver_index,
             });
         };
-
-        self.timers.insert((timer, receiver_index));
-        self.metrics[GAUGE_WIREAUTH_STATE_TIMERS_SIZE] = self.timers.len() as u64;
 
         Ok((plaintext, remote_public_key))
     }
@@ -598,7 +606,7 @@ impl<C: Context> API<C> {
 
         self.packet_queue.push_back((remote_addr, message.into()));
         self.metrics[GAUGE_WIREAUTH_STATE_PACKET_QUEUE_SIZE] = self.packet_queue.len() as u64;
-        self.timers.insert((timer, receiver_session_index));
+        self.timers.insert((timer.current, receiver_session_index));
         self.metrics[GAUGE_WIREAUTH_STATE_TIMERS_SIZE] = self.timers.len() as u64;
 
         Ok(())
@@ -627,7 +635,7 @@ impl<C: Context> API<C> {
             plaintext,
         );
         let session_id = transport.common.local_index;
-        self.timers.insert((timer, session_id));
+        self.replace_timer(timer, session_id);
         Ok(header)
     }
 
@@ -654,8 +662,7 @@ impl<C: Context> API<C> {
             plaintext,
         );
         let session_id = transport.common.local_index;
-        self.timers.insert((timer, session_id));
-        self.metrics[GAUGE_WIREAUTH_STATE_TIMERS_SIZE] = self.timers.len() as u64;
+        self.replace_timer(timer, session_id);
         Ok(header)
     }
 

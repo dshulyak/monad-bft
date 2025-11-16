@@ -315,7 +315,7 @@ where
             let now = Instant::now();
             if deadline <= now {
                 if let Some(d) = now.checked_duration_since(deadline) {
-                    if d > std::time::Duration::from_millis(5) {
+                    if d > std::time::Duration::from_millis(100) {
                         warn!(delta_ms = d.as_millis(), "slow polling wireauth timer");
                     }
                 }

@@ -329,8 +329,7 @@ impl State {
         self.metrics[GAUGE_WIREAUTH_STATE_RESPONDING_SESSIONS] =
             self.responding_sessions.len() as u64;
         self.allocated_indices.remove(&session_id);
-        self.metrics[GAUGE_WIREAUTH_STATE_ALLOCATED_INDICES] =
-            self.allocated_indices.len() as u64;
+        self.metrics[GAUGE_WIREAUTH_STATE_ALLOCATED_INDICES] = self.allocated_indices.len() as u64;
 
         if let Some(transport) = transport {
             if let Some(sessions) = self

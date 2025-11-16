@@ -52,6 +52,12 @@ pub struct MessageEvent {
     pub header: crate::protocol::messages::DataPacketHeader,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RenewedTimer {
+    pub previous: Option<Duration>,
+    pub current: Duration,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub session_timeout: Duration,
@@ -154,8 +160,15 @@ impl SessionState {
         }
     }
 
-    pub fn reset_keepalive(&mut self, duration_since_start: Duration, timer_duration: Duration) {
-        self.keepalive_deadline = Some(duration_since_start + timer_duration);
+    pub fn reset_keepalive(
+        &mut self,
+        duration_since_start: Duration,
+        timer_duration: Duration,
+    ) -> RenewedTimer {
+        let previous = self.keepalive_deadline;
+        let current = duration_since_start + timer_duration;
+        self.keepalive_deadline = Some(current);
+        RenewedTimer { previous, current }
     }
 
     pub fn reset_rekey(&mut self, duration_since_start: Duration, timer_duration: Duration) {
@@ -166,8 +179,11 @@ impl SessionState {
         &mut self,
         duration_since_start: Duration,
         timer_duration: Duration,
-    ) {
-        self.session_timeout_deadline = Some(duration_since_start + timer_duration);
+    ) -> RenewedTimer {
+        let previous = self.session_timeout_deadline;
+        let current = duration_since_start + timer_duration;
+        self.session_timeout_deadline = Some(current);
+        RenewedTimer { previous, current }
     }
 
     pub fn clear_keepalive(&mut self) {

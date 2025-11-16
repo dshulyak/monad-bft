@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::{
-    common::{add_jitter, Config, SessionError, SessionState, SessionTimeoutResult},
+    common::{add_jitter, Config, RenewedTimer, SessionError, SessionState, SessionTimeoutResult},
     transport::TransportState,
 };
 use crate::protocol::{
@@ -121,7 +121,7 @@ impl InitiatorState {
         duration_since_start: Duration,
         validated_response: ValidatedHandshakeResponse,
         _remote_addr: SocketAddr,
-    ) -> (TransportState, Duration, DataPacketHeader) {
+    ) -> (TransportState, RenewedTimer, DataPacketHeader) {
         self.common.reset_session_timeout(
             duration_since_start,
             add_jitter(rng, config.session_timeout, config.session_timeout_jitter),

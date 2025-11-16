@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::{
-    common::{add_jitter, Config, SessionError, SessionState, SessionTimeoutResult},
+    common::{add_jitter, Config, RenewedTimer, SessionError, SessionState, SessionTimeoutResult},
     transport::TransportState,
 };
 use crate::protocol::{
@@ -127,7 +127,7 @@ impl ResponderState {
         config: &Config,
         duration_since_start: Duration,
         data_packet: DataPacket<'a>,
-    ) -> Result<(Duration, Plaintext<'a>), SessionError> {
+    ) -> Result<(RenewedTimer, Plaintext<'a>), SessionError> {
         self.transport
             .decrypt(config, duration_since_start, data_packet)
     }
