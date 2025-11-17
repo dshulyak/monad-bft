@@ -1,0 +1,23 @@
+#!/usr/bin/env bpftrace
+
+tracepoint:net:net_dev_xmit {
+    @send_pkt++;
+    @send_bytes += args->len;
+}
+
+tracepoint:net:netif_receive_skb {
+    @recv_pkt++;
+    @recv_bytes += args->len;
+}
+
+interval:s:1 {
+    printf("send=%d pkt/s %d MB/s recv=%d pkt/s %d MB/s\n",
+           @send_pkt,
+           @send_bytes/1048576,
+           @recv_pkt,
+           @recv_bytes/1048576);
+    @send_pkt = 0;
+    @send_bytes = 0;
+    @recv_pkt = 0;
+    @recv_bytes = 0;
+}
