@@ -845,3 +845,102 @@ fn test_keepalive_reset_on_encrypt() {
         unexpected_packet
     );
 }
+
+//1. peer1 initiates connection to peer2
+//2. peer1 attempts to encrypt 3 messages during handshake
+//3. messages are buffered in initiator state
+//4. complete handshake between peer1 and peer2
+//5. buffered messages are sent automatically after transport established
+//6. keepalive is skipped since buffered messages exist
+//7. peer2 receives and decrypts all 3 buffered messages in order
+//8. verify no additional packets remain in queue
+#[test]
+fn test_message_buffering_during_handshake() {
+    init_tracing();
+    let (mut peer1, _, _, _) = create_manager();
+    let (mut peer2, peer2_pubkey, _, _) = create_manager();
+    let peer1_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+    let peer2_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+
+    peer1
+        .connect(peer2_pubkey, peer2_addr, DEFAULT_RETRY_ATTEMPTS)
+        .unwrap();
+
+    let mut plaintext1 = b"buffered1".to_vec();
+    let result1 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext1);
+    assert!(result1.is_ok());
+
+    let mut plaintext2 = b"buffered2".to_vec();
+    let result2 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext2);
+    assert!(result2.is_ok());
+
+    let mut plaintext3 = b"buffered3".to_vec();
+    let result3 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext3);
+    assert!(result3.is_ok());
+
+    let init = collect::<HandshakeInitiation>(&mut peer1);
+    dispatch(&mut peer2, &init, peer1_addr);
+
+    let response = collect::<HandshakeResponse>(&mut peer2);
+    dispatch(&mut peer1, &response, peer2_addr);
+
+    let packet1 = peer1.next_packet().unwrap();
+    let decrypted1 = decrypt(&mut peer2, &packet1.1, peer1_addr);
+    assert_eq!(decrypted1, b"buffered1");
+
+    let packet2 = peer1.next_packet().unwrap();
+    let decrypted2 = decrypt(&mut peer2, &packet2.1, peer1_addr);
+    assert_eq!(decrypted2, b"buffered2");
+
+    let packet3 = peer1.next_packet().unwrap();
+    let decrypted3 = decrypt(&mut peer2, &packet3.1, peer1_addr);
+    assert_eq!(decrypted3, b"buffered3");
+
+    assert!(peer1.next_packet().is_none());
+}
+
+//1. create peer1 with short initiator timeout (100ms)
+//2. peer1 initiates connection to peer2 with no retries
+//3. peer1 buffers 2 messages during handshake
+//4. advance time past initiator timeout (150ms)
+//5. tick triggers initiator timeout
+//6. buffered messages are dropped with warning logged
+//7. verify encrypt fails after initiator terminated
+#[test]
+fn test_message_buffering_timeout() {
+    init_tracing();
+    let config = Config {
+        initiator_session_timeout: Duration::from_millis(100),
+        session_timeout_jitter: Duration::from_millis(0),
+        ..Config::default()
+    };
+
+    let mut rng = rng();
+    let keypair1 = monad_secp::KeyPair::generate(&mut rng);
+    let context1 = TestContext::new();
+    let mut peer1 = API::new(config, keypair1, context1.clone());
+
+    let keypair2 = monad_secp::KeyPair::generate(&mut rng);
+    let peer2_pubkey = keypair2.pubkey();
+
+    let peer2_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+
+    peer1.connect(peer2_pubkey, peer2_addr, 0).unwrap();
+
+    let mut plaintext1 = b"will_be_dropped1".to_vec();
+    let result1 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext1);
+    assert!(result1.is_ok());
+
+    let mut plaintext2 = b"will_be_dropped2".to_vec();
+    let result2 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext2);
+    assert!(result2.is_ok());
+
+    let _init = collect::<HandshakeInitiation>(&mut peer1);
+
+    context1.advance_time(Duration::from_millis(150));
+    peer1.tick();
+
+    let mut plaintext3 = b"should_fail".to_vec();
+    let result3 = peer1.encrypt_by_public_key(&peer2_pubkey, &mut plaintext3);
+    assert!(result3.is_err());
+}

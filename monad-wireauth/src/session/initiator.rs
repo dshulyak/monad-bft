@@ -14,10 +14,13 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     time::{Duration, SystemTime},
 };
+
+use bytes::Bytes;
 
 use super::{
     common::{add_jitter, Config, SessionError, SessionState, SessionTimeoutResult},
@@ -37,6 +40,7 @@ pub struct ValidatedHandshakeResponse {
 pub struct InitiatorState {
     handshake_state: handshake::HandshakeState,
     common: SessionState,
+    buffered_messages: VecDeque<Bytes>,
 }
 
 impl InitiatorState {
@@ -78,13 +82,12 @@ impl InitiatorState {
         let mut session = InitiatorState {
             handshake_state,
             common,
+            buffered_messages: VecDeque::new(),
         };
 
-        let timeout_with_jitter =
-            add_jitter(rng, config.session_timeout, config.session_timeout_jitter);
         session
             .common
-            .reset_session_timeout(duration_since_start, timeout_with_jitter);
+            .reset_session_timeout(duration_since_start, config.initiator_session_timeout);
 
         let timer = session
             .common
@@ -164,6 +167,18 @@ impl InitiatorState {
         let (terminated, rekey) = self.handle_session_timeout();
         let timer = self.common.get_next_deadline();
         Some((timer, SessionTimeoutResult { terminated, rekey }))
+    }
+
+    pub fn buffer_message(&mut self, message: Bytes) {
+        self.buffered_messages.push_back(message);
+    }
+
+    pub fn buffered_message_count(&self) -> usize {
+        self.buffered_messages.len()
+    }
+
+    pub fn take_buffered_messages(&mut self) -> impl Iterator<Item = Bytes> {
+        std::mem::take(&mut self.buffered_messages).into_iter()
     }
 }
 

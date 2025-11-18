@@ -23,6 +23,8 @@ pub const GAUGE_WIREAUTH_STATE_ALLOCATED_INDICES: &str = "monad.wireauth.state.a
 pub const GAUGE_WIREAUTH_STATE_SESSIONS_BY_PUBLIC_KEY: &str =
     "monad.wireauth.state.sessions_by_public_key";
 pub const GAUGE_WIREAUTH_STATE_SESSIONS_BY_SOCKET: &str = "monad.wireauth.state.sessions_by_socket";
+pub const GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET: &str =
+    "monad.wireauth.state.initiated_sessions_by_socket";
 pub const GAUGE_WIREAUTH_STATE_SESSION_INDEX_ALLOCATED: &str =
     "monad.wireauth.state.session_index_allocated";
 pub const GAUGE_WIREAUTH_STATE_SESSION_ESTABLISHED_INITIATOR: &str =
@@ -83,3 +85,10 @@ pub const GAUGE_WIREAUTH_ENQUEUED_HANDSHAKE_RESPONSE: &str =
     "monad.wireauth.enqueued.handshake_response";
 pub const GAUGE_WIREAUTH_ENQUEUED_COOKIE_REPLY: &str = "monad.wireauth.enqueued.cookie_reply";
 pub const GAUGE_WIREAUTH_ENQUEUED_KEEPALIVE: &str = "monad.wireauth.enqueued.keepalive";
+
+pub const GAUGE_WIREAUTH_INITIATOR_BUFFERED_MESSAGES: &str =
+    "monad.wireauth.initiator.buffered_messages";
+pub const GAUGE_WIREAUTH_INITIATOR_MESSAGES_SENT_FROM_BUFFER: &str =
+    "monad.wireauth.initiator.messages_sent_from_buffer";
+pub const GAUGE_WIREAUTH_INITIATOR_MESSAGES_DROPPED: &str =
+    "monad.wireauth.initiator.messages_dropped";

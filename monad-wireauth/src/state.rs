@@ -81,6 +81,7 @@ pub struct State {
     allocated_indices: HashSet<SessionIndex>,
     next_session_index: SessionIndex,
     initiated_session_by_peer: HashMap<monad_secp::PubKey, SessionIndex>,
+    initiated_session_by_socket: HashMap<SocketAddr, SessionIndex>,
     accepted_sessions_by_peer: BTreeSet<(monad_secp::PubKey, SessionIndex)>,
     ip_session_counts: HashMap<IpAddr, usize>,
     total_sessions: usize,
@@ -98,6 +99,7 @@ impl State {
             allocated_indices: HashSet::new(),
             next_session_index: SessionIndex::new(0),
             initiated_session_by_peer: HashMap::new(),
+            initiated_session_by_socket: HashMap::new(),
             accepted_sessions_by_peer: BTreeSet::new(),
             ip_session_counts: HashMap::new(),
             total_sessions: 0,
@@ -390,6 +392,14 @@ impl State {
             }
         }
 
+        if let Some(&initiated_id) = self.initiated_session_by_socket.get(&remote_addr) {
+            if initiated_id == session_id {
+                self.initiated_session_by_socket.remove(&remote_addr);
+                self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+                    self.initiated_session_by_socket.len() as u64;
+            }
+        }
+
         self.accepted_sessions_by_peer
             .remove(&(*remote_public_key, session_id));
     }
@@ -404,6 +414,22 @@ impl State {
         session_index: &SessionIndex,
     ) -> Option<&mut InitiatorState> {
         self.initiating_sessions.get_mut(session_index)
+    }
+
+    pub fn get_initiator_by_public_key_mut(
+        &mut self,
+        public_key: &monad_secp::PubKey,
+    ) -> Option<&mut InitiatorState> {
+        let session_id = self.initiated_session_by_peer.get(public_key)?;
+        self.initiating_sessions.get_mut(session_id)
+    }
+
+    pub fn get_initiator_by_socket_mut(
+        &mut self,
+        socket_addr: &SocketAddr,
+    ) -> Option<&mut InitiatorState> {
+        let session_id = self.initiated_session_by_socket.get(socket_addr)?;
+        self.initiating_sessions.get_mut(session_id)
     }
 
     #[cfg(test)]
@@ -421,10 +447,18 @@ impl State {
     pub fn remove_initiator(&mut self, session_index: &SessionIndex) -> Option<InitiatorState> {
         let session = self.initiating_sessions.remove(session_index)?;
         let remote_public_key = session.remote_public_key;
+        let remote_addr = session.remote_addr;
         if let Some(&stored_session_index) = self.initiated_session_by_peer.get(&remote_public_key)
         {
             if stored_session_index == *session_index {
                 self.initiated_session_by_peer.remove(&remote_public_key);
+            }
+        }
+        if let Some(&stored_session_index) = self.initiated_session_by_socket.get(&remote_addr) {
+            if stored_session_index == *session_index {
+                self.initiated_session_by_socket.remove(&remote_addr);
+                self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+                    self.initiated_session_by_socket.len() as u64;
             }
         }
         Some(session)
@@ -450,6 +484,10 @@ impl State {
             self.initiating_sessions.len() as u64;
         self.initiated_session_by_peer
             .insert(remote_key, session_index);
+        self.initiated_session_by_socket
+            .insert(remote_addr, session_index);
+        self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+            self.initiated_session_by_socket.len() as u64;
         *self.ip_session_counts.entry(remote_addr.ip()).or_insert(0) += 1;
         self.total_sessions += 1;
         self.metrics[GAUGE_WIREAUTH_STATE_TOTAL_SESSIONS] = self.total_sessions as u64;

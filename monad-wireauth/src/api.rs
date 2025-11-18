@@ -19,10 +19,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain};
 use monad_secp::PubKey;
 use tracing::{debug, instrument, trace, warn, Level};
+use zerocopy::IntoBytes;
 
 use crate::{
     context::Context,
@@ -186,8 +187,20 @@ impl<C: Context> API<C> {
             }
 
             let tick_result = if let Some(s) = self.state.get_initiator_mut(&session_id) {
-                s.tick(duration_since_start)
-                    .map(|(timer, r)| (timer, None, r.rekey, Some(r.terminated)))
+                let buffered_count = s.buffered_message_count();
+                let result = s
+                    .tick(duration_since_start)
+                    .map(|(timer, r)| (timer, None, r.rekey, Some(r.terminated)));
+                if result.is_some() && buffered_count > 0 {
+                    warn!(
+                        session_id=?session_id,
+                        dropped_messages=buffered_count,
+                        "initiator timeout, dropping buffered messages"
+                    );
+                    self.metrics[GAUGE_WIREAUTH_INITIATOR_MESSAGES_DROPPED] +=
+                        buffered_count as u64;
+                }
+                result
             } else if let Some(s) = self.state.get_responder_mut(&session_id) {
                 s.tick(duration_since_start)
                     .map(|(timer, r)| (timer, None, r.rekey, Some(r.terminated)))
@@ -564,14 +577,21 @@ impl<C: Context> API<C> {
                 e.with_addr(remote_addr)
             })?;
 
-        let initiator = self
+        let mut initiator = self
             .state
             .remove_initiator(&receiver_session_index)
             .unwrap();
 
+        let buffered_message_count = initiator.buffered_message_count();
+        let buffered_messages = initiator.take_buffered_messages();
+
         let duration_since_start = self.context.duration_since_start();
-        debug!(local_session_id=?receiver_session_index, "initiator session established");
-        let (transport, timer, message) = initiator.establish(
+        debug!(
+            local_session_id=?receiver_session_index,
+            buffered_messages=buffered_message_count,
+            "initiator session established"
+        );
+        let (mut transport, timer, message) = initiator.establish(
             self.context.rng(),
             &self.config,
             duration_since_start,
@@ -579,10 +599,28 @@ impl<C: Context> API<C> {
             remote_addr,
         );
 
+        if buffered_message_count == 0 {
+            self.packet_queue.push_back((remote_addr, message.into()));
+        }
+
+        for buffered_msg in buffered_messages {
+            let mut plaintext = buffered_msg.to_vec();
+            let (header, _timer) = transport.encrypt(
+                self.context.rng(),
+                &self.config,
+                duration_since_start,
+                &mut plaintext,
+            );
+            let mut packet = BytesMut::with_capacity(DataPacketHeader::SIZE + plaintext.len());
+            packet.extend_from_slice(header.as_bytes());
+            packet.extend_from_slice(&plaintext);
+            self.packet_queue.push_back((remote_addr, packet.freeze()));
+            self.metrics[GAUGE_WIREAUTH_INITIATOR_MESSAGES_SENT_FROM_BUFFER] += 1;
+        }
+
         self.state
             .insert_transport(receiver_session_index, transport);
 
-        self.packet_queue.push_back((remote_addr, message.into()));
         self.timers.insert((timer, receiver_session_index));
 
         Ok(())
@@ -595,24 +633,35 @@ impl<C: Context> API<C> {
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
         self.metrics[GAUGE_WIREAUTH_API_ENCRYPT_BY_PUBLIC_KEY] += 1;
-        let transport = self
-            .state
-            .get_transport_by_public_key(public_key)
-            .ok_or_else(|| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_PUBLIC_KEY] += 1;
-                self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_FOUND] += 1;
-                Error::SessionNotFound
-            })?;
-        let duration_since_start = self.context.duration_since_start();
-        let (header, timer) = transport.encrypt(
-            self.context.rng(),
-            &self.config,
-            duration_since_start,
-            plaintext,
-        );
-        let session_id = transport.common.local_index;
-        self.timers.insert((timer, session_id));
-        Ok(header)
+
+        if let Some(transport) = self.state.get_transport_by_public_key(public_key) {
+            let duration_since_start = self.context.duration_since_start();
+            let (header, timer) = transport.encrypt(
+                self.context.rng(),
+                &self.config,
+                duration_since_start,
+                plaintext,
+            );
+            let session_id = transport.common.local_index;
+            self.timers.insert((timer, session_id));
+            return Ok(header);
+        }
+
+        if let Some(initiator) = self.state.get_initiator_by_public_key_mut(public_key) {
+            let message = Bytes::copy_from_slice(plaintext);
+            initiator.buffer_message(message);
+            self.metrics[GAUGE_WIREAUTH_INITIATOR_BUFFERED_MESSAGES] += 1;
+            trace!(
+                buffered_message_count = initiator.buffered_message_count(),
+                public_key = ?CompressedPublicKey::from(public_key),
+                "message buffered in initiator"
+            );
+            return Ok(DataPacketHeader::default());
+        }
+
+        self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_PUBLIC_KEY] += 1;
+        self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_FOUND] += 1;
+        Err(Error::SessionNotFound)
     }
 
     #[instrument(level = Level::TRACE, skip(self, plaintext), fields(local_public_key = ?self.local_serialized_public, socket_addr = ?socket_addr))]
@@ -622,24 +671,35 @@ impl<C: Context> API<C> {
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
         self.metrics[GAUGE_WIREAUTH_API_ENCRYPT_BY_SOCKET] += 1;
-        let transport = self
-            .state
-            .get_transport_by_socket(socket_addr)
-            .ok_or_else(|| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_SOCKET] += 1;
-                self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS] += 1;
-                Error::SessionNotEstablishedForAddress { addr: *socket_addr }
-            })?;
-        let duration_since_start = self.context.duration_since_start();
-        let (header, timer) = transport.encrypt(
-            self.context.rng(),
-            &self.config,
-            duration_since_start,
-            plaintext,
-        );
-        let session_id = transport.common.local_index;
-        self.timers.insert((timer, session_id));
-        Ok(header)
+
+        if let Some(transport) = self.state.get_transport_by_socket(socket_addr) {
+            let duration_since_start = self.context.duration_since_start();
+            let (header, timer) = transport.encrypt(
+                self.context.rng(),
+                &self.config,
+                duration_since_start,
+                plaintext,
+            );
+            let session_id = transport.common.local_index;
+            self.timers.insert((timer, session_id));
+            return Ok(header);
+        }
+
+        if let Some(initiator) = self.state.get_initiator_by_socket_mut(socket_addr) {
+            let message = Bytes::copy_from_slice(plaintext);
+            initiator.buffer_message(message);
+            self.metrics[GAUGE_WIREAUTH_INITIATOR_BUFFERED_MESSAGES] += 1;
+            trace!(
+                buffered_message_count = initiator.buffered_message_count(),
+                socket_addr = ?socket_addr,
+                "message buffered in initiator"
+            );
+            return Ok(DataPacketHeader::default());
+        }
+
+        self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_SOCKET] += 1;
+        self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS] += 1;
+        Err(Error::SessionNotEstablishedForAddress { addr: *socket_addr })
     }
 
     #[instrument(level = Level::TRACE, skip(self, public_key), fields(local_public_key = ?self.local_serialized_public))]

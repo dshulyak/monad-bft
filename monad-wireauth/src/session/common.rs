@@ -56,6 +56,7 @@ pub struct MessageEvent {
 pub struct Config {
     pub session_timeout: Duration,
     pub session_timeout_jitter: Duration,
+    pub initiator_session_timeout: Duration,
     pub keepalive_interval: Duration,
     pub keepalive_jitter: Duration,
     pub rekey_interval: Duration,
@@ -78,6 +79,7 @@ impl Default for Config {
         Self {
             session_timeout: Duration::from_secs(10),
             session_timeout_jitter: Duration::from_secs(1),
+            initiator_session_timeout: Duration::from_millis(400),
             keepalive_interval: Duration::from_secs(3),
             keepalive_jitter: Duration::from_millis(300),
             rekey_interval: Duration::from_secs(6 * 60 * 60),
