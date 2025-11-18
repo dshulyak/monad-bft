@@ -605,7 +605,7 @@ pub(crate) fn insert_test_initiator_session(
 ) -> SessionIndex {
     use secp256k1::rand::rng;
 
-    use crate::session::Config;
+    use crate::config::Config;
     let mut rng = rng();
     let keypair = monad_secp::KeyPair::generate(&mut rng);
     let remote_public_key = keypair.pubkey();
@@ -638,7 +638,7 @@ mod tests {
     use secp256k1::rand::rng;
 
     use super::*;
-    use crate::session::Config;
+    use crate::config::Config;
 
     fn create_dummy_hash_output() -> crate::protocol::common::HashOutput {
         crate::protocol::common::HashOutput([0u8; 32])

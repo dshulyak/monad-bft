@@ -20,9 +20,10 @@ use std::{
 };
 
 use super::{
-    common::{add_jitter, Config, RenewedTimer, SessionError, SessionState, SessionTimeoutResult},
+    common::{add_jitter, RenewedTimer, SessionError, SessionState, SessionTimeoutResult},
     transport::TransportState,
 };
+use crate::config::Config;
 use crate::protocol::{
     common::*,
     handshake::{self},

@@ -76,10 +76,6 @@ pub const GAUGE_WIREAUTH_ERROR_TIMESTAMP_REPLAY: &str = "monad.wireauth.error.ti
 pub const GAUGE_WIREAUTH_ERROR_SESSION_NOT_FOUND: &str = "monad.wireauth.error.session_not_found";
 pub const GAUGE_WIREAUTH_ERROR_SESSION_INDEX_NOT_FOUND: &str =
     "monad.wireauth.error.session_index_not_found";
-pub const GAUGE_WIREAUTH_ERROR_INVALID_RECEIVER_INDEX: &str =
-    "monad.wireauth.error.invalid_receiver_index";
-pub const GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS: &str =
-    "monad.wireauth.error.session_not_established_for_address";
 pub const GAUGE_WIREAUTH_ERROR_HANDSHAKE_INIT_VALIDATION: &str =
     "monad.wireauth.error.handshake_init_validation";
 pub const GAUGE_WIREAUTH_ERROR_HANDSHAKE_INIT_RESPONDER_NEW: &str =

@@ -22,10 +22,11 @@ use tracing::debug;
 
 use super::{
     common::{
-        Config, MessageEvent, RekeyEvent, RenewedTimer, SessionError, SessionState, TerminatedEvent,
+        MessageEvent, RekeyEvent, RenewedTimer, SessionError, SessionState, TerminatedEvent,
     },
     replay_filter::ReplayFilter,
 };
+use crate::config::Config;
 use crate::protocol::{
     common::{CipherKey, SessionIndex},
     messages::{DataPacket, DataPacketHeader, Plaintext},

@@ -25,6 +25,7 @@ use monad_secp::PubKey;
 use tracing::{debug, error, instrument, trace, warn, Level};
 
 use crate::{
+    config::Config,
     context::Context,
     cookie::Cookies,
     error::{Error, Result, SessionErrorContext},
@@ -34,7 +35,7 @@ use crate::{
         ControlPacket, CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation,
         HandshakeResponse, Plaintext,
     },
-    session::{Config, InitiatorState, RenewedTimer, ResponderState, SessionIndex},
+    session::{InitiatorState, RenewedTimer, ResponderState, SessionIndex},
     state::State,
 };
 
@@ -572,7 +573,7 @@ impl<C: Context> API<C> {
             .state
             .get_initiator_mut(&receiver_session_index)
             .ok_or_else(|| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_INVALID_RECEIVER_INDEX] += 1;
+                self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_INDEX_NOT_FOUND] += 1;
                 Error::InvalidReceiverIndex {
                     index: receiver_session_index,
                     addr: remote_addr,
@@ -651,7 +652,6 @@ impl<C: Context> API<C> {
             .get_transport_by_socket(socket_addr)
             .ok_or_else(|| {
                 self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_SOCKET] += 1;
-                self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS] += 1;
                 Error::SessionNotEstablishedForAddress { addr: *socket_addr }
             })?;
         let duration_since_start = self.context.duration_since_start();

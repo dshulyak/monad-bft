@@ -19,12 +19,9 @@ use std::{
 };
 
 use tracing::debug;
-use zeroize::Zeroizing;
 
+use crate::config::RETRY_ALWAYS;
 use crate::protocol::{common::*, cookies};
-
-pub const RETRY_ALWAYS: u64 = u64::MAX;
-pub const DEFAULT_RETRY_ATTEMPTS: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TerminatedEvent {
@@ -56,51 +53,6 @@ pub struct MessageEvent {
 pub struct RenewedTimer {
     pub previous: Option<Duration>,
     pub current: Duration,
-}
-
-#[derive(Clone)]
-pub struct Config {
-    pub session_timeout: Duration,
-    pub session_timeout_jitter: Duration,
-    pub keepalive_interval: Duration,
-    pub keepalive_jitter: Duration,
-    pub rekey_interval: Duration,
-    pub rekey_jitter: Duration,
-    pub max_session_duration: Duration,
-    pub handshake_rate_limit: u64,
-    pub handshake_rate_reset_interval: Duration,
-    pub cookie_refresh_duration: Duration,
-    pub low_watermark_sessions: usize,
-    pub high_watermark_sessions: usize,
-    pub max_sessions_per_ip: usize,
-    pub ip_rate_limit_window: Duration,
-    pub max_requests_per_ip: usize,
-    pub ip_history_capacity: usize,
-    pub psk: Zeroizing<[u8; 32]>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            session_timeout: Duration::from_secs(10),
-            session_timeout_jitter: Duration::from_secs(1),
-            keepalive_interval: Duration::from_secs(3),
-            keepalive_jitter: Duration::from_millis(300),
-            rekey_interval: Duration::from_secs(6 * 60 * 60),
-            rekey_jitter: Duration::from_secs(60),
-            max_session_duration: Duration::from_secs(7 * 60 * 60),
-            handshake_rate_limit: 2000,
-            handshake_rate_reset_interval: Duration::from_secs(1),
-            cookie_refresh_duration: Duration::from_secs(120),
-            low_watermark_sessions: 10_000,
-            high_watermark_sessions: 100_000,
-            max_sessions_per_ip: 10,
-            ip_rate_limit_window: Duration::from_secs(10),
-            max_requests_per_ip: 10,
-            ip_history_capacity: 1_000_000,
-            psk: Zeroizing::new([0u8; 32]),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
