@@ -264,8 +264,21 @@ fn spawn_noop_validator(
         let shared_pd = create_peer_discovery(known_addresses, name_records);
         let (tcp_socket, _authenticated_socket, non_authenticated_socket, control) =
             create_dataplane(auth_addr, non_auth_addr);
-        let config = create_raptorcast_config(keypair);
+        let (tcp_reader, tcp_writer) = tcp_socket.split();
+        let config = create_raptorcast_config(keypair.clone());
         let auth_protocol = monad_raptorcast::auth::NoopAuthProtocol::new();
+
+        let tcp_sig_auth =
+            monad_raptorcast::auth::SignatureBasedTcpAuth::<SecpSignature>::new(keypair);
+        let tcp_sig_handle = monad_raptorcast::auth::AuthenticatedTcpSocketHandle::new(
+            tcp_reader,
+            tcp_writer,
+            tcp_sig_auth,
+        );
+        let dual_tcp_socket: monad_raptorcast::auth::DualTcpSocketHandle<
+            monad_raptorcast::auth::SignatureBasedTcpAuth<SecpSignature>,
+            monad_raptorcast::auth::SignatureBasedTcpAuth<SecpSignature>,
+        > = monad_raptorcast::auth::DualTcpSocketHandle::new(tcp_sig_handle, None);
 
         let mut validator_rc = monad_raptorcast::RaptorCast::<
             SecpSignature,
@@ -274,10 +287,12 @@ fn spawn_noop_validator(
             MockEvent<CertificateSignaturePubKey<SecpSignature>>,
             monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
             _,
+            _,
+            _,
         >::new(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
-            tcp_socket,
+            dual_tcp_socket,
             None,
             non_authenticated_socket,
             control,
@@ -329,10 +344,23 @@ fn spawn_wireauth_validator(
         let shared_pd = create_peer_discovery(known_addresses, name_records);
         let (tcp_socket, authenticated_socket, non_authenticated_socket, control) =
             create_dataplane(auth_addr, non_auth_addr);
+        let (tcp_reader, tcp_writer) = tcp_socket.split();
         let config = create_raptorcast_config(keypair.clone());
         let wireauth_config = monad_wireauth::Config::default();
-        let auth_protocol =
+        let udp_auth_protocol =
             monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, &keypair);
+
+        let tcp_sig_auth =
+            monad_raptorcast::auth::SignatureBasedTcpAuth::<SecpSignature>::new(keypair.clone());
+        let tcp_sig_handle = monad_raptorcast::auth::AuthenticatedTcpSocketHandle::new(
+            tcp_reader,
+            tcp_writer,
+            tcp_sig_auth,
+        );
+        let dual_tcp_socket: monad_raptorcast::auth::DualTcpSocketHandle<
+            monad_raptorcast::auth::SignatureBasedTcpAuth<SecpSignature>,
+            monad_raptorcast::auth::SignatureBasedTcpAuth<SecpSignature>,
+        > = monad_raptorcast::auth::DualTcpSocketHandle::new(tcp_sig_handle, None);
 
         let mut validator_rc = monad_raptorcast::RaptorCast::<
             SecpSignature,
@@ -341,16 +369,18 @@ fn spawn_wireauth_validator(
             MockEvent<CertificateSignaturePubKey<SecpSignature>>,
             monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
             _,
+            _,
+            _,
         >::new(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
-            tcp_socket,
+            dual_tcp_socket,
             Some(authenticated_socket),
             non_authenticated_socket,
             control,
             shared_pd,
             Epoch(0),
-            auth_protocol,
+            udp_auth_protocol,
         );
 
         let mut cmd_rx = cmd_rx;

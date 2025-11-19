@@ -515,6 +515,8 @@ struct NodeSetup {
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
         monad_raptorcast::auth::WireAuthProtocol,
+        monad_raptorcast::auth::SignatureBasedTcpAuth<SignatureType>,
+        monad_raptorcast::auth::WireAuthTcpProtocol,
     >,
     node_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
     tcp_addr: SocketAddrV4,
@@ -636,9 +638,22 @@ fn setup_node(
     let pd = PeerDiscoveryDriver::new(noop_builder);
 
     let keypair_arc = Arc::new(keypair);
+    let (tcp_reader, tcp_writer) = tcp_socket.split();
     let wireauth_config = monad_wireauth::Config::default();
-    let auth_protocol =
+    let udp_auth_protocol =
         monad_raptorcast::auth::WireAuthProtocol::new(wireauth_config, &keypair_arc);
+
+    let tcp_sig_auth =
+        monad_raptorcast::auth::SignatureBasedTcpAuth::<SignatureType>::new(keypair_arc.clone());
+    let tcp_sig_handle = monad_raptorcast::auth::AuthenticatedTcpSocketHandle::new(
+        tcp_reader,
+        tcp_writer,
+        tcp_sig_auth,
+    );
+    let dual_tcp_socket: monad_raptorcast::auth::DualTcpSocketHandle<
+        monad_raptorcast::auth::SignatureBasedTcpAuth<SignatureType>,
+        monad_raptorcast::auth::WireAuthTcpProtocol,
+    > = monad_raptorcast::auth::DualTcpSocketHandle::new(tcp_sig_handle, None);
 
     let mut raptorcast = RaptorCast::<
         SignatureType,
@@ -647,16 +662,18 @@ fn setup_node(
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
         monad_raptorcast::auth::WireAuthProtocol,
+        monad_raptorcast::auth::SignatureBasedTcpAuth<SignatureType>,
+        monad_raptorcast::auth::WireAuthTcpProtocol,
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
-        tcp_socket,
+        dual_tcp_socket,
         Some(authenticated_socket),
         non_authenticated_socket,
         dataplane_control,
         Arc::new(std::sync::Mutex::new(pd)),
         Epoch(0),
-        auth_protocol,
+        udp_auth_protocol,
     );
 
     raptorcast.exec(vec![RouterCommand::AddEpochValidatorSet {

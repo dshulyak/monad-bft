@@ -67,7 +67,8 @@ pub trait AuthenticationProtocol {
 }
 
 pub struct WireAuthProtocol {
-    api: monad_wireauth::API<monad_wireauth::StdContext, crate::auth::metrics::UdpMetrics>,
+    pub(crate) api:
+        monad_wireauth::API<monad_wireauth::StdContext, crate::auth::metrics::UdpMetrics>,
 }
 
 impl WireAuthProtocol {
