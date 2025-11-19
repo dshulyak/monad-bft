@@ -17,6 +17,7 @@ use std::{convert::TryFrom, net::SocketAddr, time::Duration};
 
 use monad_wireauth::{
     messages::{CookieReply, DataPacketHeader, HandshakeInitiation, HandshakeResponse, Packet},
+    metrics::DefaultMetrics,
     Config, Context, TestContext, API, DEFAULT_RETRY_ATTEMPTS,
 };
 use secp256k1::rand::rng;
@@ -29,7 +30,12 @@ fn init_tracing() {
         .try_init();
 }
 
-fn create_manager() -> (API<TestContext>, monad_secp::PubKey, TestContext, Config) {
+fn create_manager() -> (
+    API<TestContext, DefaultMetrics>,
+    monad_secp::PubKey,
+    TestContext,
+    Config,
+) {
     let mut rng = rng();
     let keypair = monad_secp::KeyPair::generate(&mut rng);
     let public_key = keypair.pubkey();
@@ -40,7 +46,7 @@ fn create_manager() -> (API<TestContext>, monad_secp::PubKey, TestContext, Confi
     (manager, public_key, context_clone, config)
 }
 
-fn collect<T>(manager: &mut API<TestContext>) -> Vec<u8>
+fn collect<T>(manager: &mut API<TestContext, DefaultMetrics>) -> Vec<u8>
 where
     for<'a> &'a T: std::convert::TryFrom<&'a [u8]>,
     for<'a> <&'a T as std::convert::TryFrom<&'a [u8]>>::Error: std::fmt::Debug,
@@ -51,7 +57,11 @@ where
     bytes
 }
 
-fn dispatch(manager: &mut API<TestContext>, packet: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+fn dispatch(
+    manager: &mut API<TestContext, DefaultMetrics>,
+    packet: &[u8],
+    from: SocketAddr,
+) -> Option<Vec<u8>> {
     let mut packet_mut = packet.to_vec();
     let parsed_packet = Packet::try_from(&mut packet_mut[..]).ok()?;
 
@@ -68,7 +78,7 @@ fn dispatch(manager: &mut API<TestContext>, packet: &[u8], from: SocketAddr) -> 
 }
 
 fn encrypt(
-    manager: &mut API<TestContext>,
+    manager: &mut API<TestContext, DefaultMetrics>,
     peer_pubkey: &monad_secp::PubKey,
     plaintext: &mut [u8],
 ) -> Vec<u8> {
@@ -81,7 +91,11 @@ fn encrypt(
     packet
 }
 
-fn decrypt(manager: &mut API<TestContext>, packet: &[u8], from: SocketAddr) -> Vec<u8> {
+fn decrypt(
+    manager: &mut API<TestContext, DefaultMetrics>,
+    packet: &[u8],
+    from: SocketAddr,
+) -> Vec<u8> {
     dispatch(manager, packet, from).unwrap()
 }
 
@@ -651,7 +665,7 @@ fn test_next_deadline_includes_filter_reset() {
 
     let peer_keypair = monad_secp::KeyPair::generate(&mut rng);
     let peer_ctx = TestContext::new();
-    let peer = API::new(config, peer_keypair, peer_ctx.clone());
+    let peer: API<TestContext> = API::new(config, peer_keypair, peer_ctx.clone());
 
     let deadline = peer.next_deadline();
     assert!(deadline.is_some());

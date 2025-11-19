@@ -15,6 +15,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    marker::PhantomData,
     net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime},
 };
@@ -22,7 +23,7 @@ use std::{
 use monad_executor::ExecutorMetrics;
 
 use crate::{
-    metrics::*,
+    metrics::{DefaultMetrics, MetricNames},
     session::{InitiatorState, ResponderState, SessionIndex, TransportState},
 };
 
@@ -53,26 +54,7 @@ impl EstablishedSessions {
     }
 }
 
-pub(crate) struct SessionIndexReservation<'a> {
-    state: &'a mut State,
-    index: SessionIndex,
-}
-
-impl<'a> SessionIndexReservation<'a> {
-    pub(crate) fn index(&self) -> SessionIndex {
-        self.index
-    }
-
-    pub(crate) fn commit(self) {
-        self.state.next_session_index = self.index;
-        self.state.next_session_index.increment();
-        self.state.allocated_indices.insert(self.index);
-        self.state.metrics[GAUGE_WIREAUTH_STATE_ALLOCATED_INDICES] =
-            self.state.allocated_indices.len() as u64;
-    }
-}
-
-pub struct State {
+pub struct State<M: MetricNames = DefaultMetrics> {
     initiating_sessions: HashMap<SessionIndex, InitiatorState>,
     responding_sessions: HashMap<SessionIndex, ResponderState>,
     transport_sessions: HashMap<SessionIndex, TransportState>,
@@ -86,9 +68,10 @@ pub struct State {
     ip_session_counts: HashMap<IpAddr, usize>,
     total_sessions: usize,
     metrics: ExecutorMetrics,
+    _phantom: PhantomData<M>,
 }
 
-impl State {
+impl<M: MetricNames> State<M> {
     pub fn new() -> Self {
         Self {
             initiating_sessions: HashMap::new(),
@@ -104,6 +87,7 @@ impl State {
             ip_session_counts: HashMap::new(),
             total_sessions: 0,
             metrics: ExecutorMetrics::default(),
+            _phantom: PhantomData,
         }
     }
 
@@ -202,16 +186,17 @@ impl State {
         ))
     }
 
-    pub(crate) fn reserve_session_index(&mut self) -> Option<SessionIndexReservation<'_>> {
+    pub(crate) fn allocate_session_index(&mut self) -> Option<SessionIndex> {
         let start_index = self.next_session_index;
         let mut candidate = self.next_session_index;
 
         loop {
             if !self.allocated_indices.contains(&candidate) {
-                return Some(SessionIndexReservation {
-                    state: self,
-                    index: candidate,
-                });
+                self.next_session_index = candidate;
+                self.next_session_index.increment();
+                self.allocated_indices.insert(candidate);
+                self.metrics[M::STATE_ALLOCATED_INDICES] = self.allocated_indices.len() as u64;
+                return Some(candidate);
             }
 
             candidate.increment();
@@ -228,15 +213,13 @@ impl State {
         let is_initiator = transport.is_initiator;
 
         if is_initiator {
-            self.metrics[GAUGE_WIREAUTH_STATE_SESSION_ESTABLISHED_INITIATOR] += 1;
+            self.metrics[M::STATE_SESSION_ESTABLISHED_INITIATOR] += 1;
             self.initiating_sessions.remove(&session_id);
-            self.metrics[GAUGE_WIREAUTH_STATE_INITIATING_SESSIONS] =
-                self.initiating_sessions.len() as u64;
+            self.metrics[M::STATE_INITIATING_SESSIONS] = self.initiating_sessions.len() as u64;
         } else {
-            self.metrics[GAUGE_WIREAUTH_STATE_SESSION_ESTABLISHED_RESPONDER] += 1;
+            self.metrics[M::STATE_SESSION_ESTABLISHED_RESPONDER] += 1;
             self.responding_sessions.remove(&session_id);
-            self.metrics[GAUGE_WIREAUTH_STATE_RESPONDING_SESSIONS] =
-                self.responding_sessions.len() as u64;
+            self.metrics[M::STATE_RESPONDING_SESSIONS] = self.responding_sessions.len() as u64;
         }
 
         let mut replaced_sessions = Vec::new();
@@ -261,7 +244,7 @@ impl State {
             sessions.responder = Some((session_id, created));
         }
         if sessions_by_key_new {
-            self.metrics[GAUGE_WIREAUTH_STATE_SESSIONS_BY_PUBLIC_KEY] =
+            self.metrics[M::STATE_SESSIONS_BY_PUBLIC_KEY] =
                 self.last_established_session_by_public_key.len() as u64;
         }
 
@@ -289,7 +272,7 @@ impl State {
             sessions.responder = Some((session_id, created));
         }
         if sessions_by_socket_new {
-            self.metrics[GAUGE_WIREAUTH_STATE_SESSIONS_BY_SOCKET] =
+            self.metrics[M::STATE_SESSIONS_BY_SOCKET] =
                 self.last_established_session_by_socket.len() as u64;
         }
 
@@ -306,8 +289,7 @@ impl State {
         }
 
         self.transport_sessions.insert(session_id, transport);
-        self.metrics[GAUGE_WIREAUTH_STATE_TRANSPORT_SESSIONS] =
-            self.transport_sessions.len() as u64;
+        self.metrics[M::STATE_TRANSPORT_SESSIONS] = self.transport_sessions.len() as u64;
     }
 
     pub(crate) fn terminate_session(
@@ -316,7 +298,7 @@ impl State {
         remote_public_key: &monad_secp::PubKey,
         remote_addr: SocketAddr,
     ) {
-        self.metrics[GAUGE_WIREAUTH_STATE_SESSION_TERMINATED] += 1;
+        self.metrics[M::STATE_SESSION_TERMINATED] += 1;
 
         if let Some(count) = self.ip_session_counts.get_mut(&remote_addr.ip()) {
             *count = count.saturating_sub(1);
@@ -325,24 +307,20 @@ impl State {
             }
         }
         self.total_sessions = self.total_sessions.saturating_sub(1);
-        self.metrics[GAUGE_WIREAUTH_STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
+        self.metrics[M::STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
 
         let transport = self.transport_sessions.remove(&session_id);
         if transport.is_some() {
-            self.metrics[GAUGE_WIREAUTH_STATE_TRANSPORT_SESSIONS] =
-                self.transport_sessions.len() as u64;
+            self.metrics[M::STATE_TRANSPORT_SESSIONS] = self.transport_sessions.len() as u64;
         }
         if self.initiating_sessions.remove(&session_id).is_some() {
-            self.metrics[GAUGE_WIREAUTH_STATE_INITIATING_SESSIONS] =
-                self.initiating_sessions.len() as u64;
+            self.metrics[M::STATE_INITIATING_SESSIONS] = self.initiating_sessions.len() as u64;
         }
         if self.responding_sessions.remove(&session_id).is_some() {
-            self.metrics[GAUGE_WIREAUTH_STATE_RESPONDING_SESSIONS] =
-                self.responding_sessions.len() as u64;
+            self.metrics[M::STATE_RESPONDING_SESSIONS] = self.responding_sessions.len() as u64;
         }
         if self.allocated_indices.remove(&session_id) {
-            self.metrics[GAUGE_WIREAUTH_STATE_ALLOCATED_INDICES] =
-                self.allocated_indices.len() as u64;
+            self.metrics[M::STATE_ALLOCATED_INDICES] = self.allocated_indices.len() as u64;
         }
 
         if let Some(transport) = transport {
@@ -360,7 +338,7 @@ impl State {
 
                 if sessions.is_empty() {
                     self.last_established_session_by_socket.remove(&remote_addr);
-                    self.metrics[GAUGE_WIREAUTH_STATE_SESSIONS_BY_SOCKET] =
+                    self.metrics[M::STATE_SESSIONS_BY_SOCKET] =
                         self.last_established_session_by_socket.len() as u64;
                 }
             }
@@ -380,7 +358,7 @@ impl State {
                 if sessions.is_empty() {
                     self.last_established_session_by_public_key
                         .remove(remote_public_key);
-                    self.metrics[GAUGE_WIREAUTH_STATE_SESSIONS_BY_PUBLIC_KEY] =
+                    self.metrics[M::STATE_SESSIONS_BY_PUBLIC_KEY] =
                         self.last_established_session_by_public_key.len() as u64;
                 }
             }
@@ -395,7 +373,7 @@ impl State {
         if let Some(&initiated_id) = self.initiated_session_by_socket.get(&remote_addr) {
             if initiated_id == session_id {
                 self.initiated_session_by_socket.remove(&remote_addr);
-                self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+                self.metrics[M::STATE_INITIATED_SESSIONS_BY_SOCKET] =
                     self.initiated_session_by_socket.len() as u64;
             }
         }
@@ -457,7 +435,7 @@ impl State {
         if let Some(&stored_session_index) = self.initiated_session_by_socket.get(&remote_addr) {
             if stored_session_index == *session_index {
                 self.initiated_session_by_socket.remove(&remote_addr);
-                self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+                self.metrics[M::STATE_INITIATED_SESSIONS_BY_SOCKET] =
                     self.initiated_session_by_socket.len() as u64;
             }
         }
@@ -480,18 +458,17 @@ impl State {
     ) {
         let remote_addr = session.remote_addr;
         self.initiating_sessions.insert(session_index, session);
-        self.metrics[GAUGE_WIREAUTH_STATE_INITIATING_SESSIONS] =
-            self.initiating_sessions.len() as u64;
+        self.metrics[M::STATE_INITIATING_SESSIONS] = self.initiating_sessions.len() as u64;
         self.initiated_session_by_peer
             .insert(remote_key, session_index);
         self.initiated_session_by_socket
             .insert(remote_addr, session_index);
-        self.metrics[GAUGE_WIREAUTH_STATE_INITIATED_SESSIONS_BY_SOCKET] =
+        self.metrics[M::STATE_INITIATED_SESSIONS_BY_SOCKET] =
             self.initiated_session_by_socket.len() as u64;
         *self.ip_session_counts.entry(remote_addr.ip()).or_insert(0) += 1;
         self.total_sessions += 1;
-        self.metrics[GAUGE_WIREAUTH_STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
-        self.metrics[GAUGE_WIREAUTH_STATE_SESSION_INDEX_ALLOCATED] += 1;
+        self.metrics[M::STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
+        self.metrics[M::STATE_SESSION_INDEX_ALLOCATED] += 1;
     }
 
     pub fn insert_responder(
@@ -502,13 +479,12 @@ impl State {
     ) {
         let remote_addr = session.remote_addr;
         self.responding_sessions.insert(session_index, session);
-        self.metrics[GAUGE_WIREAUTH_STATE_RESPONDING_SESSIONS] =
-            self.responding_sessions.len() as u64;
+        self.metrics[M::STATE_RESPONDING_SESSIONS] = self.responding_sessions.len() as u64;
         self.accepted_sessions_by_peer
             .insert((remote_key, session_index));
         *self.ip_session_counts.entry(remote_addr.ip()).or_insert(0) += 1;
         self.total_sessions += 1;
-        self.metrics[GAUGE_WIREAUTH_STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
+        self.metrics[M::STATE_TOTAL_SESSIONS] = self.total_sessions as u64;
     }
 
     pub fn lookup_cookie_from_initiated_sessions(
@@ -629,8 +605,8 @@ impl State {
 }
 
 #[cfg(test)]
-pub(crate) fn insert_test_initiator_session(
-    state: &mut State,
+pub(crate) fn insert_test_initiator_session<M: MetricNames>(
+    state: &mut State<M>,
     remote_addr: SocketAddr,
 ) -> SessionIndex {
     use secp256k1::rand::rng;
@@ -777,19 +753,11 @@ mod tests {
 
     #[test]
     fn test_allocate_session_index() {
-        let mut state = State::new();
+        let mut state: State = State::new();
 
-        let reservation0 = state.reserve_session_index().unwrap();
-        let idx0 = reservation0.index();
-        reservation0.commit();
-
-        let reservation1 = state.reserve_session_index().unwrap();
-        let idx1 = reservation1.index();
-        reservation1.commit();
-
-        let reservation2 = state.reserve_session_index().unwrap();
-        let idx2 = reservation2.index();
-        reservation2.commit();
+        let idx0 = state.allocate_session_index().unwrap();
+        let idx1 = state.allocate_session_index().unwrap();
+        let idx2 = state.allocate_session_index().unwrap();
 
         assert_eq!(idx0, SessionIndex::new(0));
         assert_eq!(idx1, SessionIndex::new(1));
@@ -801,25 +769,21 @@ mod tests {
 
     #[test]
     fn test_allocate_session_index_skips_allocated() {
-        let mut state = State::new();
+        let mut state: State = State::new();
 
-        let reservation0 = state.reserve_session_index().unwrap();
-        let idx0 = reservation0.index();
-        reservation0.commit();
+        let idx0 = state.allocate_session_index().unwrap();
 
         state.allocated_indices.remove(&idx0);
         state.next_session_index = SessionIndex::new(0);
 
-        let reservation1 = state.reserve_session_index().unwrap();
-        let idx1 = reservation1.index();
-        reservation1.commit();
+        let idx1 = state.allocate_session_index().unwrap();
 
         assert_eq!(idx1, SessionIndex::new(0));
     }
 
     #[test]
     fn test_get_transport_mut() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -835,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_get_transport() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -851,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_empty() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -860,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_single_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -875,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_single_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -890,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_both_newer_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -914,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_both_newer_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -938,14 +902,14 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_socket_empty() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 51820);
         assert!(state.get_transport_by_socket(&addr).is_none());
     }
 
     #[test]
     fn test_get_transport_by_socket_single() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -960,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_socket_both_newer_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -982,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1005,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1029,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_get_initiator_mut() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1043,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_get_responder_mut() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1057,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_remove_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1072,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_remove_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1087,7 +1051,7 @@ mod tests {
 
     #[test]
     fn test_insert_transport_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1110,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_insert_transport_replaces_old_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1135,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_insert_transport_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1151,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_insert_transport_both_initiator_and_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1180,7 +1144,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_removes_transport() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1191,8 +1155,7 @@ mod tests {
         let transport = create_test_transport(session_id, &public_key, remote_addr, true);
         state.insert_transport(session_id, transport);
 
-        let reservation = state.reserve_session_index().unwrap();
-        reservation.commit();
+        let _allocated = state.allocate_session_index().unwrap();
 
         state.terminate_session(session_id, &key_bytes, remote_addr);
 
@@ -1202,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_cleans_up_by_public_key() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1222,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_preserves_other_slot() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1253,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_cleans_up_by_socket() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1273,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_removes_initiator() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1297,7 +1260,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_removes_responder() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1324,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_handle_terminate_removes_initiated_session_by_peer() {
-        let mut state = State::new();
+        let mut state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1342,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_lookup_cookie_from_initiated_sessions_none() {
-        let state = State::new();
+        let state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1354,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_lookup_cookie_from_accepted_sessions_none() {
-        let state = State::new();
+        let state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1366,7 +1329,7 @@ mod tests {
 
     #[test]
     fn test_get_max_timestamp_empty() {
-        let state = State::new();
+        let state: State = State::new();
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1375,46 +1338,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reserve_success_and_commit() {
-        let mut state = State::new();
+    fn test_allocate_success() {
+        let mut state: State = State::new();
 
-        let index = {
-            let reservation = state.reserve_session_index().unwrap();
-            reservation.index()
-        };
-        assert_eq!(index, SessionIndex::new(0));
-        assert_eq!(state.next_session_index, SessionIndex::new(0));
-
-        let reservation = state.reserve_session_index().unwrap();
-        assert_eq!(reservation.index(), SessionIndex::new(0));
-        reservation.commit();
+        let index0 = state.allocate_session_index().unwrap();
+        assert_eq!(index0, SessionIndex::new(0));
         assert_eq!(state.next_session_index, SessionIndex::new(1));
         assert!(state.allocated_indices.contains(&SessionIndex::new(0)));
 
-        let reservation2 = state.reserve_session_index().unwrap();
-        let index2 = reservation2.index();
-        assert_eq!(index2, SessionIndex::new(1));
-        reservation2.commit();
+        let index1 = state.allocate_session_index().unwrap();
+        assert_eq!(index1, SessionIndex::new(1));
         assert_eq!(state.next_session_index, SessionIndex::new(2));
         assert!(state.allocated_indices.contains(&SessionIndex::new(1)));
-    }
-
-    #[test]
-    fn test_reserve_drop_without_commit() {
-        let mut state = State::new();
-
-        {
-            let _reservation = state.reserve_session_index().unwrap();
-            assert_eq!(state.next_session_index, SessionIndex::new(0));
-        }
-
-        assert_eq!(state.next_session_index, SessionIndex::new(0));
-
-        let reservation2 = state.reserve_session_index().unwrap();
-        let index2 = reservation2.index();
-        assert_eq!(index2, SessionIndex::new(0));
-        reservation2.commit();
-        assert_eq!(state.next_session_index, SessionIndex::new(1));
-        assert!(state.allocated_indices.contains(&SessionIndex::new(0)));
     }
 }

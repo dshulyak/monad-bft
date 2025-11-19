@@ -30,7 +30,7 @@ use crate::{
     cookie::Cookies,
     error::{Error, Result, SessionErrorContext},
     filter::{Filter, FilterAction},
-    metrics::*,
+    metrics::{DefaultMetrics, MetricNames},
     protocol::messages::{
         ControlPacket, CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation,
         HandshakeResponse, Plaintext,
@@ -57,8 +57,8 @@ impl std::fmt::Debug for CompressedPublicKey {
     }
 }
 
-pub struct API<C: Context> {
-    state: State,
+pub struct API<C: Context, M: MetricNames = DefaultMetrics> {
+    state: State<M>,
     timers: BTreeSet<(Duration, SessionIndex)>,
     packet_queue: VecDeque<(SocketAddr, Bytes)>,
     config: Config,
@@ -71,7 +71,7 @@ pub struct API<C: Context> {
     last_tick: Option<Duration>,
 }
 
-impl<C: Context> API<C> {
+impl<C: Context, M: MetricNames> API<C, M> {
     pub fn new(config: Config, local_static_key: monad_secp::KeyPair, mut context: C) -> Self {
         let local_static_public = local_static_key.pubkey();
         let cookies = Cookies::new(
@@ -115,7 +115,7 @@ impl<C: Context> API<C> {
 
     #[instrument(level = Level::TRACE, skip(self), fields(local_public_key = ?self.local_serialized_public))]
     pub fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)> {
-        self.metrics[GAUGE_WIREAUTH_API_NEXT_PACKET] += 1;
+        self.metrics[M::API_NEXT_PACKET] += 1;
         self.packet_queue.pop_front()
     }
 
@@ -138,7 +138,7 @@ impl<C: Context> API<C> {
 
     #[instrument(level = Level::TRACE, skip(self), fields(local_public_key = ?self.local_serialized_public))]
     pub fn tick(&mut self) {
-        self.metrics[GAUGE_WIREAUTH_API_TICK] += 1;
+        self.metrics[M::API_TICK] += 1;
         let duration_since_start = self.context.duration_since_start();
 
         self.filter.tick(duration_since_start);
@@ -197,8 +197,7 @@ impl<C: Context> API<C> {
                         dropped_messages=buffered_count,
                         "initiator timeout, dropping buffered messages"
                     );
-                    self.metrics[GAUGE_WIREAUTH_INITIATOR_MESSAGES_DROPPED] +=
-                        buffered_count as u64;
+                    self.metrics[M::INITIATOR_MESSAGES_DROPPED] += buffered_count as u64;
                 }
                 result
             } else if let Some(s) = self.state.get_responder_mut(&session_id) {
@@ -215,7 +214,7 @@ impl<C: Context> API<C> {
             };
 
             if let Some(message) = message {
-                self.metrics[GAUGE_WIREAUTH_ENQUEUED_KEEPALIVE] += 1;
+                self.metrics[M::ENQUEUED_KEEPALIVE] += 1;
                 self.packet_queue
                     .push_back((message.remote_addr, message.header.into()));
             }
@@ -227,7 +226,7 @@ impl<C: Context> API<C> {
                     rekey.stored_cookie,
                     rekey.retry_attempts,
                 ) {
-                    self.metrics[GAUGE_WIREAUTH_ENQUEUED_HANDSHAKE_INIT] += 1;
+                    self.metrics[M::ENQUEUED_HANDSHAKE_INIT] += 1;
                     self.packet_queue
                         .push_back((rekey.remote_addr, message.into()));
                     self.timers.insert((timer, new_session_index));
@@ -257,7 +256,7 @@ impl<C: Context> API<C> {
         remote_addr: SocketAddr,
         retry_attempts: u64,
     ) -> Result<()> {
-        self.metrics[GAUGE_WIREAUTH_API_CONNECT] += 1;
+        self.metrics[M::API_CONNECT] += 1;
         debug!(retry_attempts, "initiating connection");
         let cookie = self
             .state
@@ -266,10 +265,10 @@ impl<C: Context> API<C> {
         let (local_index, timer, message) = self
             .init_session_with_cookie(remote_static_key, remote_addr, cookie, retry_attempts)
             .inspect_err(|_| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_CONNECT] += 1;
+                self.metrics[M::ERROR_CONNECT] += 1;
             })?;
 
-        self.metrics[GAUGE_WIREAUTH_ENQUEUED_HANDSHAKE_INIT] += 1;
+        self.metrics[M::ENQUEUED_HANDSHAKE_INIT] += 1;
         self.packet_queue.push_back((remote_addr, message.into()));
         self.timers.insert((timer, local_index));
 
@@ -283,11 +282,11 @@ impl<C: Context> API<C> {
         cookie: Option<[u8; 16]>,
         retry_attempts: u64,
     ) -> Result<(SessionIndex, Duration, HandshakeInitiation)> {
-        let reservation = self.state.reserve_session_index().ok_or_else(|| {
-            self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_EXHAUSTED] += 1;
+        let local_index = self.state.allocate_session_index().ok_or_else(|| {
+            self.metrics[M::ERROR_SESSION_EXHAUSTED] += 1;
             Error::SessionIndexExhausted
         })?;
-        debug!(local_session_id=?reservation.index(), "allocating session index for new connection");
+        debug!(local_session_id=?local_index, "allocating session index for new connection");
         let system_time = self.context.system_time();
         let duration_since_start = self.context.duration_since_start();
         let (session, (timer, message)) = InitiatorState::new(
@@ -295,27 +294,25 @@ impl<C: Context> API<C> {
             system_time,
             duration_since_start,
             &self.config,
-            reservation.index(),
+            local_index,
             &self.local_static_key,
             remote_static_key,
             remote_addr,
             cookie,
             retry_attempts,
         );
-        let index = reservation.index();
-        reservation.commit();
 
         self.state
-            .insert_initiator(index, session, remote_static_key);
+            .insert_initiator(local_index, session, remote_static_key);
 
-        Ok((index, timer, message))
+        Ok((local_index, timer, message))
     }
 
-    fn check_under_load<M: crate::protocol::messages::MacMessage>(
+    fn check_under_load<Msg: crate::protocol::messages::MacMessage>(
         &mut self,
         remote_addr: SocketAddr,
         sender_index: u32,
-        message: &M,
+        message: &Msg,
     ) -> bool {
         let duration_since_start = self.context.duration_since_start();
         let action = self.filter.apply(
@@ -334,7 +331,7 @@ impl<C: Context> API<C> {
                 let reply =
                     self.cookies
                         .create(remote_addr, sender_index, message, duration_since_start);
-                self.metrics[GAUGE_WIREAUTH_ENQUEUED_COOKIE_REPLY] += 1;
+                self.metrics[M::ENQUEUED_COOKIE_REPLY] += 1;
                 self.packet_queue.push_back((remote_addr, reply.into()));
                 false
             }
@@ -355,7 +352,7 @@ impl<C: Context> API<C> {
     ) -> Result<()> {
         crate::protocol::crypto::verify_mac1(handshake_packet, &self.local_static_key.pubkey())
             .map_err(|source| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_MAC1_VERIFICATION_FAILED] += 1;
+                self.metrics[M::ERROR_MAC1_VERIFICATION_FAILED] += 1;
                 Error::Mac1VerificationFailed {
                     addr: remote_addr,
                     source,
@@ -376,7 +373,7 @@ impl<C: Context> API<C> {
         let validated_init =
             ResponderState::validate_init(&self.local_static_key, handshake_packet).map_err(
                 |e| {
-                    self.metrics[GAUGE_WIREAUTH_ERROR_HANDSHAKE_INIT_VALIDATION] += 1;
+                    self.metrics[M::ERROR_HANDSHAKE_INIT_VALIDATION] += 1;
                     e.with_addr(remote_addr)
                 },
             )?;
@@ -387,18 +384,17 @@ impl<C: Context> API<C> {
             .get_max_timestamp(&remote_key)
             .is_some_and(|max| validated_init.system_time <= max)
         {
-            self.metrics[GAUGE_WIREAUTH_ERROR_TIMESTAMP_REPLAY] += 1;
+            self.metrics[M::ERROR_TIMESTAMP_REPLAY] += 1;
             debug!(?remote_addr, ?remote_key, "timestamp replay detected");
             return Err(Error::TimestampReplay { addr: remote_addr });
         }
 
         let stored_cookie = self.state.lookup_cookie_from_accepted_sessions(remote_key);
 
-        let reservation = self.state.reserve_session_index().ok_or_else(|| {
-            self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_EXHAUSTED] += 1;
+        let local_index = self.state.allocate_session_index().ok_or_else(|| {
+            self.metrics[M::ERROR_SESSION_EXHAUSTED] += 1;
             Error::SessionIndexExhausted
         })?;
-        let local_index = reservation.index();
 
         let (session, timer, message) = ResponderState::new(
             self.context.rng(),
@@ -410,16 +406,14 @@ impl<C: Context> API<C> {
             remote_addr,
         )
         .map_err(|e| {
-            self.metrics[GAUGE_WIREAUTH_ERROR_HANDSHAKE_INIT_RESPONDER_NEW] += 1;
+            self.metrics[M::ERROR_HANDSHAKE_INIT_RESPONDER_NEW] += 1;
             e.with_addr(remote_addr)
         })?;
-
-        reservation.commit();
 
         self.state
             .insert_responder(local_index, session, remote_key);
 
-        self.metrics[GAUGE_WIREAUTH_ENQUEUED_HANDSHAKE_RESPONSE] += 1;
+        self.metrics[M::ENQUEUED_HANDSHAKE_RESPONSE] += 1;
         self.packet_queue.push_back((remote_addr, message.into()));
         self.timers.insert((timer, local_index));
 
@@ -435,12 +429,12 @@ impl<C: Context> API<C> {
 
         if let Some(session) = self.state.get_initiator_mut(&receiver_session_index) {
             session.handle_cookie(cookie_reply).map_err(|e| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_COOKIE_REPLY] += 1;
+                self.metrics[M::ERROR_COOKIE_REPLY] += 1;
                 e.with_addr(remote_addr)
             })?;
         } else if let Some(session) = self.state.get_responder_mut(&receiver_session_index) {
             session.handle_cookie(cookie_reply).map_err(|e| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_COOKIE_REPLY] += 1;
+                self.metrics[M::ERROR_COOKIE_REPLY] += 1;
                 e.with_addr(remote_addr)
             })?;
         }
@@ -453,32 +447,32 @@ impl<C: Context> API<C> {
         control: ControlPacket,
         remote_addr: SocketAddr,
     ) -> Result<()> {
-        self.metrics[GAUGE_WIREAUTH_API_DISPATCH_CONTROL] += 1;
+        self.metrics[M::API_DISPATCH_CONTROL] += 1;
         let result = match control {
             ControlPacket::HandshakeInitiation(handshake) => {
                 debug!("processing handshake initiation");
-                self.metrics[GAUGE_WIREAUTH_DISPATCH_HANDSHAKE_INIT] += 1;
+                self.metrics[M::DISPATCH_HANDSHAKE_INIT] += 1;
                 self.accept_handshake_init(handshake, remote_addr)
             }
             ControlPacket::HandshakeResponse(response) => {
                 debug!("processing handshake response");
-                self.metrics[GAUGE_WIREAUTH_DISPATCH_HANDSHAKE_RESPONSE] += 1;
+                self.metrics[M::DISPATCH_HANDSHAKE_RESPONSE] += 1;
                 self.complete_handshake(response, remote_addr)
             }
             ControlPacket::CookieReply(cookie_reply) => {
                 debug!("processing cookie reply");
-                self.metrics[GAUGE_WIREAUTH_DISPATCH_COOKIE_REPLY] += 1;
+                self.metrics[M::DISPATCH_COOKIE_REPLY] += 1;
                 self.accept_cookie(cookie_reply, remote_addr)
             }
             ControlPacket::Keepalive(data_packet) => {
                 trace!("processing keepalive packet");
-                self.metrics[GAUGE_WIREAUTH_DISPATCH_KEEPALIVE] += 1;
+                self.metrics[M::DISPATCH_KEEPALIVE] += 1;
                 self.decrypt(data_packet, remote_addr)?;
                 Ok(())
             }
         };
         if result.is_err() {
-            self.metrics[GAUGE_WIREAUTH_ERROR_DISPATCH_CONTROL] += 1;
+            self.metrics[M::ERROR_DISPATCH_CONTROL] += 1;
         }
         result
     }
@@ -489,7 +483,7 @@ impl<C: Context> API<C> {
         data_packet: DataPacket<'a>,
         remote_addr: SocketAddr,
     ) -> Result<(Plaintext<'a>, PubKey)> {
-        self.metrics[GAUGE_WIREAUTH_API_DECRYPT] += 1;
+        self.metrics[M::API_DECRYPT] += 1;
         let receiver_index = data_packet.header().receiver_index.into();
         let nonce: u64 = data_packet.header().nonce.into();
         trace!(local_session_id=?receiver_index, nonce, "decrypting data packet");
@@ -502,7 +496,7 @@ impl<C: Context> API<C> {
             let (timer, plaintext) = transport
                 .decrypt(&self.config, duration_since_start, data_packet)
                 .map_err(|e| {
-                    self.metrics[GAUGE_WIREAUTH_ERROR_DECRYPT] += 1;
+                    self.metrics[M::ERROR_DECRYPT] += 1;
                     e.with_addr(remote_addr)
                 })?;
             let remote_public_key = transport.remote_public_key;
@@ -520,13 +514,13 @@ impl<C: Context> API<C> {
                     (establish_timer, remote_public_key, plaintext)
                 }
                 Err(e) => {
-                    self.metrics[GAUGE_WIREAUTH_ERROR_DECRYPT] += 1;
+                    self.metrics[M::ERROR_DECRYPT] += 1;
                     return Err(e.with_addr(remote_addr));
                 }
             }
         } else {
-            self.metrics[GAUGE_WIREAUTH_ERROR_DECRYPT] += 1;
-            self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_INDEX_NOT_FOUND] += 1;
+            self.metrics[M::ERROR_DECRYPT] += 1;
+            self.metrics[M::ERROR_SESSION_INDEX_NOT_FOUND] += 1;
             return Err(Error::SessionIndexNotFound {
                 index: receiver_index,
             });
@@ -544,7 +538,7 @@ impl<C: Context> API<C> {
     ) -> Result<()> {
         crate::protocol::crypto::verify_mac1(response, &self.local_static_key.pubkey()).map_err(
             |source| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_MAC1_VERIFICATION_FAILED] += 1;
+                self.metrics[M::ERROR_MAC1_VERIFICATION_FAILED] += 1;
                 Error::Mac1VerificationFailed {
                     addr: remote_addr,
                     source,
@@ -563,7 +557,7 @@ impl<C: Context> API<C> {
             .state
             .get_initiator_mut(&receiver_session_index)
             .ok_or_else(|| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_INVALID_RECEIVER_INDEX] += 1;
+                self.metrics[M::ERROR_INVALID_RECEIVER_INDEX] += 1;
                 Error::InvalidReceiverIndex {
                     index: receiver_session_index,
                     addr: remote_addr,
@@ -573,7 +567,7 @@ impl<C: Context> API<C> {
         let validated_response = initiator
             .validate_response(&self.config, &self.local_static_key, response)
             .map_err(|e| {
-                self.metrics[GAUGE_WIREAUTH_ERROR_HANDSHAKE_RESPONSE_VALIDATION] += 1;
+                self.metrics[M::ERROR_HANDSHAKE_RESPONSE_VALIDATION] += 1;
                 e.with_addr(remote_addr)
             })?;
 
@@ -615,7 +609,7 @@ impl<C: Context> API<C> {
             packet.extend_from_slice(header.as_bytes());
             packet.extend_from_slice(&plaintext);
             self.packet_queue.push_back((remote_addr, packet.freeze()));
-            self.metrics[GAUGE_WIREAUTH_INITIATOR_MESSAGES_SENT_FROM_BUFFER] += 1;
+            self.metrics[M::INITIATOR_MESSAGES_SENT_FROM_BUFFER] += 1;
         }
 
         self.state
@@ -632,7 +626,7 @@ impl<C: Context> API<C> {
         public_key: &monad_secp::PubKey,
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
-        self.metrics[GAUGE_WIREAUTH_API_ENCRYPT_BY_PUBLIC_KEY] += 1;
+        self.metrics[M::API_ENCRYPT_BY_PUBLIC_KEY] += 1;
 
         if let Some(transport) = self.state.get_transport_by_public_key(public_key) {
             let duration_since_start = self.context.duration_since_start();
@@ -650,7 +644,7 @@ impl<C: Context> API<C> {
         if let Some(initiator) = self.state.get_initiator_by_public_key_mut(public_key) {
             let message = Bytes::copy_from_slice(plaintext);
             initiator.buffer_message(message);
-            self.metrics[GAUGE_WIREAUTH_INITIATOR_BUFFERED_MESSAGES] += 1;
+            self.metrics[M::INITIATOR_BUFFERED_MESSAGES] += 1;
             trace!(
                 buffered_message_count = initiator.buffered_message_count(),
                 public_key = ?CompressedPublicKey::from(public_key),
@@ -659,8 +653,8 @@ impl<C: Context> API<C> {
             return Ok(DataPacketHeader::default());
         }
 
-        self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_PUBLIC_KEY] += 1;
-        self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_FOUND] += 1;
+        self.metrics[M::ERROR_ENCRYPT_BY_PUBLIC_KEY] += 1;
+        self.metrics[M::ERROR_SESSION_NOT_FOUND] += 1;
         Err(Error::SessionNotFound)
     }
 
@@ -670,7 +664,7 @@ impl<C: Context> API<C> {
         socket_addr: &SocketAddr,
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
-        self.metrics[GAUGE_WIREAUTH_API_ENCRYPT_BY_SOCKET] += 1;
+        self.metrics[M::API_ENCRYPT_BY_SOCKET] += 1;
 
         if let Some(transport) = self.state.get_transport_by_socket(socket_addr) {
             let duration_since_start = self.context.duration_since_start();
@@ -688,7 +682,7 @@ impl<C: Context> API<C> {
         if let Some(initiator) = self.state.get_initiator_by_socket_mut(socket_addr) {
             let message = Bytes::copy_from_slice(plaintext);
             initiator.buffer_message(message);
-            self.metrics[GAUGE_WIREAUTH_INITIATOR_BUFFERED_MESSAGES] += 1;
+            self.metrics[M::INITIATOR_BUFFERED_MESSAGES] += 1;
             trace!(
                 buffered_message_count = initiator.buffered_message_count(),
                 socket_addr = ?socket_addr,
@@ -697,14 +691,14 @@ impl<C: Context> API<C> {
             return Ok(DataPacketHeader::default());
         }
 
-        self.metrics[GAUGE_WIREAUTH_ERROR_ENCRYPT_BY_SOCKET] += 1;
-        self.metrics[GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS] += 1;
+        self.metrics[M::ERROR_ENCRYPT_BY_SOCKET] += 1;
+        self.metrics[M::ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS] += 1;
         Err(Error::SessionNotEstablishedForAddress { addr: *socket_addr })
     }
 
     #[instrument(level = Level::TRACE, skip(self, public_key), fields(local_public_key = ?self.local_serialized_public))]
     pub fn disconnect(&mut self, public_key: &monad_secp::PubKey) {
-        self.metrics[GAUGE_WIREAUTH_API_DISCONNECT] += 1;
+        self.metrics[M::API_DISCONNECT] += 1;
         self.state.terminate_by_public_key(public_key);
     }
 
