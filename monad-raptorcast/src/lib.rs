@@ -39,8 +39,8 @@ use monad_crypto::{
 };
 use monad_dataplane::{
     udp::{segment_size_for_mtu, DEFAULT_MTU},
-    DataplaneBuilder, DataplaneControl, RecvTcpMsg, TcpMsg, TcpSocketReader, TcpSocketWriter,
-    UdpSocketHandle,
+    DataplaneBuilder, DataplaneControl, RecvTcpMsg, TcpMsg, TcpSocketHandle, TcpSocketReader,
+    TcpSocketWriter, UdpSocketHandle,
 };
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{
@@ -144,8 +144,7 @@ where
     pub fn new(
         config: config::RaptorCastConfig<ST>,
         secondary_mode: SecondaryRaptorCastModeConfig,
-        tcp_reader: TcpSocketReader,
-        tcp_writer: TcpSocketWriter,
+        tcp_socket: TcpSocketHandle,
         authenticated_socket: Option<UdpSocketHandle>,
         non_authenticated_socket: UdpSocketHandle,
         control: DataplaneControl,
@@ -153,6 +152,8 @@ where
         current_epoch: Epoch,
         auth_protocol: AP,
     ) -> Self {
+        let (tcp_reader, tcp_writer) = tcp_socket.split();
+
         if config.primary_instance.raptor10_redundancy < 1f32 {
             panic!(
                 "Configuration value raptor10_redundancy must be equal or greater than 1, \
@@ -521,13 +522,19 @@ where
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
 {
+    const TCP_SOCKET: &str = "tcp";
+
     let peer_discovery_builder = NopDiscoveryBuilder {
         known_addresses,
         ..Default::default()
     };
     let up_bandwidth_mbps = 1_000;
     let non_authenticated_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
-    let dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps)
+    let dp = DataplaneBuilder::new(up_bandwidth_mbps)
+        .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+            socket_addr: local_addr,
+            label: TCP_SOCKET.to_string(),
+        }])
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: local_addr,
@@ -540,14 +547,14 @@ where
         ])
         .build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
-    let (tcp_socket, mut udp_dataplane, control) = dp.split();
+    let (mut tcp_dataplane, mut udp_dataplane, control) = dp.split();
+    let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
     let authenticated_socket = udp_dataplane
         .take_socket(AUTHENTICATED_RAPTORCAST_SOCKET)
         .expect("authenticated socket");
     let non_authenticated_socket = udp_dataplane
         .take_socket(RAPTORCAST_SOCKET)
         .expect("non-authenticated socket");
-    let (tcp_reader, tcp_writer) = tcp_socket.split();
     let config = config::RaptorCastConfig {
         shared_key,
         mtu: DEFAULT_MTU,
@@ -576,8 +583,7 @@ where
     RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, _>::new(
         config,
         SecondaryRaptorCastModeConfig::None,
-        tcp_reader,
-        tcp_writer,
+        tcp_socket,
         Some(authenticated_socket),
         non_authenticated_socket,
         control,
@@ -597,13 +603,19 @@ where
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
 {
+    const TCP_SOCKET: &str = "tcp";
+
     let peer_discovery_builder = NopDiscoveryBuilder {
         known_addresses,
         ..Default::default()
     };
     let up_bandwidth_mbps = 1_000;
     let non_authenticated_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
-    let dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps)
+    let dp = DataplaneBuilder::new(up_bandwidth_mbps)
+        .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+            socket_addr: local_addr,
+            label: TCP_SOCKET.to_string(),
+        }])
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: local_addr,
@@ -616,14 +628,14 @@ where
         ])
         .build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
-    let (tcp_socket, mut udp_dataplane, control) = dp.split();
+    let (mut tcp_dataplane, mut udp_dataplane, control) = dp.split();
+    let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
     let authenticated_socket = udp_dataplane
         .take_socket(AUTHENTICATED_RAPTORCAST_SOCKET)
         .expect("authenticated socket");
     let non_authenticated_socket = udp_dataplane
         .take_socket(RAPTORCAST_SOCKET)
         .expect("non-authenticated socket");
-    let (tcp_reader, tcp_writer) = tcp_socket.split();
     let config = config::RaptorCastConfig {
         shared_key: shared_key.clone(),
         mtu: DEFAULT_MTU,
@@ -653,8 +665,7 @@ where
     RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, _>::new(
         config,
         SecondaryRaptorCastModeConfig::None,
-        tcp_reader,
-        tcp_writer,
+        tcp_socket,
         Some(authenticated_socket),
         non_authenticated_socket,
         control,

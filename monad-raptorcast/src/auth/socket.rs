@@ -441,6 +441,8 @@ mod tests {
 
     impl PeerNode {
         fn new(auth_port: u16, non_auth_port: u16, seed: u8) -> Self {
+            const TCP_SOCKET: &str = "tcp";
+
             let auth_addr =
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), auth_port));
             let non_auth_addr = SocketAddr::V4(SocketAddrV4::new(
@@ -448,7 +450,11 @@ mod tests {
                 non_auth_port,
             ));
 
-            let dp = DataplaneBuilder::new(&auth_addr, 1000)
+            let dp = DataplaneBuilder::new(1000)
+                .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+                    socket_addr: auth_addr,
+                    label: TCP_SOCKET.to_string(),
+                }])
                 .extend_udp_sockets(vec![
                     monad_dataplane::UdpSocketConfig {
                         socket_addr: auth_addr,
@@ -462,7 +468,8 @@ mod tests {
                 .build();
 
             assert!(dp.block_until_ready(Duration::from_secs(1)));
-            let (tcp_socket, mut udp_dataplane, control) = dp.split();
+            let (mut tcp_dataplane, mut udp_dataplane, control) = dp.split();
+            let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
 
             let authenticated_socket = udp_dataplane
                 .take_socket(AUTHENTICATED_SOCKET)
@@ -570,9 +577,15 @@ mod tests {
     async fn test_timer_deadline() {
         init_tracing();
 
+        const TCP_SOCKET: &str = "tcp";
+
         let auth_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 19003));
 
-        let dp = DataplaneBuilder::new(&auth_addr, 1000)
+        let dp = DataplaneBuilder::new(1000)
+            .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+                socket_addr: auth_addr,
+                label: TCP_SOCKET.to_string(),
+            }])
             .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
                 socket_addr: auth_addr,
                 label: AUTHENTICATED_SOCKET.to_string(),
@@ -580,7 +593,7 @@ mod tests {
             .build();
 
         assert!(dp.block_until_ready(Duration::from_secs(1)));
-        let (_tcp_socket, mut udp_dataplane, _control) = dp.split();
+        let (_tcp_dataplane, mut udp_dataplane, _control) = dp.split();
 
         let authenticated_socket = udp_dataplane
             .take_socket(AUTHENTICATED_SOCKET)
@@ -589,6 +602,7 @@ mod tests {
         let local_keypair = keypair(1);
         let config = Config {
             handshake_rate_reset_interval: Duration::from_millis(10),
+            initiator_session_timeout: Duration::from_millis(4),
             session_timeout: Duration::from_millis(4),
             session_timeout_jitter: Duration::ZERO,
             ..Default::default()

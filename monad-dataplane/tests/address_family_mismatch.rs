@@ -43,7 +43,7 @@ fn address_family_mismatch() {
 
     for addr in BIND_ADDRS {
         let bind_addr = addr.parse().unwrap();
-        let mut dataplane = DataplaneBuilder::new(&bind_addr, UP_BANDWIDTH_MBPS)
+        let mut dataplane = DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
             .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
                 socket_addr: bind_addr,
                 label: LEGACY_SOCKET.to_string(),

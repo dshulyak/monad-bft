@@ -593,7 +593,13 @@ fn setup_node(
     let non_authenticated_addr =
         SocketAddr::V4(SocketAddrV4::new(bind_ip, my_config.udp_addr.port()));
 
-    let dataplane = DataplaneBuilder::new(&tcp_addr, UDP_BW)
+    const TCP_SOCKET: &str = "tcp";
+
+    let dataplane = DataplaneBuilder::new(UDP_BW)
+        .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+            socket_addr: tcp_addr,
+            label: TCP_SOCKET.to_string(),
+        }])
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: authenticated_udp_addr,
@@ -607,8 +613,8 @@ fn setup_node(
         .build();
     assert!(dataplane.block_until_ready(Duration::from_secs(2)));
 
-    let (tcp_socket, mut udp_dataplane, dataplane_control) = dataplane.split();
-    let (tcp_reader, tcp_writer) = tcp_socket.split();
+    let (mut tcp_dataplane, mut udp_dataplane, dataplane_control) = dataplane.split();
+    let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
     let authenticated_socket = udp_dataplane
         .take_socket(AUTHENTICATED_RAPTORCAST_SOCKET)
         .expect("authenticated socket not found");
@@ -644,8 +650,7 @@ fn setup_node(
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
-        tcp_reader,
-        tcp_writer,
+        tcp_socket,
         Some(authenticated_socket),
         non_authenticated_socket,
         dataplane_control,

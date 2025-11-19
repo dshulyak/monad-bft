@@ -52,6 +52,8 @@ use monad_types::{Epoch, NodeId};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
+const TCP_SOCKET: &str = "tcp";
+
 //==============================================================================
 pub struct MultiRouter<ST, M, OM, SE, PD, AP>
 where
@@ -102,13 +104,12 @@ where
         let dp = dataplane_builder.build();
         assert!(dp.block_until_ready(Duration::from_secs(1)));
 
-        let (tcp_socket, mut udp_dataplane, control) = dp.split();
+        let (mut tcp_dataplane, mut udp_dataplane, control) = dp.split();
+        let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
         let authenticated_socket = udp_dataplane.take_socket(AUTHENTICATED_RAPTORCAST_SOCKET);
         let non_authenticated_socket = udp_dataplane
             .take_socket(RAPTORCAST_SOCKET)
             .expect("raptorcast socket");
-
-        let (tcp_reader, tcp_writer) = tcp_socket.split();
 
         // Create channels between primary and secondary raptorcast instances.
         // Fundamentally this is needed because, while both can send, only the
@@ -146,8 +147,7 @@ where
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
-            tcp_reader,
-            tcp_writer,
+            tcp_socket,
             authenticated_socket,
             non_authenticated_socket,
             control,

@@ -30,6 +30,7 @@ use monad_dataplane::{
 };
 
 const LEGACY_SOCKET: &str = "legacy";
+const TCP_SOCKET: &str = "tcp";
 use rand::Rng;
 
 const NODE_ONE_ADDR: &str = "127.0.0.1:60000";
@@ -37,7 +38,7 @@ const NODE_TWO_ADDR: &str = "127.0.0.1:60001";
 
 fn main() {
     env_logger::init();
-    let tx = Node::new(&NODE_ONE_ADDR.parse().unwrap(), NODE_TWO_ADDR);
+    let mut tx = Node::new(&NODE_ONE_ADDR.parse().unwrap(), NODE_TWO_ADDR);
     let mut rx = Node::new(&NODE_TWO_ADDR.parse().unwrap(), NODE_ONE_ADDR);
 
     let num_pkts = 10;
@@ -92,7 +93,8 @@ fn main() {
             })
         }
 
-        tx.dataplane.tcp_write(
+        let tcp_socket = tx.dataplane.take_tcp_socket_handle(TCP_SOCKET).unwrap();
+        tcp_socket.write(
             tx.target,
             TcpMsg {
                 msg: Bytes::from(&b"Hello world"[..]),
@@ -117,10 +119,14 @@ struct Node {
 
 impl Node {
     pub fn new(addr: &SocketAddr, target_addr: &str) -> Self {
-        let mut dataplane = DataplaneBuilder::new(addr, 1_000)
+        let mut dataplane = DataplaneBuilder::new(1_000)
             .extend_udp_sockets(vec![monad_dataplane::UdpSocketConfig {
                 socket_addr: *addr,
                 label: LEGACY_SOCKET.to_string(),
+            }])
+            .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+                socket_addr: *addr,
+                label: TCP_SOCKET.to_string(),
             }])
             .build();
         let udp_socket = dataplane

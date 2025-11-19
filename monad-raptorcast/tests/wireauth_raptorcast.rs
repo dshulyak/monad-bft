@@ -187,7 +187,13 @@ fn create_dataplane(
     monad_dataplane::UdpSocketHandle,
     monad_dataplane::DataplaneControl,
 ) {
-    let dp = monad_dataplane::DataplaneBuilder::new(&SocketAddr::V4(auth_addr), UP_BANDWIDTH_MBPS)
+    const TCP_SOCKET: &str = "tcp";
+
+    let dp = monad_dataplane::DataplaneBuilder::new(UP_BANDWIDTH_MBPS)
+        .extend_tcp_sockets(vec![monad_dataplane::TcpSocketConfig {
+            socket_addr: SocketAddr::V4(auth_addr),
+            label: TCP_SOCKET.to_string(),
+        }])
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: SocketAddr::V4(auth_addr),
@@ -201,7 +207,8 @@ fn create_dataplane(
         .build();
     assert!(dp.block_until_ready(Duration::from_secs(1)));
 
-    let (tcp_socket, mut udp_dataplane, control) = dp.split();
+    let (mut tcp_dataplane, mut udp_dataplane, control) = dp.split();
+    let tcp_socket = tcp_dataplane.take_socket(TCP_SOCKET).unwrap();
     let authenticated_socket = udp_dataplane
         .take_socket(monad_raptorcast::AUTHENTICATED_RAPTORCAST_SOCKET)
         .expect("authenticated socket");
@@ -257,7 +264,6 @@ fn spawn_noop_validator(
         let shared_pd = create_peer_discovery(known_addresses, name_records);
         let (tcp_socket, _authenticated_socket, non_authenticated_socket, control) =
             create_dataplane(auth_addr, non_auth_addr);
-        let (tcp_reader, tcp_writer) = tcp_socket.split();
         let config = create_raptorcast_config(keypair);
         let auth_protocol = monad_raptorcast::auth::NoopAuthProtocol::new();
 
@@ -271,8 +277,7 @@ fn spawn_noop_validator(
         >::new(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
-            tcp_reader,
-            tcp_writer,
+            tcp_socket,
             None,
             non_authenticated_socket,
             control,
@@ -324,7 +329,6 @@ fn spawn_wireauth_validator(
         let shared_pd = create_peer_discovery(known_addresses, name_records);
         let (tcp_socket, authenticated_socket, non_authenticated_socket, control) =
             create_dataplane(auth_addr, non_auth_addr);
-        let (tcp_reader, tcp_writer) = tcp_socket.split();
         let config = create_raptorcast_config(keypair.clone());
         let wireauth_config = monad_wireauth::Config::default();
         let auth_protocol =
@@ -340,8 +344,7 @@ fn spawn_wireauth_validator(
         >::new(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
-            tcp_reader,
-            tcp_writer,
+            tcp_socket,
             Some(authenticated_socket),
             non_authenticated_socket,
             control,
