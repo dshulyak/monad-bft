@@ -21,10 +21,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
 use monad_types::UdpPriority;
-use monoio::{net::udp::UdpSocket, spawn, time};
+use monoio::{
+    buf::{BufferRingBuilder, Ipv4RecvMsgParser},
+    io::stream::Stream,
+    net::udp::UdpSocket,
+    spawn, time,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
@@ -164,6 +169,7 @@ pub(crate) fn spawn_tasks(
     up_bandwidth_mbps: u64,
     buffer_size: Option<usize>,
     socket_readers: usize,
+    use_multishot: bool,
 ) {
     let mut tx_sockets = Vec::new();
 
@@ -172,12 +178,22 @@ pub(crate) fn spawn_tasks(
         let tx = UdpSocket::from_std(socket).unwrap();
         configure_socket(&tx, buffer_size);
 
-        for _ in 0..socket_readers {
+        if use_multishot {
             let rx = tx.dup().expect("failed to dup socket");
-            spawn(rx_single_socket(rx, ingress_tx.clone()));
+            spawn(rx_multishot_socket(
+                rx,
+                ingress_tx.clone(),
+                socket_id as u16,
+            ));
+            trace!(socket_id, label = %label, ?socket_addr, "created multishot socket");
+        } else {
+            for _ in 0..socket_readers {
+                let rx = tx.dup().expect("failed to dup socket");
+                spawn(rx_single_socket(rx, ingress_tx.clone()));
+            }
+            trace!(socket_id, label = %label, ?socket_addr, readers = socket_readers, "created socket");
         }
 
-        trace!(socket_id, label = %label, ?socket_addr, readers = socket_readers, "created socket");
         tx_sockets.push(tx);
     }
 
@@ -209,6 +225,58 @@ async fn rx_single_socket(socket: UdpSocket, udp_ingress_tx: mpsc::Sender<RecvUd
         }
     }
 }
+
+async fn rx_multishot_socket(
+    socket: UdpSocket,
+    udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
+    group_id: u16,
+) {
+    let ring = BufferRingBuilder::<Ipv4RecvMsgParser>::new()
+        .buffer_count(DEFAULT_RINGBUF_COUNT)
+        .payload_size(DEFAULT_RINGBUF_SIZE as usize)
+        .group_id(group_id)
+        .register()
+        .expect("failed to create buffer ring");
+
+    loop {
+        let mut stream = socket
+            .recvmsg_multishot(&ring)
+            .expect("failed to create multishot stream");
+
+        loop {
+            match stream.next().await {
+                Some(Ok((src_addr, buf))) => {
+                    let payload = Bytes::copy_from_slice(&buf);
+                    let len = payload.len();
+
+                    let msg = RecvUdpMsg {
+                        src_addr: src_addr.into(),
+                        payload,
+                        stride: len.max(1).try_into().unwrap(),
+                    };
+
+                    if let Err(err) = udp_ingress_tx.send(msg).await {
+                        warn!(?err, "error queueing up received UDP message (multishot)");
+                        return;
+                    }
+                }
+                Some(Err(e)) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    debug!("ringbuf exhausted");
+                }
+                Some(Err(e)) => {
+                    warn!("multishot recv error: {:?}", e);
+                }
+                None => {
+                    debug!("multishot stream ended, recreating stream");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+const DEFAULT_RINGBUF_COUNT: u32 = 256;
+const DEFAULT_RINGBUF_SIZE: u32 = ETHERNET_SEGMENT_SIZE as u32;
 
 const PACING_SLEEP_OVERSHOOT_DETECTION_WINDOW: Duration = Duration::from_millis(100);
 

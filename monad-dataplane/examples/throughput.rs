@@ -130,6 +130,14 @@ enum Command {
             help = "number of socket readers"
         )]
         num_readers: usize,
+
+        #[arg(
+            short = 'm',
+            long,
+            default_value = "false",
+            help = "use multishot ringbuf receive"
+        )]
+        multishot: bool,
     },
 }
 
@@ -172,9 +180,10 @@ fn main() {
         Command::Reader {
             bind_addr,
             num_readers,
+            multishot,
         } => {
             let bind_addr: SocketAddr = bind_addr.parse().expect("invalid bind address");
-            run_native(bind_addr, num_readers);
+            run_native(bind_addr, num_readers, multishot);
         }
     }
 }
@@ -363,11 +372,12 @@ fn run_native_writer(
     }
 }
 
-fn run_native(bind_addr: SocketAddr, num_readers: usize) {
-    info!(addr = %bind_addr, num_readers, "starting native dataplane reader");
+fn run_native(bind_addr: SocketAddr, num_readers: usize, multishot: bool) {
+    info!(addr = %bind_addr, num_readers, multishot, "starting native dataplane reader");
 
     let mut dataplane = DataplaneBuilder::new(&bind_addr, 10_000)
         .with_socket_readers(num_readers)
+        .with_udp_multishot(multishot)
         .extend_udp_sockets(vec![UdpSocketConfig {
             socket_addr: bind_addr,
             label: "bench".to_string(),
