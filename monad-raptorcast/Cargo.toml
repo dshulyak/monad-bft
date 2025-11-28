@@ -25,36 +25,40 @@ monad-wireauth = { workspace = true }
 
 alloy-rlp = { workspace = true }
 bitvec = { workspace = true }
+byte-unit = { workspace = true }
 bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+eyre = { workspace = true }
 fixed = { workspace = true}
 futures = { workspace = true }
+futures-util = { workspace = true }
 hex = { workspace = true }
+humantime = { workspace = true }
 indexmap = { workspace = true }
 iset = { workspace = true }
 itertools = { workspace = true }
 lru = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["macros"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
 monad-testutil = { workspace = true }
 alloy-primitives = { workspace = true }
 
-byte-unit = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
-eyre = { workspace = true }
-futures-util = { workspace = true }
-humantime = { workspace = true }
 insta = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
-opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
-opentelemetry-semantic-conventions = { workspace = true }
 rand_distr = { workspace = true }
 rstest = { workspace = true }
 serial_test = { workspace = true }

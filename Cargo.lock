@@ -5020,6 +5020,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-cluster-sim"
+version = "0.1.0"
+dependencies = [
+ "alloy-rlp",
+ "bytes",
+ "clap 4.5.47",
+ "eyre",
+ "futures-util",
+ "hex",
+ "humantime",
+ "monad-crypto",
+ "monad-dataplane",
+ "monad-executor",
+ "monad-executor-glue",
+ "monad-node-config",
+ "monad-peer-discovery",
+ "monad-raptorcast",
+ "monad-router-multi",
+ "monad-secp",
+ "monad-types",
+ "monad-wireauth",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "serde",
+ "tikv-jemallocator",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "monad-compress"
 version = "0.1.0"
 dependencies = [
