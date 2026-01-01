@@ -80,7 +80,41 @@ fn criterion_benchmark(c: &mut Criterion) {
         )
     });
 
+    benchmark_3mb_sign_recover(c);
     benchmark_tx_signature_verification(c);
+}
+
+fn benchmark_3mb_sign_recover(c: &mut Criterion) {
+    const SIZE_3MB: usize = 3 * 1024 * 1024;
+
+    let key = get_key::<SignatureType>(42);
+
+    c.bench_function("secp_sign_3mb", |b| {
+        b.iter_batched(
+            || {
+                let mut rng = thread_rng();
+                let mut data = vec![0u8; SIZE_3MB];
+                rng.fill_bytes(&mut data);
+                data
+            },
+            |data| key.sign::<SigningDomainType>(&data),
+            criterion::BatchSize::LargeInput,
+        )
+    });
+
+    c.bench_function("secp_recover_3mb", |b| {
+        b.iter_batched(
+            || {
+                let mut rng = thread_rng();
+                let mut data = vec![0u8; SIZE_3MB];
+                rng.fill_bytes(&mut data);
+                let sig = key.sign::<SigningDomainType>(&data);
+                (data, sig)
+            },
+            |(data, sig)| sig.recover_pubkey::<SigningDomainType>(&data),
+            criterion::BatchSize::LargeInput,
+        )
+    });
 }
 
 fn create_legacy_tx() -> TxLegacy {
