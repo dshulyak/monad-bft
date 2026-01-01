@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use monad_wireauth::{messages::Packet, Config, TestContext, API};
-use secp256k1::rand::rng;
+use secp256k1::rand::{rng, RngCore};
 use zerocopy::IntoBytes;
 
 #[global_allocator]
@@ -192,6 +192,31 @@ fn bench_session_encrypt(c: &mut Criterion) {
     });
 }
 
+fn bench_session_encrypt_3mb(c: &mut Criterion) {
+    let (mut mgr1, peer1_public, _) = create_test_manager();
+    let (mut mgr2, peer2_public, _) = create_test_manager();
+
+    establish_session(&mut mgr1, &mut mgr2, &peer1_public, &peer2_public);
+
+    const SIZE_3MB: usize = 3 * 1024 * 1024;
+
+    c.bench_function("session_encrypt_3mb", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut rng = rng();
+                let mut plaintext = vec![0u8; SIZE_3MB];
+                rng.fill_bytes(&mut plaintext);
+                plaintext
+            },
+            |plaintext| {
+                mgr1.encrypt_by_public_key(&peer2_public, plaintext)
+                    .expect("encryption failed")
+            },
+            BatchSize::LargeInput,
+        )
+    });
+}
+
 fn bench_session_decrypt(c: &mut Criterion) {
     let (mut mgr1, peer1_public, _) = create_test_manager();
     let (mut mgr2, peer2_public, _) = create_test_manager();
@@ -225,12 +250,51 @@ fn bench_session_decrypt(c: &mut Criterion) {
     });
 }
 
+fn bench_session_decrypt_3mb(c: &mut Criterion) {
+    let (mut mgr1, peer1_public, _) = create_test_manager();
+    let (mut mgr2, peer2_public, _) = create_test_manager();
+
+    establish_session(&mut mgr1, &mut mgr2, &peer1_public, &peer2_public);
+
+    let peer1_addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+
+    const SIZE_3MB: usize = 3 * 1024 * 1024;
+
+    c.bench_function("session_decrypt_3mb", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut rng = rng();
+                let mut plaintext = vec![0u8; SIZE_3MB];
+                rng.fill_bytes(&mut plaintext);
+                let header = mgr1
+                    .encrypt_by_public_key(&peer2_public, &mut plaintext)
+                    .expect("encryption failed");
+
+                let mut packet_data = Vec::with_capacity(header.as_bytes().len() + plaintext.len());
+                packet_data.extend_from_slice(header.as_bytes());
+                packet_data.extend_from_slice(&plaintext);
+
+                packet_data
+            },
+            |packet_data| {
+                let parsed = Packet::try_from(&mut packet_data[..]).unwrap();
+                if let Packet::Data(data) = parsed {
+                    mgr2.decrypt(data, peer1_addr).expect("decryption failed");
+                }
+            },
+            BatchSize::LargeInput,
+        )
+    });
+}
+
 criterion_group!(
     benches,
     bench_session_send_init,
     bench_session_handle_init,
     bench_session_handle_response,
     bench_session_encrypt,
-    bench_session_decrypt
+    bench_session_encrypt_3mb,
+    bench_session_decrypt,
+    bench_session_decrypt_3mb
 );
 criterion_main!(benches);
