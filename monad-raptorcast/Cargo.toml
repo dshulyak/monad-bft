@@ -42,6 +42,8 @@ tokio = { workspace = true, features = ["macros"] }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
+monad-blocksync = { workspace = true }
+monad-consensus-types = { workspace = true }
 monad-testutil = { workspace = true }
 alloy-primitives = { workspace = true }
 
@@ -77,3 +79,6 @@ name = "service"
 
 [[example]]
 name = "latency"
+
+[[example]]
+name = "dos"

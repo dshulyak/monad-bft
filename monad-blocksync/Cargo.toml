@@ -27,6 +27,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 monad-multi-sig = { workspace = true }
+monad-secp = { workspace = true }
 monad-testutil = { workspace = true }
 
+criterion = { workspace = true }
 test-case = { workspace = true }
+
+[[bench]]
+name = "response_path"
+harness = false
