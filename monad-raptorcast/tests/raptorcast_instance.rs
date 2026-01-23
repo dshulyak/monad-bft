@@ -445,6 +445,9 @@ where
             RaptorCastEvent::SecondaryRaptorcastPeersUpdate { .. } => {
                 unimplemented!()
             }
+            RaptorCastEvent::LeanUdpTx { .. } => {
+                unimplemented!()
+            }
         }
     }
 }

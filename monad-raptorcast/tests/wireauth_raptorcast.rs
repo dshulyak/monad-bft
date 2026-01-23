@@ -112,6 +112,7 @@ where
             RaptorCastEvent::Message(event) => event,
             RaptorCastEvent::PeerManagerResponse(_) => unimplemented!(),
             RaptorCastEvent::SecondaryRaptorcastPeersUpdate { .. } => unimplemented!(),
+            RaptorCastEvent::LeanUdpTx { .. } => unimplemented!(),
         }
     }
 }

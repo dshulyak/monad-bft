@@ -22,9 +22,10 @@ use std::{
     pin::{pin, Pin},
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use alloy_consensus::TxEnvelope;
 use alloy_rlp::{Decodable, Encodable};
 use bytes::{Bytes, BytesMut};
 use futures::{channel::oneshot, FutureExt, Stream, StreamExt};
@@ -53,6 +54,7 @@ use monad_peer_discovery::{
     mock::{NopDiscovery, NopDiscoveryBuilder},
     NameRecord, PeerDiscoveryAlgo, PeerDiscoveryEvent,
 };
+use monad_peer_score::StdClock;
 use monad_types::{DropTimer, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget, UdpPriority};
 use monad_validator::signature_collection::SignatureCollection;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -115,6 +117,8 @@ where
     tcp_reader: TcpSocketReader,
     tcp_writer: TcpSocketWriter,
     dual_socket: auth::DualSocketHandle<AP>,
+    lean_udp_socket:
+        Option<auth::LeanUdpSocketHandle<AP, NodeId<CertificateSignaturePubKey<ST>>, StdClock>>,
     dataplane_control: DataplaneControl,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
@@ -123,6 +127,7 @@ where
     channel_from_secondary_outbound: Option<UnboundedReceiver<SecondaryOutboundMessage<ST>>>,
 
     waker: Option<Waker>,
+    start_instant: Instant,
     metrics: ExecutorMetrics,
     peer_discovery_metrics: ExecutorMetrics,
     _phantom: PhantomData<(OM, SE)>,
@@ -137,6 +142,10 @@ pub enum RaptorCastEvent<E, ST: CertificateSignatureRecoverable> {
     Message(E),
     PeerManagerResponse(PeerManagerResponse<ST>),
     SecondaryRaptorcastPeersUpdate(Round, Vec<NodeId<CertificateSignaturePubKey<ST>>>),
+    LeanUdpTx {
+        sender: CertificateSignaturePubKey<ST>,
+        tx: TxEnvelope,
+    },
 }
 
 impl<ST, M, OM, SE, PD, AP> RaptorCast<ST, M, OM, SE, PD, AP>
@@ -224,6 +233,7 @@ where
             tcp_reader,
             tcp_writer,
             dual_socket,
+            lean_udp_socket: None,
             dataplane_control: control,
             pending_events: Default::default(),
             channel_to_secondary: None,
@@ -231,6 +241,7 @@ where
             channel_from_secondary_outbound: None,
 
             waker: None,
+            start_instant: Instant::now(),
             metrics: Default::default(),
             peer_discovery_metrics: Default::default(),
             _phantom: PhantomData,
@@ -275,6 +286,28 @@ where
     ) -> bool {
         self.dual_socket
             .is_connected_socket_and_public_key(socket_addr, public_key)
+    }
+
+    pub fn set_lean_udp_socket(
+        &mut self,
+        socket: auth::LeanUdpSocketHandle<AP, NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+    ) {
+        self.lean_udp_socket = Some(socket);
+    }
+
+    pub fn lean_udp_socket_mut(
+        &mut self,
+    ) -> Option<&mut auth::LeanUdpSocketHandle<AP, NodeId<CertificateSignaturePubKey<ST>>, StdClock>>
+    {
+        self.lean_udp_socket.as_mut()
+    }
+
+    pub fn send_lean_udp_tx(&mut self, dst: SocketAddr, tx: &TxEnvelope, priority: UdpPriority) {
+        if let Some(lean_socket) = self.lean_udp_socket.as_mut() {
+            let mut buf = BytesMut::new();
+            tx.encode(&mut buf);
+            lean_socket.send(dst, buf.freeze(), priority);
+        }
     }
 
     fn enqueue_message_to_self(
@@ -1089,6 +1122,30 @@ where
             }
         }
 
+        if let Some(lean_socket) = this.lean_udp_socket.as_mut() {
+            loop {
+                let mut recv_fut = pin!(lean_socket.recv());
+                match recv_fut.poll_unpin(cx) {
+                    Poll::Ready(Ok(msg)) => {
+                        if let Ok(tx) = TxEnvelope::decode(&mut msg.payload.as_ref()) {
+                            this.pending_events.push_back(RaptorCastEvent::LeanUdpTx {
+                                sender: msg.public_key.clone(),
+                                tx,
+                            });
+                        }
+                        if let Some(event) = this.pending_events.pop_front() {
+                            return Poll::Ready(Some(event.into()));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        trace!(error=?e, "leanudp socket recv error");
+                        continue;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+        }
+
         loop {
             let Poll::Ready(msg) = pin!(this.tcp_reader.recv()).poll_unpin(cx) else {
                 break;
@@ -1305,6 +1362,7 @@ where
                     confirm_group_peers,
                 }
             }
+            RaptorCastEvent::LeanUdpTx { sender, tx } => MonadEvent::LeanUdpTx { sender, tx },
         }
     }
 }
