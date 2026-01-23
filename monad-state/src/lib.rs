@@ -1316,6 +1316,9 @@ where
                 }
                 cmds
             }
+            MonadEvent::LeanUdpTx { .. } => {
+                vec![]
+            }
         }
     }
 

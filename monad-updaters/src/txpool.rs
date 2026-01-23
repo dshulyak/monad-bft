@@ -340,7 +340,7 @@ where
                             None => (monad_tfm::base_fee::PRE_TFM_BASE_FEE, None, None, None),
                         };
 
-                    let proposed_execution_inputs = pool
+                    let (proposed_execution_inputs, _forwarded_senders) = pool
                         .create_proposal(
                             &mut event_tracker,
                             epoch,
@@ -423,7 +423,7 @@ where
                         last_delay_committed_blocks,
                     );
                 }
-                TxPoolCommand::InsertForwardedTxs { sender: _, txs } => {
+                TxPoolCommand::InsertForwardedTxs { sender, txs } => {
                     pool.insert_txs(
                         &mut event_tracker,
                         block_policy,
@@ -435,7 +435,9 @@ where
                                 let signer = tx.recover_signer().ok()?;
                                 Some((
                                     Recovered::new_unchecked(tx, signer),
-                                    PoolTransactionKind::Forwarded,
+                                    PoolTransactionKind::Forwarded {
+                                        sender: sender.clone(),
+                                    },
                                 ))
                             })
                             .collect(),

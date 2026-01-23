@@ -35,7 +35,10 @@ use monad_consensus_types::{
     payload::{ConsensusBlockBody, ConsensusBlockBodyId, ConsensusBlockBodyInner, RoundSignature},
     quorum_certificate::QuorumCertificate,
 };
-use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSignature};
+use monad_crypto::{
+    certificate_signature::{CertificateKeyPair, PubKey},
+    NopKeyPair, NopSignature,
+};
 use monad_eth_block_policy::{EthBlockPolicy, EthValidatedBlock};
 use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_testutil::{recover_tx, secret_to_eth_address, S1, S2};
@@ -462,7 +465,19 @@ fn check_txpool_coherency(
             chain_config,
             block_txs
                 .into_iter()
-                .map(|tx| (tx, PoolTransactionKind::Forwarded))
+                .map(|tx| {
+                    (
+                        tx,
+                        PoolTransactionKind::Forwarded {
+                            sender: NodeId::new(
+                                <NopKeyPair as CertificateKeyPair>::PubKeyType::from_bytes(
+                                    &[0u8; 32],
+                                )
+                                .unwrap(),
+                            ),
+                        },
+                    )
+                })
                 .collect(),
             |_tx| {},
         );
@@ -501,11 +516,12 @@ fn check_txpool_coherency(
 
     info!(
         "Txpool created proposal with {} txs for seq_num {:?}",
-        proposal.body.transactions.len(),
+        proposal.0.body.transactions.len(),
         block_under_test.header().seq_num
     );
 
     let txs = proposal
+        .0
         .body
         .transactions
         .iter()

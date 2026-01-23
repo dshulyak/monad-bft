@@ -137,8 +137,11 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-        txs: Vec<(Recovered<TxEnvelope>, PoolTransactionKind)>,
-        mut on_insert: impl FnMut(&ValidEthTransaction),
+        txs: Vec<(
+            Recovered<TxEnvelope>,
+            PoolTransactionKind<NodeId<CertificateSignaturePubKey<ST>>>,
+        )>,
+        mut on_insert: impl FnMut(&ValidEthTransaction<NodeId<CertificateSignaturePubKey<ST>>>),
     ) {
         if !self.do_local_insert {
             event_tracker.drop_all(
@@ -290,7 +293,13 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-    ) -> Result<ProposedExecutionInputs<EthExecutionProtocol>, BlockPolicyError> {
+    ) -> Result<
+        (
+            ProposedExecutionInputs<EthExecutionProtocol>,
+            Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+        ),
+        BlockPolicyError,
+    > {
         info!(
             ?proposed_seq_num,
             ?tx_limit,
@@ -347,7 +356,7 @@ where
             .map(|tx| tx.length() as u64)
             .sum();
 
-        let user_transactions = self.sequence_user_transactions(
+        let (user_transactions, forwarded_senders) = self.sequence_user_transactions(
             event_tracker,
             proposed_seq_num,
             base_fee,
@@ -412,7 +421,7 @@ where
 
         self.update_aggregate_metrics(event_tracker);
 
-        Ok(ProposedExecutionInputs { header, body })
+        Ok((ProposedExecutionInputs { header, body }, forwarded_senders))
     }
 
     pub fn enter_round(
@@ -622,14 +631,20 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-    ) -> Result<Vec<Recovered<TxEnvelope>>, BlockPolicyError> {
+    ) -> Result<
+        (
+            Vec<Recovered<TxEnvelope>>,
+            Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+        ),
+        BlockPolicyError,
+    > {
         let _timer = DropTimer::start(Duration::ZERO, |elapsed| {
             debug!(?elapsed, "txpool create_proposal");
         });
 
         let Some(last_commit) = self.last_commit.as_ref() else {
             error!("txpool create_proposal called before last committed block set");
-            return Ok(Vec::default());
+            return Ok((Vec::default(), Vec::default()));
         };
 
         let last_commit_seq_num = last_commit.seq_num;
@@ -645,12 +660,12 @@ where
                 txpool_last_commit = last_commit_seq_num.0,
                 "txpool last commit update does not match block policy last commit"
             );
-            return Ok(Vec::default());
+            return Ok((Vec::default(), Vec::default()));
         }
 
         if tx_limit == 0 {
             warn!("txpool create_proposal called with zero tx_limit");
-            return Ok(Vec::default());
+            return Ok((Vec::default(), Vec::default()));
         }
 
         let sequencer =
@@ -658,7 +673,7 @@ where
         let sequencer_len = sequencer.len();
 
         if sequencer.is_empty() {
-            return Ok(Vec::default());
+            return Ok((Vec::default(), Vec::default()));
         }
 
         let (account_balances, state_backend_lookups) = {
@@ -722,10 +737,11 @@ where
             ?proposed_seq_num,
             ?proposal_num_txs,
             proposal_total_gas = proposal.total_gas,
+            forwarded_senders = proposal.forwarded_senders.len(),
             "created proposal"
         );
 
-        Ok(proposal.txs)
+        Ok((proposal.txs, proposal.forwarded_senders))
     }
 }
 

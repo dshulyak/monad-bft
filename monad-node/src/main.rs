@@ -49,6 +49,7 @@ use monad_peer_discovery::{
     discovery::{PeerDiscovery, PeerDiscoveryBuilder},
     MonadNameRecord, NameRecord,
 };
+use monad_peer_score::{create_scorer, ScoreConfig, StdClock};
 use monad_pprof::start_pprof_server;
 use monad_raptorcast::{
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
@@ -226,6 +227,11 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         }
     });
 
+    let (score_provider, score_reader) = create_scorer::<
+        NodeId<CertificateSignaturePubKey<SignatureType>>,
+        StdClock,
+    >(ScoreConfig::default(), StdClock);
+
     let mut executor = ParentExecutor {
         metrics: Default::default(),
         router,
@@ -265,6 +271,8 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             // TODO(andr-dev): Use timestamp from last commit in ledger
             0,
             true,
+            score_provider,
+            score_reader,
         )
         .expect("txpool ipc succeeds"),
         control_panel: ControlPanelIpcReceiver::new(

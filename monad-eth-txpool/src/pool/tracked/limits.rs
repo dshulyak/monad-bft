@@ -110,12 +110,12 @@ impl TrackedTxLimits {
             || self.eip2718_bytes > self.config.max_eip2718_bytes
     }
 
-    pub fn add_tx(&mut self, tx: &ValidEthTransaction) {
+    pub fn add_tx<N>(&mut self, tx: &ValidEthTransaction<N>) {
         self.txs += 1;
         self.eip2718_bytes += tx.raw().eip2718_encoded_length() as u64;
     }
 
-    pub fn remove_tx(&mut self, tx: &ValidEthTransaction) {
+    pub fn remove_tx<N>(&mut self, tx: &ValidEthTransaction<N>) {
         self.txs = self.txs.checked_sub(1).unwrap_or_else(|| {
             error!("txpool txs limit underflowed, detected during remove_tx");
             0
@@ -130,7 +130,7 @@ impl TrackedTxLimits {
             });
     }
 
-    pub fn remove_txs<'a>(&mut self, txs: impl Iterator<Item = &'a ValidEthTransaction>) {
+    pub fn remove_txs<'a, N: 'a>(&mut self, txs: impl Iterator<Item = &'a ValidEthTransaction<N>>) {
         for tx in txs {
             self.remove_tx(tx)
         }

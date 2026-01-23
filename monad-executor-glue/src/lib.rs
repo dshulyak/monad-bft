@@ -273,27 +273,55 @@ pub struct PeerEntry<ST: CertificateSignatureRecoverable> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_port: Option<u16>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lean_udp_p2p_port: Option<u16>,
 }
 
 impl<ST: CertificateSignatureRecoverable> Encodable for PeerEntry<ST> {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        if let Some(auth_port) = self.auth_port {
-            let enc: [&dyn Encodable; 5] = [
-                &self.pubkey,
-                &self.addr.to_string(),
-                &self.signature,
-                &self.record_seq_num,
-                &auth_port,
-            ];
-            encode_list::<_, dyn Encodable>(&enc, out);
-        } else {
-            let enc: [&dyn Encodable; 4] = [
-                &self.pubkey,
-                &self.addr.to_string(),
-                &self.signature,
-                &self.record_seq_num,
-            ];
-            encode_list::<_, dyn Encodable>(&enc, out);
+        match (self.auth_port, self.lean_udp_p2p_port) {
+            (Some(auth_port), Some(lean_udp_p2p_port)) => {
+                let enc: [&dyn Encodable; 6] = [
+                    &self.pubkey,
+                    &self.addr.to_string(),
+                    &self.signature,
+                    &self.record_seq_num,
+                    &auth_port,
+                    &lean_udp_p2p_port,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            (Some(auth_port), None) => {
+                let enc: [&dyn Encodable; 5] = [
+                    &self.pubkey,
+                    &self.addr.to_string(),
+                    &self.signature,
+                    &self.record_seq_num,
+                    &auth_port,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            (None, Some(lean_udp_p2p_port)) => {
+                let enc: [&dyn Encodable; 6] = [
+                    &self.pubkey,
+                    &self.addr.to_string(),
+                    &self.signature,
+                    &self.record_seq_num,
+                    &0u16,
+                    &lean_udp_p2p_port,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
+            (None, None) => {
+                let enc: [&dyn Encodable; 4] = [
+                    &self.pubkey,
+                    &self.addr.to_string(),
+                    &self.signature,
+                    &self.record_seq_num,
+                ];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
         }
     }
 }
@@ -311,6 +339,17 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
         let record_seq_num = u64::decode(&mut payload)?;
 
         let auth_port = if !payload.is_empty() {
+            let port = u16::decode(&mut payload)?;
+            if port == 0 {
+                None
+            } else {
+                Some(port)
+            }
+        } else {
+            None
+        };
+
+        let lean_udp_p2p_port = if !payload.is_empty() {
             Some(u16::decode(&mut payload)?)
         } else {
             None
@@ -322,6 +361,7 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
             signature,
             record_seq_num,
             auth_port,
+            lean_udp_p2p_port,
         })
     }
 }
@@ -2045,6 +2085,13 @@ where
         expiry_round: Round,
         confirm_group_peers: Vec<NodeId<SCT::NodeIdPubKey>>,
     },
+    /// LeanUDP transaction received from a peer
+    LeanUdpTx {
+        #[serde(skip)]
+        sender: CertificateSignaturePubKey<ST>,
+        #[serde(skip)]
+        tx: alloy_consensus::TxEnvelope,
+    },
 }
 
 impl<ST, SCT, EPT> MonadEvent<ST, SCT, EPT>
@@ -2104,6 +2151,10 @@ where
                 expiry_round: *expiry_round,
                 confirm_group_peers: confirm_group_peers.clone(),
             },
+            MonadEvent::LeanUdpTx { sender, tx } => MonadEvent::LeanUdpTx {
+                sender: *sender,
+                tx: tx.clone(),
+            },
         }
     }
 }
@@ -2155,6 +2206,10 @@ where
                 let enc: [&dyn Encodable; 3] = [&9u8, &expiry_round, &confirm_group_peers];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
+            Self::LeanUdpTx { sender, tx } => {
+                let enc: [&dyn Encodable; 3] = [&10u8, &sender, &tx];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
         }
     }
 }
@@ -2197,6 +2252,11 @@ where
                     expiry_round,
                     confirm_group_peers,
                 })
+            }
+            10 => {
+                let sender = CertificateSignaturePubKey::<ST>::decode(&mut payload)?;
+                let tx = alloy_consensus::TxEnvelope::decode(&mut payload)?;
+                Ok(Self::LeanUdpTx { sender, tx })
             }
             _ => Err(alloy_rlp::Error::Custom(
                 "failed to decode unknown MonadEvent",
@@ -2270,6 +2330,9 @@ where
             MonadEvent::ConfigEvent(_) => "CONFIGEVENT".to_string(),
             MonadEvent::SecondaryRaptorcastPeersUpdate { .. } => {
                 "SecondaryRaptorcastPeersUpdate".to_string()
+            }
+            MonadEvent::LeanUdpTx { sender, .. } => {
+                format!("LeanUdpTx -- from {sender}")
             }
         };
 
@@ -2526,6 +2589,7 @@ mod tests {
             signature,
             record_seq_num,
             auth_port: None,
+            lean_udp_p2p_port: None,
         };
         let encoded = alloy_rlp::encode(&entry);
         let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();

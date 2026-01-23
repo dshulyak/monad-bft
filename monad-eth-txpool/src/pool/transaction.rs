@@ -41,12 +41,12 @@ pub const fn max_eip2718_encoded_length(execution_params: &ExecutionChainParams)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PoolTransactionKind {
+pub enum PoolTransactionKind<N> {
     Owned { priority: U256, extra_data: Vec<u8> },
-    Forwarded,
+    Forwarded { sender: N },
 }
 
-impl PoolTransactionKind {
+impl<N> PoolTransactionKind<N> {
     pub fn owned_default() -> Self {
         Self::Owned {
             priority: DEFAULT_TX_PRIORITY,
@@ -56,9 +56,9 @@ impl PoolTransactionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValidEthTransaction {
+pub struct ValidEthTransaction<N> {
     tx: Recovered<TxEnvelope>,
-    kind: PoolTransactionKind,
+    kind: PoolTransactionKind<N>,
     forward_last_seqnum: SeqNum,
     forward_retries: usize,
     max_value: Balance,
@@ -72,14 +72,14 @@ pub struct ValidEthRecoveredAuthorization {
     pub authorization: Authorization,
 }
 
-impl ValidEthTransaction {
+impl<N> ValidEthTransaction<N> {
     pub fn validate<ST, SCT>(
         last_commit: &ConsensusBlockHeader<ST, SCT, EthExecutionProtocol>,
         chain_id: u64,
         chain_params: &ChainParams,
         execution_params: &ExecutionChainParams,
         tx: Recovered<TxEnvelope>,
-        kind: PoolTransactionKind,
+        kind: PoolTransactionKind<N>,
     ) -> Result<Self, (Recovered<TxEnvelope>, EthTxPoolDropReason)>
     where
         ST: CertificateSignatureRecoverable,
@@ -250,14 +250,14 @@ impl ValidEthTransaction {
     pub fn tx_kind_priority(&self) -> U256 {
         match self.kind {
             PoolTransactionKind::Owned { priority, .. } => priority,
-            PoolTransactionKind::Forwarded => DEFAULT_TX_PRIORITY,
+            PoolTransactionKind::Forwarded { .. } => DEFAULT_TX_PRIORITY,
         }
     }
 
     pub fn is_owned(&self) -> bool {
         match self.kind {
             PoolTransactionKind::Owned { .. } => true,
-            PoolTransactionKind::Forwarded => false,
+            PoolTransactionKind::Forwarded { .. } => false,
         }
     }
 
@@ -267,7 +267,14 @@ impl ValidEthTransaction {
                 priority,
                 extra_data: _,
             } => priority <= &DEFAULT_TX_PRIORITY,
-            PoolTransactionKind::Forwarded => false,
+            PoolTransactionKind::Forwarded { .. } => false,
+        }
+    }
+
+    pub fn forwarded_sender(&self) -> Option<&N> {
+        match &self.kind {
+            PoolTransactionKind::Forwarded { sender } => Some(sender),
+            PoolTransactionKind::Owned { .. } => None,
         }
     }
 

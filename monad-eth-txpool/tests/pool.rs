@@ -35,7 +35,7 @@ use monad_consensus_types::{
 };
 use monad_crypto::{
     certificate_signature::{CertificateKeyPair, PubKey},
-    NopKeyPair, NopPubKey, NopSignature,
+    NopKeyPair, NopSignature,
 };
 use monad_eth_block_policy::{validation::TFM_MAX_GAS_LIMIT, EthBlockPolicy};
 use monad_eth_block_validator::EthBlockValidator;
@@ -208,7 +208,14 @@ fn run_custom_iter<const N: usize>(
                             if owned {
                                 PoolTransactionKind::owned_default()
                             } else {
-                                PoolTransactionKind::Forwarded
+                                PoolTransactionKind::Forwarded {
+                                    sender: NodeId::new(
+                                        <NopKeyPair as CertificateKeyPair>::PubKeyType::from_bytes(
+                                            &[0u8; 32],
+                                        )
+                                        .unwrap(),
+                                    ),
+                                }
                             },
                         )],
                         |inserted_tx| {
@@ -265,7 +272,14 @@ fn run_custom_iter<const N: usize>(
                                 if owned {
                                     PoolTransactionKind::owned_default()
                                 } else {
-                                    PoolTransactionKind::Forwarded
+                                    PoolTransactionKind::Forwarded {
+                                        sender: NodeId::new(
+                                            <NopKeyPair as CertificateKeyPair>::PubKeyType::from_bytes(
+                                                &[0u8; 32],
+                                            )
+                                            .unwrap(),
+                                        ),
+                                    }
                                 },
                             )
                         })
@@ -310,7 +324,10 @@ fn run_custom_iter<const N: usize>(
                         byte_limit,
                         [0_u8; 20],
                         GENESIS_TIMESTAMP + current_seq_num as u128,
-                        NodeId::new(NopPubKey::from_bytes(&[0_u8; 32]).unwrap()),
+                        NodeId::new(
+                            <NopKeyPair as CertificateKeyPair>::PubKeyType::from_bytes(&[0_u8; 32])
+                                .unwrap(),
+                        ),
                         RoundSignature::new(Round(0), &mock_keypair),
                         pending_blocks.iter().cloned().collect_vec(),
                         &eth_block_policy,
@@ -319,7 +336,7 @@ fn run_custom_iter<const N: usize>(
                     )
                     .expect("create proposal succeeds");
 
-                let decoded_txns = encoded_txns.body.transactions;
+                let decoded_txns = encoded_txns.0.body.transactions;
 
                 let expected_txs = expected_txs.into_iter().cloned().collect_vec();
 

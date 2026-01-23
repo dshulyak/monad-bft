@@ -5497,6 +5497,8 @@ dependencies = [
  "monad-eth-types",
  "monad-executor",
  "monad-executor-glue",
+ "monad-fair-queue",
+ "monad-peer-score",
  "monad-secp",
  "monad-state-backend",
  "monad-testutil",
@@ -5620,6 +5622,7 @@ dependencies = [
 name = "monad-executor-glue"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-rlp",
  "bincode",
  "bytes",
@@ -5801,6 +5804,7 @@ dependencies = [
  "monad-ledger",
  "monad-node-config",
  "monad-peer-discovery",
+ "monad-peer-score",
  "monad-pprof",
  "monad-raptorcast",
  "monad-router-multi",
@@ -5952,6 +5956,7 @@ dependencies = [
 name = "monad-raptorcast"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
  "bitvec",
@@ -5974,11 +5979,14 @@ dependencies = [
  "monad-compress",
  "monad-crypto",
  "monad-dataplane",
+ "monad-eth-testutil",
  "monad-executor",
  "monad-executor-glue",
+ "monad-leanudp",
  "monad-merkle",
  "monad-node-config",
  "monad-peer-discovery",
+ "monad-peer-score",
  "monad-raptor",
  "monad-secp",
  "monad-testutil",
