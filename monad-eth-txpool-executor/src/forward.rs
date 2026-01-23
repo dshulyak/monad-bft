@@ -15,6 +15,8 @@
 
 use std::{
     collections::VecDeque,
+    fmt::{self, Debug, Display},
+    hash::Hash,
     pin::Pin,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -22,6 +24,17 @@ use std::{
 
 use alloy_consensus::TxEnvelope;
 use bytes::Bytes;
+use monad_fair_queue::{FairQueue, FairQueueBuilder, Identity};
+use monad_peer_score::{Clock, ScoreReader};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NoUnauthenticated;
+
+impl Display for NoUnauthenticated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NoUnauthenticated")
+    }
+}
 use monad_chain_config::{
     execution_revision::ExecutionChainParams, revision::ChainRevision, ChainConfig,
 };
@@ -33,22 +46,21 @@ use monad_eth_types::ExtractEthAddress;
 use monad_state_backend::StateBackend;
 use monad_validator::signature_collection::SignatureCollection;
 use pin_project::pin_project;
-use tracing::{debug, error};
+use tracing::error;
 
 const EGRESS_MIN_COMMITTED_SEQ_NUM_DIFF: u64 = 5;
 const EGRESS_MAX_RETRIES: usize = 3;
 
 const INGRESS_CHUNK_MAX_SIZE: usize = 128;
 const INGRESS_CHUNK_INTERVAL_MS: u64 = 8;
-const INGRESS_MAX_SIZE: usize = 8 * 1024;
 
 pub fn egress_max_size_bytes(execution_params: &ExecutionChainParams) -> usize {
     max_eip2718_encoded_length(execution_params)
 }
 
 #[pin_project(project = EthTxPoolForwardingManagerProjected)]
-pub struct EthTxPoolForwardingManager {
-    ingress: VecDeque<TxEnvelope>,
+pub struct EthTxPoolForwardingManager<N: Hash + Eq + Send + Sync, C: Clock + Send + Sync> {
+    ingress: FairQueue<ScoreReader<N, C>, NoUnauthenticated, (TxEnvelope, N)>,
     #[pin]
     ingress_timer: tokio::time::Interval,
     ingress_waker: Option<Waker>,
@@ -57,15 +69,26 @@ pub struct EthTxPoolForwardingManager {
     egress_waker: Option<Waker>,
 }
 
-impl Default for EthTxPoolForwardingManager {
-    fn default() -> Self {
+impl<N, C: Clock> EthTxPoolForwardingManager<N, C>
+where
+    N: Hash + Eq + Clone + Send + Sync + std::fmt::Debug + std::fmt::Display,
+    C: Send + Sync,
+{
+    pub fn new(score_reader: ScoreReader<N, C>) -> Self {
         let mut ingress_timer =
             tokio::time::interval(Duration::from_millis(INGRESS_CHUNK_INTERVAL_MS));
 
         ingress_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        let ingress = FairQueueBuilder::new()
+            .per_id_limit(10_000)
+            .max_size(100_000)
+            .regular_max_size(100_000)
+            .regular_bandwidth_pct(10)
+            .build(score_reader);
+
         Self {
-            ingress: VecDeque::default(),
+            ingress,
             ingress_timer,
             ingress_waker: None,
 
@@ -75,8 +98,10 @@ impl Default for EthTxPoolForwardingManager {
     }
 }
 
-impl EthTxPoolForwardingManager {
-    pub fn poll_ingress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Vec<TxEnvelope>> {
+impl<N: Hash + Eq + Clone + Send + Sync + Debug + Display, C: Clock + Send + Sync>
+    EthTxPoolForwardingManager<N, C>
+{
+    pub fn poll_ingress(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Vec<(TxEnvelope, N)>> {
         let EthTxPoolForwardingManagerProjected {
             ingress,
             mut ingress_timer,
@@ -96,11 +121,14 @@ impl EthTxPoolForwardingManager {
             return Poll::Pending;
         };
 
-        Poll::Ready(
-            ingress
-                .drain(..INGRESS_CHUNK_MAX_SIZE.min(ingress.len()))
-                .collect(),
-        )
+        let mut chunk = Vec::with_capacity(INGRESS_CHUNK_MAX_SIZE);
+        while chunk.len() < INGRESS_CHUNK_MAX_SIZE {
+            match ingress.pop() {
+                Some((_, item)) => chunk.push(item),
+                None => break,
+            }
+        }
+        Poll::Ready(chunk)
     }
 
     pub fn poll_egress(
@@ -165,30 +193,27 @@ impl EthTxPoolForwardingManager {
     }
 }
 
-impl EthTxPoolForwardingManagerProjected<'_> {
-    pub fn add_ingress_txs(&mut self, txs: Vec<TxEnvelope>) {
+impl<'a, N: Clone + Hash + Eq + Send + Sync + Debug + Display, C: Clock + Send + Sync>
+    EthTxPoolForwardingManagerProjected<'a, N, C>
+{
+    pub fn add_ingress_txs(&mut self, sender: N, txs: Vec<TxEnvelope>) {
         let Self {
             ingress,
             ingress_waker,
             ..
         } = self;
 
-        let capacity_remaining = INGRESS_MAX_SIZE.saturating_sub(ingress.len());
-
-        let dropped = txs.len().saturating_sub(capacity_remaining);
-
-        if dropped > 0 {
-            debug!(
-                capacity =? INGRESS_MAX_SIZE,
-                ?capacity_remaining,
-                ?dropped,
-                "ingress queue full, discarding forwarded txs"
-            )
+        let mut added = 0usize;
+        for tx in txs {
+            let id = Identity::Authenticated(sender.clone());
+            if let Err(e) = ingress.push(id, (tx, sender.clone())) {
+                tracing::debug!(%sender, error = %e, "ingress queue full, dropping remaining txs");
+                break;
+            }
+            added += 1;
         }
 
-        ingress.extend(txs.into_iter().take(capacity_remaining));
-
-        if ingress.is_empty() {
+        if added == 0 {
             return;
         }
 
@@ -197,7 +222,7 @@ impl EthTxPoolForwardingManagerProjected<'_> {
         }
     }
 
-    pub fn add_egress_txs<'a>(&mut self, txs: impl Iterator<Item = &'a TxEnvelope>) {
+    pub fn add_egress_txs<'b>(&mut self, txs: impl Iterator<Item = &'b TxEnvelope>) {
         let Self {
             egress,
             egress_waker,
@@ -250,6 +275,7 @@ mod test {
     use itertools::Itertools;
     use monad_chain_config::execution_revision::MonadExecutionRevision;
     use monad_eth_testutil::{make_eip1559_tx, make_eip7702_tx, make_legacy_tx, S1};
+    use monad_peer_score::{create_scorer, ScoreConfig, StdClock};
 
     use crate::forward::{
         egress_max_size_bytes, EthTxPoolForwardingManager, INGRESS_CHUNK_INTERVAL_MS,
@@ -260,9 +286,22 @@ mod test {
 
     const BASE_FEE_PER_GAS: u128 = 100_000_000_000; // 100 Gwei
 
-    fn setup<'a>() -> (EthTxPoolForwardingManager, Context<'a>) {
+    type TestNodeId = u64;
+
+    fn setup<'a>() -> (
+        EthTxPoolForwardingManager<TestNodeId, StdClock>,
+        monad_peer_score::ScoreProvider<TestNodeId, StdClock>,
+        Context<'a>,
+    ) {
+        let config = ScoreConfig {
+            min_time_for_score: Duration::ZERO,
+            ..ScoreConfig::default()
+        };
+        let (score_provider, score_reader) =
+            create_scorer::<TestNodeId, StdClock>(config, StdClock);
         (
-            EthTxPoolForwardingManager::default(),
+            EthTxPoolForwardingManager::new(score_reader),
+            score_provider,
             Context::from_waker(noop_waker_ref()),
         )
     }
@@ -272,7 +311,7 @@ mod test {
     }
 
     async fn assert_pending_now_and_forever(
-        mut forwarding_manager: Pin<&mut EthTxPoolForwardingManager>,
+        mut forwarding_manager: Pin<&mut EthTxPoolForwardingManager<TestNodeId, StdClock>>,
         mut cx: Context<'_>,
     ) {
         assert_eq!(
@@ -302,7 +341,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn test_poll_none() {
-        let (forwarding_manager, cx) = setup();
+        let (forwarding_manager, _score_provider, cx) = setup();
         let forwarding_manager = pin!(forwarding_manager);
 
         assert_pending_now_and_forever(forwarding_manager, cx).await;
@@ -311,7 +350,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn test_ingress_simple() {
         for poll_ingress_before_insert in [false, true] {
-            let (forwarding_manager, mut cx) = setup();
+            let (forwarding_manager, _score_provider, mut cx) = setup();
             let mut forwarding_manager = pin!(forwarding_manager);
 
             if poll_ingress_before_insert {
@@ -326,11 +365,12 @@ mod test {
             forwarding_manager
                 .as_mut()
                 .project()
-                .add_ingress_txs(txs.clone());
+                .add_ingress_txs(0, txs.clone());
 
+            let expected: Vec<_> = txs.into_iter().map(|tx| (tx, 0)).collect();
             assert_eq!(
                 forwarding_manager.as_mut().poll_ingress(&mut cx),
-                Poll::Ready(txs.clone())
+                Poll::Ready(expected)
             );
 
             assert_pending_now_and_forever(forwarding_manager, cx).await;
@@ -339,7 +379,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn test_ingress_subsequent() {
-        let (forwarding_manager, mut cx) = setup();
+        let (forwarding_manager, _score_provider, mut cx) = setup();
         let mut forwarding_manager = pin!(forwarding_manager);
 
         assert_eq!(
@@ -348,15 +388,16 @@ mod test {
         );
 
         let txs = vec![generate_tx(0)];
+        let expected: Vec<_> = txs.iter().cloned().map(|tx| (tx, 0)).collect();
 
         forwarding_manager
             .as_mut()
             .project()
-            .add_ingress_txs(txs.clone());
+            .add_ingress_txs(0, txs.clone());
 
         assert_eq!(
             forwarding_manager.as_mut().poll_ingress(&mut cx),
-            Poll::Ready(txs.clone())
+            Poll::Ready(expected.clone())
         );
         assert_eq!(
             forwarding_manager.as_mut().poll_ingress(&mut cx),
@@ -366,7 +407,7 @@ mod test {
         forwarding_manager
             .as_mut()
             .project()
-            .add_ingress_txs(txs.clone());
+            .add_ingress_txs(0, txs.clone());
 
         // Since time is frozen and we just polled, the forwarding manager should wait its interval
         // even though it should be "empty"
@@ -389,7 +430,7 @@ mod test {
         tokio::time::advance(Duration::from_nanos(1)).await;
         assert_eq!(
             forwarding_manager.as_mut().poll_ingress(&mut cx),
-            Poll::Ready(txs.clone())
+            Poll::Ready(expected)
         );
 
         assert_pending_now_and_forever(forwarding_manager, cx).await;
@@ -397,7 +438,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn test_ingress_chunks() {
-        let (forwarding_manager, mut cx) = setup();
+        let (forwarding_manager, score_provider, mut cx) = setup();
         let mut forwarding_manager = pin!(forwarding_manager);
 
         assert_eq!(
@@ -410,10 +451,13 @@ mod test {
         // We insert the last tx below to test adding to an existing chunk
         const NUM_TXS: usize = INGRESS_CHUNK_MAX_SIZE * NUM_CHUNKS - 1;
 
+        // Register sender 0 as having contributed, so they get primary tier (10K limit)
+        score_provider.record_contribution(0);
+
         forwarding_manager
             .as_mut()
             .project()
-            .add_ingress_txs((0..NUM_TXS as u64).map(generate_tx).collect_vec());
+            .add_ingress_txs(0, (0..NUM_TXS as u64).map(generate_tx).collect_vec());
 
         for chunk_num in 0..NUM_CHUNKS {
             tokio::time::advance(Duration::from_millis(INGRESS_CHUNK_INTERVAL_MS)).await;
@@ -422,24 +466,28 @@ mod test {
                 forwarding_manager
                     .as_mut()
                     .project()
-                    .add_ingress_txs(vec![generate_tx(0)]);
+                    .add_ingress_txs(0, vec![generate_tx(0)]);
             }
 
-            let Poll::Ready(txs) = forwarding_manager.as_mut().poll_ingress(&mut cx) else {
+            let Poll::Ready(txs_with_senders) = forwarding_manager.as_mut().poll_ingress(&mut cx)
+            else {
                 panic!("forwarding manager should be ready after each iteration");
             };
 
-            assert_eq!(txs.len(), INGRESS_CHUNK_MAX_SIZE);
+            assert_eq!(txs_with_senders.len(), INGRESS_CHUNK_MAX_SIZE);
 
             // Check that txs are produced in the same order they are inserted
-            txs.into_iter().enumerate().for_each(|(idx, tx)| {
-                // By using % NUM_TXS, we can check that the last tx is the 0 nonce added above when
-                // we're at the last chunk
-                assert_eq!(
-                    tx.nonce(),
-                    ((idx + chunk_num * INGRESS_CHUNK_MAX_SIZE) as u64) % (NUM_TXS as u64)
-                );
-            });
+            txs_with_senders
+                .into_iter()
+                .enumerate()
+                .for_each(|(idx, (tx, _sender))| {
+                    // By using % NUM_TXS, we can check that the last tx is the 0 nonce added above when
+                    // we're at the last chunk
+                    assert_eq!(
+                        tx.nonce(),
+                        ((idx + chunk_num * INGRESS_CHUNK_MAX_SIZE) as u64) % (NUM_TXS as u64)
+                    );
+                });
 
             assert_eq!(
                 forwarding_manager.as_mut().poll_ingress(&mut cx),
@@ -452,7 +500,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn test_ingress_complete() {
-        let (forwarding_manager, mut cx) = setup();
+        let (forwarding_manager, _score_provider, mut cx) = setup();
         let mut forwarding_manager = pin!(forwarding_manager);
 
         assert_eq!(
@@ -461,15 +509,17 @@ mod test {
         );
 
         forwarding_manager.as_mut().project().add_ingress_txs(
+            0,
             (0..2 * INGRESS_CHUNK_MAX_SIZE as u64)
                 .map(generate_tx)
                 .collect_vec(),
         );
 
-        let Poll::Ready(txs) = forwarding_manager.as_mut().poll_ingress(&mut cx) else {
+        let Poll::Ready(txs_with_senders) = forwarding_manager.as_mut().poll_ingress(&mut cx)
+        else {
             panic!("forwarding manager should be ready");
         };
-        assert_eq!(txs.len(), INGRESS_CHUNK_MAX_SIZE);
+        assert_eq!(txs_with_senders.len(), INGRESS_CHUNK_MAX_SIZE);
 
         tokio::time::advance(Duration::from_millis(1)).await;
 
@@ -491,17 +541,18 @@ mod test {
 
         tokio::time::advance(Duration::from_millis(1)).await;
 
-        let Poll::Ready(txs) = forwarding_manager.as_mut().poll_ingress(&mut cx) else {
+        let Poll::Ready(txs_with_senders) = forwarding_manager.as_mut().poll_ingress(&mut cx)
+        else {
             panic!("forwarding manager should be ready");
         };
-        assert_eq!(txs.len(), INGRESS_CHUNK_MAX_SIZE);
+        assert_eq!(txs_with_senders.len(), INGRESS_CHUNK_MAX_SIZE);
 
         assert_pending_now_and_forever(forwarding_manager, cx).await;
     }
 
     #[tokio::test]
     async fn test_egress_limit() {
-        let (forwarding_manager, mut cx) = setup();
+        let (forwarding_manager, _score_provider, mut cx) = setup();
         let mut forwarding_manager = pin!(forwarding_manager);
 
         let mut egress_txs = Vec::new();
@@ -563,7 +614,7 @@ mod test {
 
     #[tokio::test]
     async fn test_egress_limit_exceeded() {
-        let (forwarding_manager, mut cx) = setup();
+        let (forwarding_manager, _score_provider, mut cx) = setup();
         let mut forwarding_manager = pin!(forwarding_manager);
 
         let legacy_tx_generator =

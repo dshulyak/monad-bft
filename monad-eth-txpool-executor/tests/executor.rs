@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures::{task::noop_waker_ref, SinkExt, StreamExt};
 use monad_chain_config::{revision::MockChainRevision, ChainConfig, MockChainConfig};
 use monad_consensus_types::block::GENESIS_TIMESTAMP;
-use monad_crypto::NopSignature;
+use monad_crypto::{NopPubKey, NopSignature};
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_testutil::{generate_block_with_txs, make_legacy_tx, secret_to_eth_address, S1};
 use monad_eth_txpool_executor::{
@@ -33,10 +33,11 @@ use monad_eth_txpool_ipc::{EthTxPoolIpcClient, EthTxPoolIpcTx};
 use monad_eth_txpool_types::EthTxPoolSnapshot;
 use monad_executor::Executor;
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
+use monad_peer_score::{create_scorer, ScoreConfig, StdClock};
 use monad_state_backend::{InMemoryBlockState, InMemoryState, InMemoryStateInner};
 use monad_testutil::signing::MockSignatures;
 use monad_tfm::base_fee::MIN_BASE_FEE;
-use monad_types::{Balance, SeqNum, GENESIS_ROUND, GENESIS_SEQ_NUM};
+use monad_types::{Balance, NodeId, SeqNum, GENESIS_ROUND, GENESIS_SEQ_NUM};
 
 type SignatureType = NopSignature;
 type SignatureCollectionType = MockSignatures<SignatureType>;
@@ -63,6 +64,9 @@ async fn setup_txpool_executor_with_client() -> (
     let ipc_tempdir = tempfile::tempdir().unwrap();
     let bind_path = ipc_tempdir.path().join("txpool_executor_test.socket");
 
+    let (score_provider, score_reader) =
+        create_scorer::<NodeId<NopPubKey>, StdClock>(ScoreConfig::default(), StdClock);
+
     let mut txpool_executor = EthTxPoolExecutor::start(
         eth_block_policy,
         state_backend,
@@ -78,6 +82,8 @@ async fn setup_txpool_executor_with_client() -> (
         GENESIS_ROUND,
         GENESIS_TIMESTAMP as u64,
         true,
+        score_provider,
+        score_reader,
     )
     .unwrap();
 

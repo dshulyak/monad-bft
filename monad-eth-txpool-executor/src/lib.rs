@@ -39,9 +39,10 @@ use monad_eth_txpool_types::{EthTxPoolDropReason, EthTxPoolEventType};
 use monad_eth_types::{EthExecutionProtocol, ExtractEthAddress};
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
+use monad_peer_score::{ScoreProvider, ScoreReader, StdClock};
 use monad_secp::RecoverableAddress;
 use monad_state_backend::StateBackend;
-use monad_types::{DropTimer, Round};
+use monad_types::{DropTimer, NodeId, Round};
 use monad_validator::signature_collection::SignatureCollection;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tokio::{sync::mpsc, time::Instant};
@@ -80,8 +81,11 @@ where
     events_tx: mpsc::UnboundedSender<MempoolEvent<ST, SCT, EthExecutionProtocol>>,
     events: mpsc::UnboundedReceiver<MempoolEvent<ST, SCT, EthExecutionProtocol>>,
 
-    forwarding_manager: Pin<Box<EthTxPoolForwardingManager>>,
+    forwarding_manager:
+        Pin<Box<EthTxPoolForwardingManager<NodeId<CertificateSignaturePubKey<ST>>, StdClock>>>,
     preload_manager: Pin<Box<EthTxPoolPreloadManager>>,
+
+    score_provider: ScoreProvider<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
 
     metrics: Arc<EthTxPoolExecutorMetrics>,
     executor_metrics: ExecutorMetrics,
@@ -109,6 +113,8 @@ where
         round: Round,
         execution_timestamp_s: u64,
         do_local_insert: bool,
+        score_provider: ScoreProvider<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
+        score_reader: ScoreReader<NodeId<CertificateSignaturePubKey<ST>>, StdClock>,
     ) -> io::Result<EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>> {
         let ipc = Box::pin(EthTxPoolIpcServer::new(ipc_config)?);
 
@@ -148,8 +154,10 @@ where
                         events_tx,
                         events,
 
-                        forwarding_manager: Box::pin(EthTxPoolForwardingManager::default()),
+                        forwarding_manager: Box::pin(EthTxPoolForwardingManager::new(score_reader)),
                         preload_manager: Box::pin(EthTxPoolPreloadManager::default()),
+
+                        score_provider,
 
                         metrics,
                         executor_metrics,
@@ -266,7 +274,7 @@ where
             self.forwarding_manager
                 .as_mut()
                 .project()
-                .add_ingress_txs(txs);
+                .add_ingress_txs(sender, txs);
         }
     }
 }
@@ -383,7 +391,11 @@ where
                         &self.state_backend,
                         &self.chain_config,
                     ) {
-                        Ok(proposed_execution_inputs) => {
+                        Ok((proposed_execution_inputs, forwarded_senders)) => {
+                            for sender in forwarded_senders {
+                                self.score_provider.record_contribution(sender);
+                            }
+
                             let elapsed = create_proposal_start.elapsed();
 
                             self.metrics.create_proposal.fetch_add(1, Ordering::SeqCst);
@@ -504,6 +516,8 @@ where
             forwarding_manager,
             preload_manager,
 
+            score_provider: _,
+
             metrics,
             executor_metrics,
 
@@ -598,17 +612,21 @@ where
 
         let mut ipc_events = BTreeMap::default();
 
-        while let Poll::Ready(forwarded_txs) = forwarding_manager.as_mut().poll_ingress(cx) {
-            let _span = debug_span!("forwarded txs", len = forwarded_txs.len()).entered();
+        while let Poll::Ready(forwarded_txs_with_senders) =
+            forwarding_manager.as_mut().poll_ingress(cx)
+        {
+            let _span =
+                debug_span!("forwarded txs", len = forwarded_txs_with_senders.len()).entered();
 
             let recovered_txs = {
-                let (recovered_txs, dropped_txs): (Vec<_>, Vec<_>) =
-                    forwarded_txs.into_par_iter().partition_map(|tx| {
+                let (recovered_txs, dropped_txs): (Vec<_>, Vec<_>) = forwarded_txs_with_senders
+                    .into_par_iter()
+                    .partition_map(|(tx, sender)| {
                         let _span = trace_span!("txpool: forwarded tx recover signer").entered();
                         match tx.secp256k1_recover() {
                             Ok(signer) => rayon::iter::Either::Left((
                                 Recovered::new_unchecked(tx, signer),
-                                PoolTransactionKind::Forwarded,
+                                PoolTransactionKind::Forwarded { sender },
                             )),
                             Err(_) => rayon::iter::Either::Right((
                                 *tx.tx_hash(),
