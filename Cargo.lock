@@ -5673,6 +5673,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-leanudp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monad-peer-score",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "monad-ledger"
 version = "0.1.0"
 dependencies = [
