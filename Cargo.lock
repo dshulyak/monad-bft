@@ -5639,6 +5639,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-fair-queue"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "monad-peer-score",
+ "proptest",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "monad-keystore"
 version = "0.1.0"
 dependencies = [
