@@ -1,0 +1,13 @@
+[package]
+name = "monad-peer-score"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+test-utils = []
+
+[dependencies]
+lru = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
