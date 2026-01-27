@@ -22,7 +22,7 @@
   - [Security Analysis](#security-analysis)
     - [Naive Flooding](#naive-flooding)
     - [Mempool Monopolization](#mempool-monopolization)
-    - [Attack Cost Estimates](#attack-cost-estimates)
+    - [Graceful Degradation](#graceful-degradation)
 
 ## Rationale
 
@@ -65,7 +65,7 @@ These components ensure that peers who have consistently contributed valid trans
 
 ## Peer Score
 
-An identity is a public key that owns a wireauth session. Each authenticated UDP session is tied to exactly one identity, and all reputation tracking uses this public key as the identifier.
+An identity is a public key that owns a wireauth session. All reputation tracking uses this public key as the identifier. The number of identities per IP address is limited to prevent a single IP from creating unbounded sessions.
 
 ### Score Computation
 
@@ -95,7 +95,7 @@ Contributions are recorded as gas spent per identity per block. When a block inc
 
 Gas-based counting ties attack cost directly to on-chain fees. The cap forces attackers to acquire more identities (IPs) rather than outspending honest users from a single identity.
 
-The scoring model intentionally avoids negative reputation (penalties for invalid transactions, failed execution, or spam). This keeps the model simple and predictable. Penalties may be introduced in future iterations if the positive-only approach proves insufficient against observed attack patterns.
+The scoring model intentionally avoids negative reputation (penalties for invalid transactions or spam). This keeps the model simple. Penalties may be introduced in future iterations if the positive-only approach proves insufficient against observed attack patterns.
 
 ### Two-Tier Identity Storage
 
@@ -140,7 +140,7 @@ The algorithm guarantees that over time, each identity receives bandwidth propor
 
 ### Priority Pool Fallback
 
-When the priority pool cannot accept a transaction (full or per-identity limit reached), promoted identities fall back to the regular pool rather than being rejected. This provides a safety mechanism if scoring is abused to block new identities.
+When the priority pool cannot accept a transaction, promoted identities fall back to the regular pool rather than being rejected. This provides a safety mechanism if scoring is abused to block new identities.
 
 ## LeanUDP Fragmentation
 
@@ -226,3 +226,7 @@ Assuming 1000 honest relays at gas cap (100M gas each), AWS IP cost $3.60/month,
 | 80% | 1min | 14,400,000 | ~0 | $3,312,000 | $3,312,000 |
 
 Due to quadratic time weight, instant attacks are 3,600x more expensive than prepared attacks.
+
+### Graceful Degradation
+
+When the scoring system itself is under attack (e.g., priority pools exhausted, reassembly buffers full), the protocol falls back to pre-scoring behavior rather than failing completely. Promoted identities overflow to regular pools, and regular pools use random eviction. This ensures that an attack on the prioritization layer cannot cause worse outcomes than having no prioritization at all.
