@@ -28,7 +28,8 @@ impl Decoder {
     ) {
         let buffer_index: u16 = self.buffer_state.len().try_into().unwrap();
 
-        let mut buffer = Buffer::new();
+        let mut buffer =
+            Buffer::with_intermediate_symbol_universe_size(self.params.num_intermediate_symbols());
 
         let mut used_buffer_indices = Vec::with_capacity(MAX_DEGREE);
 

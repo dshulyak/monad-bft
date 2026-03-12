@@ -39,6 +39,14 @@ impl Buffer {
         }
     }
 
+    pub fn with_intermediate_symbol_universe_size(universe_size: usize) -> Buffer {
+        Buffer {
+            intermediate_symbol_ids: OrderedSet::with_universe_size(universe_size),
+            active_used_weight: 0,
+            used: false,
+        }
+    }
+
     pub fn append_active_intermediate_symbol_id(&mut self, intermediate_symbol_id: usize) {
         self.append_intermediate_symbol_id(intermediate_symbol_id, true);
     }

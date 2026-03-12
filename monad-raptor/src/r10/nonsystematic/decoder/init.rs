@@ -67,9 +67,11 @@ impl Decoder {
         //   |                               |       |
         //   +-------------------------------+-------+
 
-        let mut buffer_state: Vec<Buffer> = iter::repeat_with(Buffer::new)
-            .take(params.num_ldpc_symbols() + params.num_half_symbols())
-            .collect();
+        let mut buffer_state: Vec<Buffer> = iter::repeat_with(|| {
+            Buffer::with_intermediate_symbol_universe_size(params.num_intermediate_symbols())
+        })
+        .take(params.num_ldpc_symbols() + params.num_half_symbols())
+        .collect();
 
         let mut intermediate_symbol_state: Vec<IntermediateSymbol> =
             iter::repeat_with(IntermediateSymbol::new)
