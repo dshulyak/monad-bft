@@ -116,7 +116,7 @@ impl DenseMatrix {
                 let mut weight = 0;
                 let mut lead_column = None;
 
-                for col in 0..a.ncols() {
+                for col in step..a.ncols() {
                     if a[(row, col)] {
                         weight += 1;
 
