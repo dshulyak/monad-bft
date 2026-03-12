@@ -67,6 +67,7 @@ pub struct Decoder {
     num_source_symbols_paired: usize,
 
     inactive_buffer_indices_scratch: Vec<u16>,
+    inactive_reducee_buffer_indices_scratch: Vec<u16>,
     inactive_intermediate_symbol_ids_scratch: Vec<u16>,
     inactive_intermediate_symbol_marks: Vec<u32>,
     inactive_intermediate_symbol_columns: Vec<u16>,

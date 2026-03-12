@@ -15,10 +15,7 @@
 
 use std::num::NonZeroU16;
 
-use crate::{
-    matrix::{DenseMatrix, RowOperation},
-    r10::nonsystematic::decoder::{BufferId, BufferState, Decoder},
-};
+use crate::r10::nonsystematic::decoder::{BufferId, BufferState, Decoder};
 
 impl Decoder {
     fn next_inactive_intermediate_symbol_generation(&mut self) -> u32 {
@@ -63,27 +60,6 @@ impl Decoder {
 
         self.inactive_buffer_indices_scratch.len()
             >= self.inactive_intermediate_symbol_ids_scratch.len()
-    }
-
-    fn build_inactivated_gaussian_matrix(&self) -> DenseMatrix {
-        let nrows = self.inactive_buffer_indices_scratch.len();
-        let ncols = self.inactive_intermediate_symbol_ids_scratch.len();
-        let mut data = vec![false; nrows * ncols];
-
-        for (row, &buffer_index) in self.inactive_buffer_indices_scratch.iter().enumerate() {
-            let row_start = row * ncols;
-
-            for &intermediate_symbol_id in
-                &self.buffer_state[usize::from(buffer_index)].intermediate_symbol_ids
-            {
-                let col = usize::from(
-                    self.inactive_intermediate_symbol_columns[usize::from(intermediate_symbol_id)],
-                );
-                data[row_start + col] = true;
-            }
-        }
-
-        DenseMatrix::from_vec(nrows, ncols, data)
     }
 
     fn buffer_inactivated_xor_eq(&mut self, a: u16, b: u16) {
@@ -135,12 +111,51 @@ impl Decoder {
             return false;
         }
 
-        let mat = self.build_inactivated_gaussian_matrix();
+        let pivot_count = self.inactive_intermediate_symbol_ids_scratch.len();
 
-        let _ = mat.rowwise_elimination_gaussian_full_pivot(|op| match op {
-            RowOperation::SubAssign { i, j } => {
-                let reducee_buffer_index = self.inactive_buffer_indices_scratch[i];
-                let reducing_buffer_index = self.inactive_buffer_indices_scratch[j];
+        for step in 0..pivot_count {
+            let Some((pivot_offset, _pivot_weight)) = self.inactive_buffer_indices_scratch[step..]
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, &buffer_index)| {
+                    let weight = self.buffer_state[usize::from(buffer_index)]
+                        .intermediate_symbol_ids
+                        .len();
+
+                    (weight != 0).then_some((offset, weight))
+                })
+                .min_by_key(|&(_offset, weight)| weight)
+            else {
+                break;
+            };
+
+            let pivot_index = step + pivot_offset;
+            self.inactive_buffer_indices_scratch.swap(step, pivot_index);
+
+            let reducing_buffer_index = self.inactive_buffer_indices_scratch[step];
+            let pivot_intermediate_symbol_id = self.buffer_state
+                [usize::from(reducing_buffer_index)]
+            .first_intermediate_symbol_id();
+
+            self.inactive_reducee_buffer_indices_scratch.clear();
+            for &buffer_index in self.intermediate_symbol_state
+                [usize::from(pivot_intermediate_symbol_id)]
+            .inactivated_values()
+            {
+                if self.buffer_state[usize::from(buffer_index)].state() == BufferState::Inactivated
+                {
+                    self.inactive_reducee_buffer_indices_scratch
+                        .push(buffer_index);
+                }
+            }
+
+            for reducee_index in 0..self.inactive_reducee_buffer_indices_scratch.len() {
+                let reducee_buffer_index =
+                    self.inactive_reducee_buffer_indices_scratch[reducee_index];
+
+                if reducee_buffer_index == reducing_buffer_index {
+                    continue;
+                }
 
                 self.buffer_inactivated_xor_eq(reducee_buffer_index, reducing_buffer_index);
 
@@ -149,7 +164,7 @@ impl Decoder {
                     self.buffer_index_to_buffer_id(reducing_buffer_index),
                 );
             }
-        });
+        }
 
         for &buffer_index in &self.inactive_buffer_indices_scratch {
             let weight = self.buffer_state[usize::from(buffer_index)]
