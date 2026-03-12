@@ -29,6 +29,13 @@ impl OrderedSet {
         }
     }
 
+    pub fn with_universe_size(universe_size: usize) -> OrderedSet {
+        OrderedSet {
+            values: Vec::new(),
+            positions: vec![0; universe_size],
+        }
+    }
+
     fn ensure_capacity(&mut self, value: u16) {
         let value = usize::from(value);
         if value >= self.positions.len() {

@@ -29,10 +29,16 @@ struct InactiveGaussianWorkspace {
 impl InactiveGaussianWorkspace {
     fn new(nrows: usize, ncols: usize) -> Self {
         Self {
-            row_intermediate_symbol_ids: iter::repeat_with(OrderedSet::new).take(nrows).collect(),
-            intermediate_symbol_row_indices: iter::repeat_with(OrderedSet::new)
-                .take(ncols)
-                .collect(),
+            row_intermediate_symbol_ids: iter::repeat_with(|| {
+                OrderedSet::with_universe_size(ncols)
+            })
+            .take(nrows)
+            .collect(),
+            intermediate_symbol_row_indices: iter::repeat_with(|| {
+                OrderedSet::with_universe_size(nrows)
+            })
+            .take(ncols)
+            .collect(),
         }
     }
 
