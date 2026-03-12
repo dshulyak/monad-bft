@@ -13,9 +13,60 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::num::NonZeroU16;
+use std::{iter, num::NonZeroU16};
 
-use crate::r10::nonsystematic::decoder::{BufferId, BufferState, Decoder};
+use crate::{
+    ordered_set::OrderedSet,
+    r10::nonsystematic::decoder::{BufferId, BufferState, Decoder, IntermediateSymbol},
+};
+
+#[derive(Debug)]
+struct InactiveGaussianWorkspace {
+    row_intermediate_symbol_ids: Vec<OrderedSet>,
+    intermediate_symbol_row_indices: Vec<OrderedSet>,
+}
+
+impl InactiveGaussianWorkspace {
+    fn new(nrows: usize, ncols: usize) -> Self {
+        Self {
+            row_intermediate_symbol_ids: iter::repeat_with(OrderedSet::new).take(nrows).collect(),
+            intermediate_symbol_row_indices: iter::repeat_with(OrderedSet::new)
+                .take(ncols)
+                .collect(),
+        }
+    }
+
+    fn row_weight(&self, row_index: u16) -> usize {
+        self.row_intermediate_symbol_ids[usize::from(row_index)].len()
+    }
+
+    fn row_first_intermediate_symbol_id(&self, row_index: u16) -> u16 {
+        self.row_intermediate_symbol_ids[usize::from(row_index)]
+            .first()
+            .copied()
+            .unwrap()
+    }
+
+    fn row_xor_eq(&mut self, a: u16, b: u16) {
+        let (aref, bref) = Decoder::get_two_mut(
+            &mut self.row_intermediate_symbol_ids,
+            usize::from(a),
+            usize::from(b),
+        );
+
+        for &intermediate_symbol_id in &*bref {
+            if aref.insert_or_remove(intermediate_symbol_id) {
+                let ret = self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
+                    .insert(a);
+                debug_assert!(ret);
+            } else {
+                let ret = self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
+                    .remove(&a);
+                debug_assert!(ret);
+            }
+        }
+    }
+}
 
 impl Decoder {
     fn next_inactive_intermediate_symbol_generation(&mut self) -> u32 {
@@ -62,27 +113,104 @@ impl Decoder {
             >= self.inactive_intermediate_symbol_ids_scratch.len()
     }
 
-    fn buffer_inactivated_xor_eq(&mut self, a: u16, b: u16) {
-        let (aref, bref) =
-            Self::get_two_mut(&mut self.buffer_state, usize::from(a), usize::from(b));
+    fn build_inactivated_gaussian_workspace(&self) -> InactiveGaussianWorkspace {
+        let nrows = self.inactive_buffer_indices_scratch.len();
+        let ncols = self.inactive_intermediate_symbol_ids_scratch.len();
+        let mut workspace = InactiveGaussianWorkspace::new(nrows, ncols);
 
-        debug_assert!(aref.state() == BufferState::Inactivated);
+        for (local_row_index, &buffer_index) in
+            self.inactive_buffer_indices_scratch.iter().enumerate()
+        {
+            let local_row_index: u16 = local_row_index.try_into().unwrap();
 
-        debug_assert!(bref.state() == BufferState::Inactivated);
-
-        for intermediate_symbol_id in &bref.intermediate_symbol_ids {
-            let symbol = &mut self.intermediate_symbol_state[usize::from(*intermediate_symbol_id)];
-
-            if !symbol.is_inactivated() {
-                let ret = aref.intermediate_symbol_ids.remove(intermediate_symbol_id);
-                debug_assert!(ret);
-            } else if aref
-                .intermediate_symbol_ids
-                .insert_or_remove(*intermediate_symbol_id)
+            for &intermediate_symbol_id in
+                &self.buffer_state[usize::from(buffer_index)].intermediate_symbol_ids
             {
-                symbol.inactivated_insert(a);
-            } else {
-                symbol.inactivated_remove(a);
+                let local_symbol_index =
+                    self.inactive_intermediate_symbol_columns[usize::from(intermediate_symbol_id)];
+
+                workspace.row_intermediate_symbol_ids[usize::from(local_row_index)]
+                    .append(local_symbol_index);
+                workspace.intermediate_symbol_row_indices[usize::from(local_symbol_index)]
+                    .append(local_row_index);
+            }
+        }
+
+        workspace
+    }
+
+    fn collect_preserved_inactivated_symbol_buffers(&self) -> Vec<OrderedSet> {
+        let mut preserved = Vec::with_capacity(self.inactive_intermediate_symbol_ids_scratch.len());
+
+        for &intermediate_symbol_id in &self.inactive_intermediate_symbol_ids_scratch {
+            let IntermediateSymbol::Inactivated { buffer_indices } =
+                &self.intermediate_symbol_state[usize::from(intermediate_symbol_id)]
+            else {
+                panic!();
+            };
+
+            let mut preserved_buffer_indices = OrderedSet::new();
+
+            for &buffer_index in buffer_indices {
+                if self.buffer_state[usize::from(buffer_index)].state() != BufferState::Inactivated
+                {
+                    preserved_buffer_indices.append(buffer_index);
+                }
+            }
+
+            preserved.push(preserved_buffer_indices);
+        }
+
+        preserved
+    }
+
+    fn writeback_inactivated_gaussian_workspace(
+        &mut self,
+        workspace: InactiveGaussianWorkspace,
+        preserved_symbol_buffers: Vec<OrderedSet>,
+    ) {
+        for (local_row_index, local_symbol_ids) in
+            workspace.row_intermediate_symbol_ids.iter().enumerate()
+        {
+            let buffer_index = self.inactive_buffer_indices_scratch[local_row_index];
+            let mut intermediate_symbol_ids = OrderedSet::new();
+
+            for &local_symbol_id in local_symbol_ids {
+                intermediate_symbol_ids.append(
+                    self.inactive_intermediate_symbol_ids_scratch[usize::from(local_symbol_id)],
+                );
+            }
+
+            self.buffer_state[usize::from(buffer_index)].intermediate_symbol_ids =
+                intermediate_symbol_ids;
+        }
+
+        for (local_symbol_index, preserved_buffer_indices) in
+            preserved_symbol_buffers.into_iter().enumerate()
+        {
+            let intermediate_symbol_id =
+                self.inactive_intermediate_symbol_ids_scratch[local_symbol_index];
+
+            let IntermediateSymbol::Inactivated { buffer_indices } =
+                &mut self.intermediate_symbol_state[usize::from(intermediate_symbol_id)]
+            else {
+                panic!();
+            };
+
+            *buffer_indices = preserved_buffer_indices;
+        }
+
+        for (local_symbol_index, local_row_indices) in
+            workspace.intermediate_symbol_row_indices.iter().enumerate()
+        {
+            let intermediate_symbol_id =
+                self.inactive_intermediate_symbol_ids_scratch[local_symbol_index];
+            let symbol = &mut self.intermediate_symbol_state[usize::from(intermediate_symbol_id)];
+
+            for &local_row_index in local_row_indices {
+                symbol.inactivated_insert(
+                    self.inactive_buffer_indices_scratch[usize::from(local_row_index)],
+                );
             }
         }
     }
@@ -111,16 +239,18 @@ impl Decoder {
             return false;
         }
 
+        let mut workspace = self.build_inactivated_gaussian_workspace();
+        let mut row_order: Vec<u16> = (0..workspace.row_intermediate_symbol_ids.len())
+            .map(|row_index| row_index.try_into().unwrap())
+            .collect();
         let pivot_count = self.inactive_intermediate_symbol_ids_scratch.len();
 
         for step in 0..pivot_count {
-            let Some((pivot_offset, _pivot_weight)) = self.inactive_buffer_indices_scratch[step..]
+            let Some((pivot_offset, _pivot_weight)) = row_order[step..]
                 .iter()
                 .enumerate()
-                .filter_map(|(offset, &buffer_index)| {
-                    let weight = self.buffer_state[usize::from(buffer_index)]
-                        .intermediate_symbol_ids
-                        .len();
+                .filter_map(|(offset, &row_index)| {
+                    let weight = workspace.row_weight(row_index);
 
                     (weight != 0).then_some((offset, weight))
                 })
@@ -130,34 +260,30 @@ impl Decoder {
             };
 
             let pivot_index = step + pivot_offset;
-            self.inactive_buffer_indices_scratch.swap(step, pivot_index);
+            row_order.swap(step, pivot_index);
 
-            let reducing_buffer_index = self.inactive_buffer_indices_scratch[step];
-            let pivot_intermediate_symbol_id = self.buffer_state
-                [usize::from(reducing_buffer_index)]
-            .first_intermediate_symbol_id();
+            let reducing_row_index = row_order[step];
+            let reducing_buffer_index =
+                self.inactive_buffer_indices_scratch[usize::from(reducing_row_index)];
+            let pivot_intermediate_symbol_id =
+                workspace.row_first_intermediate_symbol_id(reducing_row_index);
 
             self.inactive_reducee_buffer_indices_scratch.clear();
-            for &buffer_index in self.intermediate_symbol_state
+            for &row_index in &workspace.intermediate_symbol_row_indices
                 [usize::from(pivot_intermediate_symbol_id)]
-            .inactivated_values()
             {
-                if self.buffer_state[usize::from(buffer_index)].state() == BufferState::Inactivated
-                {
-                    self.inactive_reducee_buffer_indices_scratch
-                        .push(buffer_index);
-                }
+                self.inactive_reducee_buffer_indices_scratch.push(row_index);
             }
 
-            for reducee_index in 0..self.inactive_reducee_buffer_indices_scratch.len() {
-                let reducee_buffer_index =
-                    self.inactive_reducee_buffer_indices_scratch[reducee_index];
-
-                if reducee_buffer_index == reducing_buffer_index {
+            for &reducee_row_index in &self.inactive_reducee_buffer_indices_scratch {
+                if reducee_row_index == reducing_row_index {
                     continue;
                 }
 
-                self.buffer_inactivated_xor_eq(reducee_buffer_index, reducing_buffer_index);
+                let reducee_buffer_index =
+                    self.inactive_buffer_indices_scratch[usize::from(reducee_row_index)];
+
+                workspace.row_xor_eq(reducee_row_index, reducing_row_index);
 
                 xor_buffers(
                     self.buffer_index_to_buffer_id(reducee_buffer_index),
@@ -165,6 +291,9 @@ impl Decoder {
                 );
             }
         }
+
+        let preserved_symbol_buffers = self.collect_preserved_inactivated_symbol_buffers();
+        self.writeback_inactivated_gaussian_workspace(workspace, preserved_symbol_buffers);
 
         for &buffer_index in &self.inactive_buffer_indices_scratch {
             let weight = self.buffer_state[usize::from(buffer_index)]
