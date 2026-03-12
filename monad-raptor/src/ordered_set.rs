@@ -13,119 +13,99 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{iter::IntoIterator, slice};
-
-use crate::binary_search::smallest_integer_satisfying;
-
-// Empirically determined threshold for binary search.
-const BINARY_SEARCH_THRESHOLD: usize = 250;
+use std::slice;
 
 #[derive(Clone, Debug)]
 pub struct OrderedSet {
-    data: Vec<u16>,
+    values: Vec<u16>,
+    positions: Vec<u16>,
 }
 
 impl OrderedSet {
     pub fn new() -> OrderedSet {
-        OrderedSet { data: Vec::new() }
+        OrderedSet {
+            values: Vec::new(),
+            positions: Vec::new(),
+        }
+    }
+
+    fn ensure_capacity(&mut self, value: u16) {
+        let value = usize::from(value);
+        if value >= self.positions.len() {
+            self.positions.resize(value + 1, 0);
+        }
+    }
+
+    fn position(&self, value: u16) -> Option<usize> {
+        let value = usize::from(value);
+        let raw = *self.positions.get(value)?;
+        if raw == 0 {
+            None
+        } else {
+            Some(usize::from(raw - 1))
+        }
     }
 
     pub fn append(&mut self, value: u16) {
-        self.data.push(value);
-    }
-
-    // Find the array index where element 'value' is located or where it would be inserted.
-    // This involves finding the lowest-numbered entry that is higher than or equal to `value`.
-    fn placement_index(&self, value: &u16) -> usize {
-        if self.data.len() < BINARY_SEARCH_THRESHOLD {
-            for i in 0..self.data.len() {
-                if self.data[i] >= *value {
-                    return i;
-                }
-            }
-
-            self.data.len()
-        } else {
-            match smallest_integer_satisfying(0, self.data.len(), |pivot| {
-                self.data[pivot] >= *value
-            }) {
-                None => self.data.len(),
-                Some(index) => index,
-            }
-        }
+        self.ensure_capacity(value);
+        debug_assert!(self.position(value).is_none());
+        self.positions[usize::from(value)] = (self.values.len() + 1).try_into().unwrap();
+        self.values.push(value);
     }
 
     pub fn contains(&self, value: &u16) -> bool {
-        let index = self.placement_index(value);
-
-        index < self.data.len() && self.data[index] == *value
+        self.position(*value).is_some()
     }
 
     pub fn first(&self) -> Option<&u16> {
-        if !self.data.is_empty() {
-            Some(&self.data[0])
-        } else {
-            None
-        }
+        self.values.first()
     }
 
     pub fn insert(&mut self, value: u16) -> bool {
-        let len = self.data.len();
-        let index = self.placement_index(&value);
-
-        if index == len || self.data[index] != value {
-            self.data.push(0);
-            self.data.copy_within(index..len, index + 1);
-            self.data[index] = value;
-
-            true
-        } else {
+        if self.contains(&value) {
             false
+        } else {
+            self.append(value);
+            true
         }
     }
 
     pub fn insert_or_remove(&mut self, value: u16) -> bool {
-        let len = self.data.len();
-        let index = self.placement_index(&value);
-
-        if index == len || self.data[index] != value {
-            self.data.push(0);
-            self.data.copy_within(index..len, index + 1);
-            self.data[index] = value;
-
-            true
-        } else {
-            self.data.copy_within(index + 1..len, index);
-            self.data.truncate(len - 1);
-
+        if self.remove(&value) {
             false
+        } else {
+            self.append(value);
+            true
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.values.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &u16> {
-        self.data.iter()
+        self.values.iter()
     }
 
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.values.len()
     }
 
     pub fn remove(&mut self, value: &u16) -> bool {
-        let len = self.data.len();
-        let index = self.placement_index(value);
+        let Some(index) = self.position(*value) else {
+            return false;
+        };
 
-        if index < len && self.data[index] == *value {
-            self.data.copy_within(index + 1..len, index);
-            self.data.truncate(len - 1);
+        self.positions[usize::from(*value)] = 0;
 
-            true
-        } else {
-            false
+        let removed = self.values.swap_remove(index);
+        debug_assert_eq!(removed, *value);
+
+        if let Some(moved) = self.values.get(index).copied() {
+            self.positions[usize::from(moved)] = (index + 1).try_into().unwrap();
         }
+
+        true
     }
 }
 
@@ -140,7 +120,7 @@ impl IntoIterator for OrderedSet {
     type IntoIter = <Vec<u16> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.data.into_iter()
+        self.values.into_iter()
     }
 }
 
@@ -149,6 +129,6 @@ impl<'a> IntoIterator for &'a OrderedSet {
     type IntoIter = slice::Iter<'a, u16>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.data[..].iter()
+        self.values.iter()
     }
 }
