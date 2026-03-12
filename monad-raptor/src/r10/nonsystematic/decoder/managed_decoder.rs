@@ -50,6 +50,22 @@ impl BufferSet {
         }
     }
 
+    fn xor_bytes(dst: &mut [u8], src: &[u8]) {
+        assert_eq!(dst.len(), src.len());
+
+        let (dst_words, dst_tail) = dst.as_chunks_mut::<8>();
+        let (src_words, src_tail) = src.as_chunks::<8>();
+
+        for (dst_word, src_word) in dst_words.iter_mut().zip(src_words) {
+            *dst_word =
+                (u64::from_ne_bytes(*dst_word) ^ u64::from_ne_bytes(*src_word)).to_ne_bytes();
+        }
+
+        for (dst_byte, src_byte) in dst_tail.iter_mut().zip(src_tail) {
+            *dst_byte ^= *src_byte;
+        }
+    }
+
     pub fn xor_buffers(&mut self, a: BufferId, b: BufferId) {
         let a_index = self.buffer_index(a);
         let b_index = self.buffer_index(b);
@@ -69,13 +85,7 @@ impl BufferSet {
             Ordering::Equal => panic!("xor_buffers: Was asked to XOR buffer with itself"),
         };
 
-        let len = dst.len();
-
-        assert_eq!(len, src.len());
-
-        for i in 0..len {
-            dst[i] ^= src[i];
-        }
+        Self::xor_bytes(dst, src);
     }
 
     pub fn buffer(&self, buffer_id: BufferId) -> &[u8] {
