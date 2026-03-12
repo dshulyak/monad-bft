@@ -65,6 +65,12 @@ pub struct Decoder {
     // Number of source symbols recovered.  We are done decoding if this is equal to
     // params.num_source_symbols().
     num_source_symbols_paired: usize,
+
+    inactive_buffer_indices_scratch: Vec<u16>,
+    inactive_intermediate_symbol_ids_scratch: Vec<u16>,
+    inactive_intermediate_symbol_marks: Vec<u32>,
+    inactive_intermediate_symbol_columns: Vec<u16>,
+    inactive_intermediate_symbol_generation: u32,
 }
 
 impl Decoder {

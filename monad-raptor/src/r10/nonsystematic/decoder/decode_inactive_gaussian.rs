@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::BTreeSet, num::NonZeroU16};
+use std::num::NonZeroU16;
 
 use crate::{
     matrix::{DenseMatrix, RowOperation},
@@ -21,6 +21,71 @@ use crate::{
 };
 
 impl Decoder {
+    fn next_inactive_intermediate_symbol_generation(&mut self) -> u32 {
+        self.inactive_intermediate_symbol_generation =
+            self.inactive_intermediate_symbol_generation.wrapping_add(1);
+
+        if self.inactive_intermediate_symbol_generation == 0 {
+            self.inactive_intermediate_symbol_marks.fill(0);
+            self.inactive_intermediate_symbol_generation = 1;
+        }
+
+        self.inactive_intermediate_symbol_generation
+    }
+
+    fn collect_inactivated_gaussian_inputs(&mut self) -> bool {
+        self.inactive_buffer_indices_scratch.clear();
+        self.buffers_inactivated.enumerate(|buffer_index, _weight| {
+            self.inactive_buffer_indices_scratch.push(buffer_index)
+        });
+
+        let generation = self.next_inactive_intermediate_symbol_generation();
+        let buffer_state = &self.buffer_state;
+        let marks = &mut self.inactive_intermediate_symbol_marks;
+        let columns = &mut self.inactive_intermediate_symbol_columns;
+        let symbol_ids = &mut self.inactive_intermediate_symbol_ids_scratch;
+
+        symbol_ids.clear();
+
+        for &buffer_index in &self.inactive_buffer_indices_scratch {
+            for &intermediate_symbol_id in
+                &buffer_state[usize::from(buffer_index)].intermediate_symbol_ids
+            {
+                let mark_index = usize::from(intermediate_symbol_id);
+
+                if marks[mark_index] != generation {
+                    marks[mark_index] = generation;
+                    columns[mark_index] = symbol_ids.len().try_into().unwrap();
+                    symbol_ids.push(intermediate_symbol_id);
+                }
+            }
+        }
+
+        self.inactive_buffer_indices_scratch.len()
+            >= self.inactive_intermediate_symbol_ids_scratch.len()
+    }
+
+    fn build_inactivated_gaussian_matrix(&self) -> DenseMatrix {
+        let nrows = self.inactive_buffer_indices_scratch.len();
+        let ncols = self.inactive_intermediate_symbol_ids_scratch.len();
+        let mut data = vec![false; nrows * ncols];
+
+        for (row, &buffer_index) in self.inactive_buffer_indices_scratch.iter().enumerate() {
+            let row_start = row * ncols;
+
+            for &intermediate_symbol_id in
+                &self.buffer_state[usize::from(buffer_index)].intermediate_symbol_ids
+            {
+                let col = usize::from(
+                    self.inactive_intermediate_symbol_columns[usize::from(intermediate_symbol_id)],
+                );
+                data[row_start + col] = true;
+            }
+        }
+
+        DenseMatrix::from_vec(nrows, ncols, data)
+    }
+
     fn buffer_inactivated_xor_eq(&mut self, a: u16, b: u16) {
         let (aref, bref) =
             Self::get_two_mut(&mut self.buffer_state, usize::from(a), usize::from(b));
@@ -64,48 +129,18 @@ impl Decoder {
             return true;
         }
 
-        let mut inactivated_buffer_indices: Vec<u16> = Vec::new();
-
-        self.buffers_inactivated
-            .enumerate(|buffer_index, _weight| inactivated_buffer_indices.push(buffer_index));
-
-        // TODO: Consider pre-computing part of this.
-        let inactivated_intermediate_symbol_ids: BTreeSet<u16> = inactivated_buffer_indices
-            .iter()
-            .flat_map(|buffer_index| {
-                self.buffer_state[usize::from(*buffer_index)]
-                    .intermediate_symbol_ids
-                    .iter()
-                    .copied()
-            })
-            .collect();
-
-        if inactivated_buffer_indices.len() < inactivated_intermediate_symbol_ids.len() {
+        if !self.collect_inactivated_gaussian_inputs() {
             // We need at least as many buffers as intermediate symbols for Gaussian
             // elimination to be successful.
             return false;
         }
 
-        let inactivated_intermediate_symbol_ids: Vec<u16> =
-            inactivated_intermediate_symbol_ids.into_iter().collect();
-
-        let mat = DenseMatrix::from_fn(
-            inactivated_buffer_indices.len(),
-            inactivated_intermediate_symbol_ids.len(),
-            |i, j| {
-                let buffer_index = inactivated_buffer_indices[i];
-                let intermediate_symbol_id = inactivated_intermediate_symbol_ids[j];
-
-                self.buffer_state[usize::from(buffer_index)]
-                    .intermediate_symbol_ids
-                    .contains(&intermediate_symbol_id)
-            },
-        );
+        let mat = self.build_inactivated_gaussian_matrix();
 
         let _ = mat.rowwise_elimination_gaussian_full_pivot(|op| match op {
             RowOperation::SubAssign { i, j } => {
-                let reducee_buffer_index = inactivated_buffer_indices[i];
-                let reducing_buffer_index = inactivated_buffer_indices[j];
+                let reducee_buffer_index = self.inactive_buffer_indices_scratch[i];
+                let reducing_buffer_index = self.inactive_buffer_indices_scratch[j];
 
                 self.buffer_inactivated_xor_eq(reducee_buffer_index, reducing_buffer_index);
 
@@ -116,19 +151,19 @@ impl Decoder {
             }
         });
 
-        for buffer_index in &inactivated_buffer_indices {
-            let weight = self.buffer_state[usize::from(*buffer_index)]
+        for &buffer_index in &self.inactive_buffer_indices_scratch {
+            let weight = self.buffer_state[usize::from(buffer_index)]
                 .intermediate_symbol_ids
                 .len();
 
             if weight > 0 {
                 self.buffers_inactivated.update_buffer_weight(
-                    usize::from(*buffer_index),
+                    usize::from(buffer_index),
                     NonZeroU16::new(weight.try_into().unwrap()).unwrap(),
                 );
             } else {
                 self.buffers_inactivated
-                    .remove_buffer_weight(usize::from(*buffer_index));
+                    .remove_buffer_weight(usize::from(buffer_index));
 
                 self.num_redundant_buffers += 1;
             }

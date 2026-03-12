@@ -32,6 +32,12 @@ impl DenseMatrix {
         DenseMatrix { data, nrows, ncols }
     }
 
+    pub fn from_vec(nrows: usize, ncols: usize, data: Vec<bool>) -> DenseMatrix {
+        assert_eq!(data.len(), nrows * ncols);
+
+        DenseMatrix { data, nrows, ncols }
+    }
+
     pub fn from_fn(
         nrows: usize,
         ncols: usize,

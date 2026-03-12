@@ -117,6 +117,7 @@ impl Decoder {
         }
 
         let buffers_inactivated = BufferWeightMap::with_capacity(capacity);
+        let num_intermediate_symbols = params.num_intermediate_symbols();
 
         let decoder = Decoder {
             params,
@@ -126,6 +127,11 @@ impl Decoder {
             buffers_inactivated,
             num_redundant_buffers: 0,
             num_source_symbols_paired: 0,
+            inactive_buffer_indices_scratch: Vec::with_capacity(capacity),
+            inactive_intermediate_symbol_ids_scratch: Vec::with_capacity(num_intermediate_symbols),
+            inactive_intermediate_symbol_marks: vec![0; num_intermediate_symbols],
+            inactive_intermediate_symbol_columns: vec![0; num_intermediate_symbols],
+            inactive_intermediate_symbol_generation: 0,
         };
 
         decoder.check();
