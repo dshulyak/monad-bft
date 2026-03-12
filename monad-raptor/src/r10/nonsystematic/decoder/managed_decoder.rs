@@ -50,7 +50,7 @@ impl BufferSet {
         }
     }
 
-    fn xor_bytes(dst: &mut [u8], src: &[u8]) {
+    fn xor_bytes_scalar(dst: &mut [u8], src: &[u8]) {
         assert_eq!(dst.len(), src.len());
 
         let (dst_words, dst_tail) = dst.as_chunks_mut::<8>();
@@ -64,6 +64,68 @@ impl BufferSet {
         for (dst_byte, src_byte) in dst_tail.iter_mut().zip(src_tail) {
             *dst_byte ^= *src_byte;
         }
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn xor_bytes_avx2(dst: &mut [u8], src: &[u8]) {
+        use std::arch::x86::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256};
+
+        let simd_len = dst.len() / 32 * 32;
+        let mut offset = 0;
+
+        while offset < simd_len {
+            let dst_chunk =
+                unsafe { _mm256_loadu_si256(dst.as_ptr().add(offset).cast::<__m256i>()) };
+            let src_chunk =
+                unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+            let xor_chunk = _mm256_xor_si256(dst_chunk, src_chunk);
+            unsafe {
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset).cast::<__m256i>(), xor_chunk);
+            }
+            offset += 32;
+        }
+
+        Self::xor_bytes_scalar(&mut dst[simd_len..], &src[simd_len..]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn xor_bytes_avx2(dst: &mut [u8], src: &[u8]) {
+        use std::arch::x86_64::{
+            __m256i, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256,
+        };
+
+        let simd_len = dst.len() / 32 * 32;
+        let mut offset = 0;
+
+        while offset < simd_len {
+            let dst_chunk =
+                unsafe { _mm256_loadu_si256(dst.as_ptr().add(offset).cast::<__m256i>()) };
+            let src_chunk =
+                unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+            let xor_chunk = _mm256_xor_si256(dst_chunk, src_chunk);
+            unsafe {
+                _mm256_storeu_si256(dst.as_mut_ptr().add(offset).cast::<__m256i>(), xor_chunk);
+            }
+            offset += 32;
+        }
+
+        Self::xor_bytes_scalar(&mut dst[simd_len..], &src[simd_len..]);
+    }
+
+    fn xor_bytes(dst: &mut [u8], src: &[u8]) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    Self::xor_bytes_avx2(dst, src);
+                }
+                return;
+            }
+        }
+
+        Self::xor_bytes_scalar(dst, src);
     }
 
     pub fn xor_buffers(&mut self, a: BufferId, b: BufferId) {
