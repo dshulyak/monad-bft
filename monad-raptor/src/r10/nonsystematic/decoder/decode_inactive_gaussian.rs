@@ -61,13 +61,12 @@ impl InactiveGaussianWorkspace {
         );
 
         for &intermediate_symbol_id in &*bref {
-            if aref.insert_or_remove(intermediate_symbol_id) {
-                let ret = self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
-                    .insert(a);
-                debug_assert!(ret);
+            if aref.insert_or_remove_within_capacity(intermediate_symbol_id) {
+                self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
+                    .append_within_capacity(a);
             } else {
                 let ret = self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
-                    .remove(&a);
+                    .remove_within_capacity(a);
                 debug_assert!(ret);
             }
         }
@@ -136,9 +135,9 @@ impl Decoder {
                     self.inactive_intermediate_symbol_columns[usize::from(intermediate_symbol_id)];
 
                 workspace.row_intermediate_symbol_ids[usize::from(local_row_index)]
-                    .append(local_symbol_index);
+                    .append_within_capacity(local_symbol_index);
                 workspace.intermediate_symbol_row_indices[usize::from(local_symbol_index)]
-                    .append(local_row_index);
+                    .append_within_capacity(local_row_index);
             }
         }
 

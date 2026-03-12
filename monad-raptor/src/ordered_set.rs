@@ -60,6 +60,13 @@ impl OrderedSet {
         self.values.push(value);
     }
 
+    pub fn append_within_capacity(&mut self, value: u16) {
+        debug_assert!(usize::from(value) < self.positions.len());
+        debug_assert!(self.position(value).is_none());
+        self.positions[usize::from(value)] = (self.values.len() + 1).try_into().unwrap();
+        self.values.push(value);
+    }
+
     pub fn contains(&self, value: &u16) -> bool {
         self.position(*value).is_some()
     }
@@ -86,6 +93,16 @@ impl OrderedSet {
         }
     }
 
+    pub fn insert_or_remove_within_capacity(&mut self, value: u16) -> bool {
+        debug_assert!(usize::from(value) < self.positions.len());
+        if self.remove_within_capacity(value) {
+            false
+        } else {
+            self.append_within_capacity(value);
+            true
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
@@ -107,6 +124,26 @@ impl OrderedSet {
 
         let removed = self.values.swap_remove(index);
         debug_assert_eq!(removed, *value);
+
+        if let Some(moved) = self.values.get(index).copied() {
+            self.positions[usize::from(moved)] = (index + 1).try_into().unwrap();
+        }
+
+        true
+    }
+
+    pub fn remove_within_capacity(&mut self, value: u16) -> bool {
+        debug_assert!(usize::from(value) < self.positions.len());
+        let index = usize::from(self.positions[usize::from(value)]);
+        if index == 0 {
+            return false;
+        }
+
+        let index = index - 1;
+        self.positions[usize::from(value)] = 0;
+
+        let removed = self.values.swap_remove(index);
+        debug_assert_eq!(removed, value);
 
         if let Some(moved) = self.values.get(index).copied() {
             self.positions[usize::from(moved)] = (index + 1).try_into().unwrap();
