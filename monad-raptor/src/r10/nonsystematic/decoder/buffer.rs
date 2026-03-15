@@ -76,6 +76,14 @@ impl Buffer {
                 .insert_or_remove(*intermediate_symbol_id);
         }
     }
+
+    // Decoder buffers always allocate the full intermediate-symbol universe up front.
+    pub fn xor_eq_within_capacity(&mut self, other: &Buffer) {
+        for intermediate_symbol_id in &other.intermediate_symbol_ids {
+            self.intermediate_symbol_ids
+                .insert_or_remove_within_capacity(*intermediate_symbol_id);
+        }
+    }
 }
 
 impl Default for Buffer {

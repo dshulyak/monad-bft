@@ -50,7 +50,7 @@ impl Decoder {
 
         // Reduce this buffer by all intermediate symbols that have already been recovered.
         for used_buffer_index in used_buffer_indices {
-            buffer.xor_eq(&self.buffer_state[usize::from(used_buffer_index)]);
+            buffer.xor_eq_within_capacity(&self.buffer_state[usize::from(used_buffer_index)]);
 
             // The buffer we are reducing by has active_used_weight == 1.
             buffer.active_used_weight -= 1;
