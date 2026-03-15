@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{iter, num::NonZeroU16};
+use std::num::NonZeroU16;
 
 use crate::{
     ordered_set::OrderedSet,
@@ -22,53 +22,170 @@ use crate::{
 
 #[derive(Debug)]
 struct InactiveGaussianWorkspace {
-    row_intermediate_symbol_ids: Vec<OrderedSet>,
-    intermediate_symbol_row_indices: Vec<OrderedSet>,
+    row_intermediate_symbol_ids: DenseSetCollection,
+    intermediate_symbol_row_indices: DenseSetCollection,
+}
+
+#[derive(Debug)]
+struct DenseSetCollection {
+    words: Vec<u64>,
+    lens: Vec<u16>,
+    words_per_set: usize,
+    universe_size: usize,
+}
+
+#[derive(Debug)]
+struct DenseSetIter<'a> {
+    words: &'a [u64],
+    word_index: usize,
+    current_word: u64,
+}
+
+impl DenseSetCollection {
+    fn new(count: usize, universe_size: usize) -> Self {
+        let words_per_set = universe_size.div_ceil(u64::BITS as usize);
+
+        Self {
+            words: vec![0; count * words_per_set],
+            lens: vec![0; count],
+            words_per_set,
+            universe_size,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.lens.len()
+    }
+
+    fn words(&self, set_index: usize) -> &[u64] {
+        let start = set_index * self.words_per_set;
+        &self.words[start..start + self.words_per_set]
+    }
+
+    fn len(&self, set_index: u16) -> usize {
+        usize::from(self.lens[usize::from(set_index)])
+    }
+
+    fn first(&self, set_index: u16) -> Option<u16> {
+        for (word_index, &word) in self.words(usize::from(set_index)).iter().enumerate() {
+            if word != 0 {
+                let bit_index = word_index * u64::BITS as usize + word.trailing_zeros() as usize;
+                debug_assert!(bit_index < self.universe_size);
+                return Some(bit_index.try_into().unwrap());
+            }
+        }
+
+        None
+    }
+
+    fn set_member(&mut self, set_index: u16, value: u16, present: bool) {
+        let set_index = usize::from(set_index);
+        let value = usize::from(value);
+        debug_assert!(value < self.universe_size);
+        let word_index = value / u64::BITS as usize;
+        let bit_index = value % u64::BITS as usize;
+        let mask = 1u64 << bit_index;
+        let base = set_index * self.words_per_set;
+        let words = &mut self.words[base..base + self.words_per_set];
+        let was_present = (words[word_index] & mask) != 0;
+
+        if was_present == present {
+            return;
+        }
+
+        if present {
+            words[word_index] |= mask;
+            self.lens[set_index] += 1;
+        } else {
+            words[word_index] &= !mask;
+            self.lens[set_index] -= 1;
+        }
+    }
+
+    fn toggle(&mut self, set_index: u16, value: u16) -> bool {
+        let set_index = usize::from(set_index);
+        let value = usize::from(value);
+        debug_assert!(value < self.universe_size);
+        let word_index = value / u64::BITS as usize;
+        let bit_index = value % u64::BITS as usize;
+        let mask = 1u64 << bit_index;
+        let base = set_index * self.words_per_set;
+        let words = &mut self.words[base..base + self.words_per_set];
+
+        if (words[word_index] & mask) == 0 {
+            words[word_index] |= mask;
+            self.lens[set_index] += 1;
+            true
+        } else {
+            words[word_index] &= !mask;
+            self.lens[set_index] -= 1;
+            false
+        }
+    }
+
+    fn iter(&self, set_index: usize) -> DenseSetIter<'_> {
+        DenseSetIter::new(self.words(set_index))
+    }
+}
+
+impl<'a> DenseSetIter<'a> {
+    fn new(words: &'a [u64]) -> Self {
+        Self {
+            words,
+            word_index: 0,
+            current_word: 0,
+        }
+    }
+}
+
+impl Iterator for DenseSetIter<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_word != 0 {
+                let bit_index = self.current_word.trailing_zeros() as usize;
+                self.current_word &= self.current_word - 1;
+                let value = (self.word_index - 1) * u64::BITS as usize + bit_index;
+                return Some(value.try_into().unwrap());
+            }
+
+            let next_word = *self.words.get(self.word_index)?;
+            self.word_index += 1;
+            self.current_word = next_word;
+        }
+    }
 }
 
 impl InactiveGaussianWorkspace {
     fn new(nrows: usize, ncols: usize) -> Self {
         Self {
-            row_intermediate_symbol_ids: iter::repeat_with(|| {
-                OrderedSet::with_universe_size(ncols)
-            })
-            .take(nrows)
-            .collect(),
-            intermediate_symbol_row_indices: iter::repeat_with(|| {
-                OrderedSet::with_universe_size(nrows)
-            })
-            .take(ncols)
-            .collect(),
+            row_intermediate_symbol_ids: DenseSetCollection::new(nrows, ncols),
+            intermediate_symbol_row_indices: DenseSetCollection::new(ncols, nrows),
         }
     }
 
+    fn num_rows(&self) -> usize {
+        self.row_intermediate_symbol_ids.count()
+    }
+
     fn row_weight(&self, row_index: u16) -> usize {
-        self.row_intermediate_symbol_ids[usize::from(row_index)].len()
+        self.row_intermediate_symbol_ids.len(row_index)
     }
 
     fn row_first_intermediate_symbol_id(&self, row_index: u16) -> u16 {
-        self.row_intermediate_symbol_ids[usize::from(row_index)]
-            .first()
-            .copied()
-            .unwrap()
+        self.row_intermediate_symbol_ids.first(row_index).unwrap()
     }
 
     fn row_xor_eq(&mut self, a: u16, b: u16) {
-        let (aref, bref) = Decoder::get_two_mut(
-            &mut self.row_intermediate_symbol_ids,
-            usize::from(a),
-            usize::from(b),
-        );
+        let toggled_symbol_ids: Vec<u16> = self.row_intermediate_symbol_ids.iter(usize::from(b)).collect();
 
-        for &intermediate_symbol_id in &*bref {
-            if aref.insert_or_remove_within_capacity(intermediate_symbol_id) {
-                self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
-                    .append_within_capacity(a);
-            } else {
-                let ret = self.intermediate_symbol_row_indices[usize::from(intermediate_symbol_id)]
-                    .remove_within_capacity(a);
-                debug_assert!(ret);
-            }
+        for intermediate_symbol_id in toggled_symbol_ids {
+            let present = self
+                .row_intermediate_symbol_ids
+                .toggle(a, intermediate_symbol_id);
+            self.intermediate_symbol_row_indices
+                .set_member(intermediate_symbol_id, a, present);
         }
     }
 }
@@ -134,10 +251,12 @@ impl Decoder {
                 let local_symbol_index =
                     self.inactive_intermediate_symbol_columns[usize::from(intermediate_symbol_id)];
 
-                workspace.row_intermediate_symbol_ids[usize::from(local_row_index)]
-                    .append_within_capacity(local_symbol_index);
-                workspace.intermediate_symbol_row_indices[usize::from(local_symbol_index)]
-                    .append_within_capacity(local_row_index);
+                workspace
+                    .row_intermediate_symbol_ids
+                    .set_member(local_row_index, local_symbol_index, true);
+                workspace
+                    .intermediate_symbol_row_indices
+                    .set_member(local_symbol_index, local_row_index, true);
             }
         }
 
@@ -171,17 +290,16 @@ impl Decoder {
 
     fn writeback_inactivated_gaussian_workspace(
         &mut self,
-        workspace: InactiveGaussianWorkspace,
+        workspace: &InactiveGaussianWorkspace,
         preserved_symbol_buffers: Vec<OrderedSet>,
     ) {
-        for (local_row_index, local_symbol_ids) in
-            workspace.row_intermediate_symbol_ids.iter().enumerate()
-        {
+        for local_row_index in 0..workspace.num_rows() {
             let buffer_index = self.inactive_buffer_indices_scratch[local_row_index];
-            let mut intermediate_symbol_ids = OrderedSet::new();
+            let mut intermediate_symbol_ids =
+                OrderedSet::with_universe_size(self.params.num_intermediate_symbols());
 
-            for &local_symbol_id in local_symbol_ids {
-                intermediate_symbol_ids.append(
+            for local_symbol_id in workspace.row_intermediate_symbol_ids.iter(local_row_index) {
+                intermediate_symbol_ids.append_within_capacity(
                     self.inactive_intermediate_symbol_ids_scratch[usize::from(local_symbol_id)],
                 );
             }
@@ -205,14 +323,13 @@ impl Decoder {
             *buffer_indices = preserved_buffer_indices;
         }
 
-        for (local_symbol_index, local_row_indices) in
-            workspace.intermediate_symbol_row_indices.iter().enumerate()
-        {
+        for local_symbol_index in 0..workspace.intermediate_symbol_row_indices.count() {
             let intermediate_symbol_id =
                 self.inactive_intermediate_symbol_ids_scratch[local_symbol_index];
             let symbol = &mut self.intermediate_symbol_state[usize::from(intermediate_symbol_id)];
 
-            for &local_row_index in local_row_indices {
+            for local_row_index in workspace.intermediate_symbol_row_indices.iter(local_symbol_index)
+            {
                 symbol.inactivated_insert(
                     self.inactive_buffer_indices_scratch[usize::from(local_row_index)],
                 );
@@ -244,8 +361,9 @@ impl Decoder {
             return false;
         }
 
-        let mut workspace = self.build_inactivated_gaussian_workspace();
-        let mut row_order: Vec<u16> = (0..workspace.row_intermediate_symbol_ids.len())
+        let workspace = self.build_inactivated_gaussian_workspace();
+        let mut workspace = workspace;
+        let mut row_order: Vec<u16> = (0..workspace.num_rows())
             .map(|row_index| row_index.try_into().unwrap())
             .collect();
         let pivot_count = self.inactive_intermediate_symbol_ids_scratch.len();
@@ -274,8 +392,9 @@ impl Decoder {
                 workspace.row_first_intermediate_symbol_id(reducing_row_index);
 
             self.inactive_reducee_buffer_indices_scratch.clear();
-            for &row_index in &workspace.intermediate_symbol_row_indices
-                [usize::from(pivot_intermediate_symbol_id)]
+            for row_index in workspace
+                .intermediate_symbol_row_indices
+                .iter(usize::from(pivot_intermediate_symbol_id))
             {
                 self.inactive_reducee_buffer_indices_scratch.push(row_index);
             }
@@ -298,7 +417,7 @@ impl Decoder {
         }
 
         let preserved_symbol_buffers = self.collect_preserved_inactivated_symbol_buffers();
-        self.writeback_inactivated_gaussian_workspace(workspace, preserved_symbol_buffers);
+        self.writeback_inactivated_gaussian_workspace(&workspace, preserved_symbol_buffers);
 
         for &buffer_index in &self.inactive_buffer_indices_scratch {
             let weight = self.buffer_state[usize::from(buffer_index)]
