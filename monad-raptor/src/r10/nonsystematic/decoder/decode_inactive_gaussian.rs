@@ -102,27 +102,6 @@ impl DenseSetCollection {
         }
     }
 
-    fn toggle(&mut self, set_index: u16, value: u16) -> bool {
-        let set_index = usize::from(set_index);
-        let value = usize::from(value);
-        debug_assert!(value < self.universe_size);
-        let word_index = value / u64::BITS as usize;
-        let bit_index = value % u64::BITS as usize;
-        let mask = 1u64 << bit_index;
-        let base = set_index * self.words_per_set;
-        let words = &mut self.words[base..base + self.words_per_set];
-
-        if (words[word_index] & mask) == 0 {
-            words[word_index] |= mask;
-            self.lens[set_index] += 1;
-            true
-        } else {
-            words[word_index] &= !mask;
-            self.lens[set_index] -= 1;
-            false
-        }
-    }
-
     fn iter(&self, set_index: usize) -> DenseSetIter<'_> {
         DenseSetIter::new(self.words(set_index))
     }
@@ -134,6 +113,37 @@ impl<'a> DenseSetIter<'a> {
             words,
             word_index: 0,
             current_word: 0,
+        }
+    }
+}
+
+fn update_column_membership_bits(
+    words: &mut [u64],
+    lens: &mut [u16],
+    words_per_set: usize,
+    row_word_index: usize,
+    row_mask: u64,
+    base_symbol_index: usize,
+    mut bits: u64,
+    present: bool,
+) {
+    while bits != 0 {
+        let bit_index = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+
+        let symbol_index = base_symbol_index + bit_index;
+        if symbol_index >= lens.len() {
+            break;
+        }
+
+        let word_offset = symbol_index * words_per_set + row_word_index;
+
+        if present {
+            words[word_offset] |= row_mask;
+            lens[symbol_index] += 1;
+        } else {
+            words[word_offset] &= !row_mask;
+            lens[symbol_index] -= 1;
         }
     }
 }
@@ -178,14 +188,72 @@ impl InactiveGaussianWorkspace {
     }
 
     fn row_xor_eq(&mut self, a: u16, b: u16) {
-        let toggled_symbol_ids: Vec<u16> = self.row_intermediate_symbol_ids.iter(usize::from(b)).collect();
+        let a_index = usize::from(a);
+        let b_index = usize::from(b);
+        debug_assert_ne!(a_index, b_index);
 
-        for intermediate_symbol_id in toggled_symbol_ids {
-            let present = self
-                .row_intermediate_symbol_ids
-                .toggle(a, intermediate_symbol_id);
-            self.intermediate_symbol_row_indices
-                .set_member(intermediate_symbol_id, a, present);
+        let row_words_per_set = self.row_intermediate_symbol_ids.words_per_set;
+        let row_a_start = a_index * row_words_per_set;
+        let row_b_start = b_index * row_words_per_set;
+
+        let row_words = &mut self.row_intermediate_symbol_ids.words;
+        let row_lens = &mut self.row_intermediate_symbol_ids.lens;
+        let row_len = &mut row_lens[a_index];
+
+        let (a_words, b_words): (&mut [u64], &[u64]) = if row_a_start < row_b_start {
+            let (before_b, b_and_after) = row_words.split_at_mut(row_b_start);
+            (
+                &mut before_b[row_a_start..row_a_start + row_words_per_set],
+                &b_and_after[..row_words_per_set],
+            )
+        } else {
+            let (before_a, a_and_after) = row_words.split_at_mut(row_a_start);
+            (
+                &mut a_and_after[..row_words_per_set],
+                &before_a[row_b_start..row_b_start + row_words_per_set],
+            )
+        };
+
+        let column_words = &mut self.intermediate_symbol_row_indices.words;
+        let column_lens = &mut self.intermediate_symbol_row_indices.lens;
+        let column_words_per_set = self.intermediate_symbol_row_indices.words_per_set;
+        let column_row_word_index = a_index / u64::BITS as usize;
+        let column_row_mask = 1u64 << (a_index % u64::BITS as usize);
+
+        for (word_index, &b_word) in b_words.iter().enumerate() {
+            if b_word == 0 {
+                continue;
+            }
+
+            let before = a_words[word_index];
+            let added = (!before) & b_word;
+            let removed = before & b_word;
+
+            a_words[word_index] = before ^ b_word;
+            *row_len += added.count_ones() as u16;
+            *row_len -= removed.count_ones() as u16;
+
+            let base_symbol_index = word_index * u64::BITS as usize;
+            update_column_membership_bits(
+                column_words,
+                column_lens,
+                column_words_per_set,
+                column_row_word_index,
+                column_row_mask,
+                base_symbol_index,
+                added,
+                true,
+            );
+            update_column_membership_bits(
+                column_words,
+                column_lens,
+                column_words_per_set,
+                column_row_word_index,
+                column_row_mask,
+                base_symbol_index,
+                removed,
+                false,
+            );
         }
     }
 }
