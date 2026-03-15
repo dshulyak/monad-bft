@@ -117,9 +117,9 @@ impl<'a> DenseSetIter<'a> {
     }
 }
 
-fn update_column_membership_bits(
-    words: &mut [u64],
-    lens: &mut [u16],
+unsafe fn update_column_membership_bits_unchecked(
+    words: *mut u64,
+    lens: *mut u16,
     words_per_set: usize,
     row_word_index: usize,
     row_mask: u64,
@@ -132,18 +132,18 @@ fn update_column_membership_bits(
         bits &= bits - 1;
 
         let symbol_index = base_symbol_index + bit_index;
-        if symbol_index >= lens.len() {
-            break;
-        }
-
         let word_offset = symbol_index * words_per_set + row_word_index;
 
         if present {
-            words[word_offset] |= row_mask;
-            lens[symbol_index] += 1;
+            unsafe {
+                *words.add(word_offset) |= row_mask;
+                *lens.add(symbol_index) += 1;
+            }
         } else {
-            words[word_offset] &= !row_mask;
-            lens[symbol_index] -= 1;
+            unsafe {
+                *words.add(word_offset) &= !row_mask;
+                *lens.add(symbol_index) -= 1;
+            }
         }
     }
 }
@@ -219,8 +219,21 @@ impl InactiveGaussianWorkspace {
         let column_words_per_set = self.intermediate_symbol_row_indices.words_per_set;
         let column_row_word_index = a_index / u64::BITS as usize;
         let column_row_mask = 1u64 << (a_index % u64::BITS as usize);
+        let column_words_ptr = column_words.as_mut_ptr();
+        let column_lens_ptr = column_lens.as_mut_ptr();
+        let last_word_index = row_words_per_set - 1;
+        let last_word_mask = match self.row_intermediate_symbol_ids.universe_size % u64::BITS as usize
+        {
+            0 => u64::MAX,
+            rem => (1u64 << rem) - 1,
+        };
 
-        for (word_index, &b_word) in b_words.iter().enumerate() {
+        for (word_index, &raw_b_word) in b_words.iter().enumerate() {
+            let b_word = if word_index == last_word_index {
+                raw_b_word & last_word_mask
+            } else {
+                raw_b_word
+            };
             if b_word == 0 {
                 continue;
             }
@@ -234,26 +247,29 @@ impl InactiveGaussianWorkspace {
             *row_len -= removed.count_ones() as u16;
 
             let base_symbol_index = word_index * u64::BITS as usize;
-            update_column_membership_bits(
-                column_words,
-                column_lens,
-                column_words_per_set,
-                column_row_word_index,
-                column_row_mask,
-                base_symbol_index,
-                added,
-                true,
-            );
-            update_column_membership_bits(
-                column_words,
-                column_lens,
-                column_words_per_set,
-                column_row_word_index,
-                column_row_mask,
-                base_symbol_index,
-                removed,
-                false,
-            );
+            // `b_word` is masked on the last partial word, so every bit maps to a valid symbol.
+            unsafe {
+                update_column_membership_bits_unchecked(
+                    column_words_ptr,
+                    column_lens_ptr,
+                    column_words_per_set,
+                    column_row_word_index,
+                    column_row_mask,
+                    base_symbol_index,
+                    added,
+                    true,
+                );
+                update_column_membership_bits_unchecked(
+                    column_words_ptr,
+                    column_lens_ptr,
+                    column_words_per_set,
+                    column_row_word_index,
+                    column_row_mask,
+                    base_symbol_index,
+                    removed,
+                    false,
+                );
+            }
         }
     }
 }
