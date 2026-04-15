@@ -306,7 +306,9 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     let logger_config: WALoggerConfig<LogFriendlyMonadEvent<_, _, _>> = WALoggerConfig::new(
         node_state.wal_path.clone(), // output wal path
         false,                       // flush on every write
-    );
+    )
+    .with_chunks(node_state.wal_chunks)
+    .with_chunk_size(node_state.wal_chunk_size_bytes);
     let Ok(mut wal) = logger_config.build() else {
         event!(
             Level::ERROR,

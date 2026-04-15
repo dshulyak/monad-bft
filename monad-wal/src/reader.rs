@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     fs::{File, OpenOptions},
     io::{BufReader, Read},
@@ -25,11 +26,103 @@ use std::{
 use monad_types::Deserializable;
 
 use crate::{
-    wal::{EventHeaderType, EVENT_HEADER_LEN},
+    wal::{
+        chunk_timestamp, discover_chunks, event_timestamp, DiscoveredChunk, EventHeaderType,
+        EventTimestampType,
+    },
     WALError,
 };
 
 const WAL_READ_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+
+#[derive(Debug)]
+struct ChunkReader {
+    timestamp: EventTimestampType,
+    reader: BufReader<File>,
+    exhausted: bool,
+}
+
+impl ChunkReader {
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        if self.exhausted {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+
+        let mut timestamp_buf = [0u8; std::mem::size_of::<EventTimestampType>()];
+        match self.reader.read_exact(&mut timestamp_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.exhausted = true;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+
+        let timestamp = EventTimestampType::from_le_bytes(timestamp_buf);
+        if timestamp < self.timestamp {
+            self.exhausted = true;
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+
+        let mut len_buf = [0u8; std::mem::size_of::<EventHeaderType>()];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.exhausted = true;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+
+        let len = EventHeaderType::from_le_bytes(len_buf) as usize;
+        if len == 0 {
+            self.exhausted = true;
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+
+        let mut buf = vec![0u8; len];
+        match self.reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.exhausted = true;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+        Ok(buf)
+    }
+}
+
+impl TryFrom<DiscoveredChunk> for ChunkReader {
+    type Error = WALError;
+
+    fn try_from(chunk: DiscoveredChunk) -> Result<Self, Self::Error> {
+        let file = OpenOptions::new().read(true).open(chunk.path)?;
+        Ok((file, event_timestamp(chunk.timestamp)).into())
+    }
+}
+
+impl From<(File, EventTimestampType)> for ChunkReader {
+    fn from((file, timestamp): (File, EventTimestampType)) -> Self {
+        Self {
+            timestamp,
+            reader: BufReader::with_capacity(WAL_READ_BUFFER_SIZE, file),
+            exhausted: false,
+        }
+    }
+}
+
+pub trait WALReadRaw {
+    fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error>;
+}
+
+pub trait WALRead<M> {
+    fn load_one(&mut self) -> Result<M, WALError>;
+}
 
 /// Config for a write-ahead-log
 #[derive(Clone)]
@@ -51,11 +144,13 @@ where
     }
 
     pub fn build(self) -> Result<WALReader<M>, WALError> {
-        let file = OpenOptions::new().read(true).open(self.file_path)?;
-
         Ok(WALReader {
             _marker: PhantomData,
-            reader: BufReader::with_capacity(WAL_READ_BUFFER_SIZE, file),
+            reader: (
+                OpenOptions::new().read(true).open(&self.file_path)?,
+                event_timestamp(chunk_timestamp(&self.file_path)?),
+            )
+                .into(),
         })
     }
 }
@@ -63,7 +158,7 @@ where
 #[derive(Debug)]
 pub struct WALReader<M> {
     _marker: PhantomData<M>,
-    reader: BufReader<File>,
+    reader: ChunkReader,
 }
 
 impl<M> WALReader<M>
@@ -71,24 +166,123 @@ where
     M: Deserializable<[u8]> + Debug,
 {
     pub fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error> {
-        let mut len_buf = [0u8; EVENT_HEADER_LEN];
-        self.reader.read_exact(&mut len_buf)?;
-        let len = EventHeaderType::from_le_bytes(len_buf);
-        let mut buf = vec![0u8; len as usize];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        self.reader.load_one_raw()
     }
 
     pub fn load_one(&mut self) -> Result<M, WALError> {
         let buf = self.load_one_raw()?;
-        let msg = M::deserialize(&buf).map_err(|e| WALError::DeserError(Box::new(e)))?;
-        Ok(msg)
+        M::deserialize(&buf).map_err(|e| WALError::DeserError(Box::new(e)))
     }
 }
 
-pub fn events_iter_raw<M>(mut reader: WALReader<M>) -> impl Iterator<Item = Vec<u8>>
+impl<M> WALReadRaw for WALReader<M>
 where
     M: Deserializable<[u8]> + Debug,
+{
+    fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        WALReader::load_one_raw(self)
+    }
+}
+
+impl<M> WALRead<M> for WALReader<M>
+where
+    M: Deserializable<[u8]> + Debug,
+{
+    fn load_one(&mut self) -> Result<M, WALError> {
+        WALReader::load_one(self)
+    }
+}
+
+/// Config for a multi-chunk write-ahead-log reader.
+#[derive(Clone)]
+pub struct WALClientConfig<M> {
+    file_path: PathBuf,
+
+    _marker: PhantomData<M>,
+}
+
+impl<M> WALClientConfig<M>
+where
+    M: Deserializable<[u8]> + Debug,
+{
+    pub fn new(file_path: PathBuf) -> Self {
+        Self {
+            file_path,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn build(self) -> Result<WALClient<M>, WALError> {
+        let discovered = discover_chunks(&self.file_path)?;
+        let readers = discovered
+            .into_iter()
+            .map(ChunkReader::try_from)
+            .collect::<Result<VecDeque<_>, _>>()?;
+
+        Ok(WALClient {
+            _marker: PhantomData,
+            readers,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WALClient<M> {
+    _marker: PhantomData<M>,
+    readers: VecDeque<ChunkReader>,
+}
+
+impl<M> WALClient<M>
+where
+    M: Deserializable<[u8]> + Debug,
+{
+    pub fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        loop {
+            let Some(reader) = self.readers.front_mut() else {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            };
+            if reader.is_exhausted() {
+                self.readers.pop_front();
+                continue;
+            }
+
+            match reader.load_one_raw() {
+                Ok(buf) => return Ok(buf),
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.readers.pop_front();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    pub fn load_one(&mut self) -> Result<M, WALError> {
+        let buf = self.load_one_raw()?;
+        M::deserialize(&buf).map_err(|e| WALError::DeserError(Box::new(e)))
+    }
+}
+
+impl<M> WALReadRaw for WALClient<M>
+where
+    M: Deserializable<[u8]> + Debug,
+{
+    fn load_one_raw(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        WALClient::load_one_raw(self)
+    }
+}
+
+impl<M> WALRead<M> for WALClient<M>
+where
+    M: Deserializable<[u8]> + Debug,
+{
+    fn load_one(&mut self) -> Result<M, WALError> {
+        WALClient::load_one(self)
+    }
+}
+
+pub fn events_iter_raw<R>(mut reader: R) -> impl Iterator<Item = Vec<u8>>
+where
+    R: WALReadRaw,
 {
     std::iter::repeat(()).map_while(move |()| match reader.load_one_raw() {
         Ok(event) => Some(event),
@@ -97,9 +291,10 @@ where
     })
 }
 
-pub fn events_iter<M>(mut reader: WALReader<M>) -> impl Iterator<Item = M>
+pub fn events_iter<M, R>(mut reader: R) -> impl Iterator<Item = M>
 where
     M: Deserializable<[u8]> + Debug,
+    R: WALRead<M>,
 {
     std::iter::repeat(()).map_while(move |()| match reader.load_one() {
         Ok(event) => Some(event),

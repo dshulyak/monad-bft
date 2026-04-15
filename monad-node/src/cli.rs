@@ -17,6 +17,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+const DEFAULT_WAL_CHUNKS: usize = 8;
+const DEFAULT_WAL_CHUNK_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "monad-node", about, long_about = None, version = monad_version::version!())]
 pub struct Cli {
@@ -47,6 +50,14 @@ pub struct Cli {
     /// Set the path where the write-ahead log will be stored
     #[arg(long)]
     pub wal_path: PathBuf,
+
+    /// Set the maximum number of WAL chunks to retain
+    #[arg(long, default_value_t = DEFAULT_WAL_CHUNKS)]
+    pub wal_chunks: usize,
+
+    /// Set the WAL chunk size in bytes
+    #[arg(long, default_value_t = DEFAULT_WAL_CHUNK_SIZE_BYTES)]
+    pub wal_chunk_size_bytes: u64,
 
     /// Set the path where consensus blocks will be stored
     #[arg(long)]
