@@ -71,7 +71,7 @@ use util::{
 use crate::{
     auth::NopScore,
     metrics::{
-        COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,
+        init_router_executor_metrics, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,
         COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT,
         GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS, GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED,
         GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS,
@@ -248,6 +248,7 @@ where
         let secondary_message_builder = OwnedMessageBuilder::new(config.shared_key.clone())
             .segment_size(segment_size)
             .redundancy(secondary_redundancy);
+        let peer_discovery_metrics = peer_discovery_driver.lock().unwrap().metrics().clone();
 
         Self {
             self_id,
@@ -281,8 +282,8 @@ where
             channel_from_secondary_outbound: None,
 
             waker: None,
-            metrics: Default::default(),
-            peer_discovery_metrics: Default::default(),
+            metrics: init_router_executor_metrics(),
+            peer_discovery_metrics,
             _phantom: PhantomData,
         }
     }
@@ -588,7 +589,9 @@ where
     ) {
         // fall back to raptorcast point-to-point when direct UDP is not configured.
         let Some(socket) = self.direct_udp_transport.as_mut() else {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
+                .inc();
             self.handle_publish(
                 RouterTarget::PointToPoint(target),
                 message,
@@ -608,7 +611,9 @@ where
 
             // Fall back when peer discovery doesn't have a direct UDP address for the target.
             let Some(discovered_addr) = discovered_addr else {
-                self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK] += 1;
+                self.metrics
+                    .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
+                    .inc();
                 self.handle_publish(
                     RouterTarget::PointToPoint(target),
                     message,
@@ -644,7 +649,9 @@ where
         let max_message_size = TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES;
 
         if payload_len > max_message_size {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE)
+                .inc();
             warn!(
                 ?target,
                 payload_len, max_message_size, "direct udp payload exceeds max message size"
@@ -656,7 +663,9 @@ where
             .write_buffered(&target_pubkey, outbound_message, priority)
             .is_ok()
         {
-            self.metrics[COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT] += 1;
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT)
+                .inc();
         } else {
             warn!(
                 ?target,
@@ -1140,11 +1149,13 @@ where
 
                 match sock.poll_unpin(cx) {
                     Poll::Ready(Ok(msg)) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED)
+                            .inc();
                         msg
                     }
                     Poll::Ready(Err(e)) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS] += 1;
+                        this.metrics.gauge(GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS).inc();
                         trace!(error=?e, "socket recv error");
                         continue;
                     }
@@ -1260,7 +1271,9 @@ where
                         }
                     },
                     Err(err) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS)
+                            .inc();
                         debug!(?from, ?err, "failed to deserialize message");
                     }
                 }
@@ -1345,7 +1358,9 @@ where
                 match InboundRouterMessage::<M, ST>::try_deserialize(&app_message_bytes) {
                     Ok(message) => message,
                     Err(err) => {
-                        this.metrics[GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS] += 1;
+                        this.metrics
+                            .gauge(GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS)
+                            .inc();
                         debug!(?err, ?src_addr, "failed to deserialize message");
                         this.dataplane_control.disconnect(src_addr);
                         continue;
@@ -1454,7 +1469,8 @@ where
                         send_peer_disc_msg(this, target, Some(name_record), message);
                     }
                     PeerDiscoveryEmit::MetricsCommand(executor_metrics) => {
-                        this.peer_discovery_metrics = executor_metrics;
+                        this.peer_discovery_metrics
+                            .copy_values_from(&executor_metrics);
                     }
                 }
             }
