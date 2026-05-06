@@ -387,6 +387,17 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     if let Some(version) = MONAD_NODE_VERSION {
         prometheus_labels.insert("version".to_owned(), version.to_owned());
     }
+    if let Some(metrics_config) = &node_state.metrics {
+        for label in &metrics_config.labels {
+            if prometheus_labels
+                .insert(label.key.clone(), label.value.clone())
+                .is_some()
+            {
+                error!(label = %label.key, "duplicate prometheus label");
+                return Err(());
+            }
+        }
+    }
 
     let prometheus_metrics = Arc::new(
         NodePrometheusMetrics::new(

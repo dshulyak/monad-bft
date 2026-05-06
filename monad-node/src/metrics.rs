@@ -22,6 +22,43 @@ use monad_consensus_types::metrics::Metrics as StateMetrics;
 use monad_executor::{metric_consts, ExecutorMetrics, ExecutorMetricsChain, Gauge};
 use prometheus::{Opts, Registry};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub key: String,
+    pub value: String,
+}
+
+pub fn parse_label(label: &str) -> Result<Label, String> {
+    let Some((key, value)) = label.split_once('=') else {
+        return Err("expected key=value".to_owned());
+    };
+
+    if key.is_empty() {
+        return Err("label key must not be empty".to_owned());
+    }
+
+    if !is_valid_label_key(key) {
+        return Err(format!(
+            "invalid label key {key:?}; expected [a-zA-Z_][a-zA-Z0-9_]*"
+        ));
+    }
+
+    Ok(Label {
+        key: key.to_owned(),
+        value: value.to_owned(),
+    })
+}
+
+fn is_valid_label_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    matches!(first, 'a'..='z' | 'A'..='Z' | '_')
+        && chars.all(|ch| matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
+}
+
 metric_consts! {
     pub GAUGE_TOTAL_UPTIME_US {
         name: "monad.total_uptime_us",
@@ -170,5 +207,48 @@ impl NodePrometheusMetrics {
         self.total_uptime
             .set(self.process_start.elapsed().as_micros() as u64);
         self.node_info.set(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_label, Label};
+
+    #[test]
+    fn parses_key_value_label() {
+        assert_eq!(
+            parse_label("network=devnet").expect("valid label"),
+            Label {
+                key: "network".to_owned(),
+                value: "devnet".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn allows_empty_label_value() {
+        assert_eq!(
+            parse_label("zone=").expect("valid label"),
+            Label {
+                key: "zone".to_owned(),
+                value: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        assert!(parse_label("network").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_label_key() {
+        assert!(parse_label("=devnet").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_label_key() {
+        assert!(parse_label("1network=devnet").is_err());
+        assert!(parse_label("network.name=devnet").is_err());
     }
 }
