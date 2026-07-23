@@ -667,6 +667,9 @@ where
         txs: Vec<Bytes>,
     },
 
+    /// Inserts transactions produced by a local subsystem, bypassing network ingress.
+    InsertLocalTxs { txs: Vec<Bytes> },
+
     EnterRound {
         epoch: Epoch,
         round: Round,
@@ -731,6 +734,9 @@ where
                 .field("sender", sender)
                 .field("txs", txs)
                 .finish(),
+            Self::InsertLocalTxs { txs } => {
+                f.debug_struct("InsertLocalTxs").field("txs", txs).finish()
+            }
             Self::EnterRound {
                 epoch,
                 round,

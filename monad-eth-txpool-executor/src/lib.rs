@@ -109,6 +109,8 @@ where
         delayed_execution_results: Vec<EPT::FinalizedHeader>,
     },
 
+    InsertLocalTxs(Vec<TxEnvelope>),
+
     EnterRound {
         epoch: Epoch,
         round: Round,
@@ -524,6 +526,41 @@ where
                         }
                     }
                 }
+                TxPoolExecutorCommand::InsertLocalTxs(txs) => {
+                    let _span = debug_span!("insert local txs", len = txs.len()).entered();
+                    let mut recovered_txs = Vec::with_capacity(txs.len());
+                    for tx in txs {
+                        match tx.secp256k1_recover() {
+                            Ok(signer) => recovered_txs.push((
+                                Recovered::new_unchecked(tx, signer),
+                                PoolTxKind::owned_default(),
+                            )),
+                            Err(_) => event_tracker
+                                .drop(*tx.tx_hash(), EthTxPoolDropReason::InvalidSignature),
+                        }
+                    }
+
+                    let mut inserted_addresses = HashSet::<Address>::default();
+                    let mut immediately_forwardable_txs = Vec::new();
+                    self.pool.insert_txs(
+                        &mut event_tracker,
+                        &self.block_policy,
+                        &mut self.state_read,
+                        &self.chain_config,
+                        recovered_txs,
+                        |tx| {
+                            inserted_addresses.insert(tx.signer());
+                            if tx.is_owned_and_forwardable() {
+                                immediately_forwardable_txs.push(tx.raw().clone_inner());
+                            }
+                        },
+                    );
+                    self.preload_manager.add_requests(inserted_addresses.iter());
+                    self.forwarding_manager
+                        .as_mut()
+                        .project()
+                        .add_egress_txs(immediately_forwardable_txs.iter());
+                }
                 TxPoolExecutorCommand::EnterRound {
                     epoch: _,
                     round,
@@ -791,7 +828,8 @@ mod test {
         time::Duration,
     };
 
-    use alloy_consensus::transaction::SignerRecoverable;
+    use alloy_consensus::{transaction::SignerRecoverable, TxEnvelope};
+    use alloy_eips::Decodable2718;
     use alloy_primitives::TxHash;
     use futures::StreamExt;
     use monad_chain_config::{revision::MockChainRevision, ChainConfig, MockChainConfig};
@@ -1060,6 +1098,42 @@ mod test {
         MockChainRevision,
     > {
         start_test_client_with_forwarded_ingress_config(ForwardedIngressFairQueueConfig::default())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_local_transaction_is_forwarded_and_proposed() {
+        let mut client = start_test_client();
+        let txs = make_forwarded_txs(0, 1);
+        client.exec(vec![TxPoolCommand::Reset {
+            last_delay_committed_blocks: vec![generate_block_with_txs(
+                GENESIS_ROUND,
+                GENESIS_SEQ_NUM,
+                MIN_BASE_FEE,
+                &MockChainConfig::DEFAULT,
+                vec![],
+            )],
+        }]);
+        client.insert_local_txs(
+            txs.iter()
+                .map(|tx| TxEnvelope::decode_2718_exact(tx).unwrap())
+                .collect(),
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("local transaction should be forwarded")
+            .expect("txpool stream should remain open");
+        assert!(matches!(
+            event,
+            MonadEvent::MempoolEvent(MempoolEvent::ForwardTxs(forwarded)) if forwarded == txs
+        ));
+
+        client.exec(vec![proposal_command(GENESIS_ROUND + Round(1))]);
+        let event = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("local transaction should be proposed")
+            .expect("txpool stream should remain open");
+        assert_eq!(collect_forwarded_txs(event), txs);
     }
 
     #[tokio::test(flavor = "current_thread")]

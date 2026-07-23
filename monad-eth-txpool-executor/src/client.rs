@@ -15,6 +15,7 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, task::Poll};
 
+use alloy_consensus::TxEnvelope;
 use bytes::Bytes;
 use futures::Stream;
 use itertools::{Either, Itertools};
@@ -289,6 +290,13 @@ where
         if self.event_rx.is_closed() {
             panic!("EthTxPoolExecutorClient event_tx dropped!");
         }
+    }
+
+    pub fn insert_local_txs(&mut self, txs: Vec<TxEnvelope>) {
+        self.verify_handle_liveness();
+        self.command_tx
+            .try_send(vec![TxPoolExecutorCommand::InsertLocalTxs(txs)])
+            .expect("EthTxPoolExecutorClient executor is lagging");
     }
 
     fn enqueue_forwarded(&mut self, forwarded: Vec<ForwardedTxs<SCT>>) {
