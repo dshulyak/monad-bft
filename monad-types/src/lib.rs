@@ -422,6 +422,14 @@ impl SeqNum {
         (*self).to_epoch(epoch_length) + Epoch(1)
     }
 
+    pub fn latest_locked_epoch(&self, epoch_length: SeqNum) -> Epoch {
+        if self.is_boundary_block(epoch_length) {
+            self.get_locked_epoch(epoch_length)
+        } else {
+            self.to_epoch(epoch_length)
+        }
+    }
+
     pub fn as_u64(&self) -> u64 {
         self.0
     }
@@ -1040,6 +1048,13 @@ mod test {
     #[test_case(SeqNum(200), Epoch(3), SeqNum(100); "sn_200_epoch_3")]
     fn test_epoch_conversion(seq_num: SeqNum, expected_epoch: Epoch, epoch_length: SeqNum) {
         assert_eq!(seq_num.to_epoch(epoch_length), expected_epoch);
+    }
+
+    #[test_case(SeqNum(748), Epoch(5))]
+    #[test_case(SeqNum(749), Epoch(6))]
+    #[test_case(SeqNum(750), Epoch(6))]
+    fn latest_locked_epoch(seq_num: SeqNum, expected: Epoch) {
+        assert_eq!(seq_num.latest_locked_epoch(SeqNum(150)), expected);
     }
 
     #[test_case(Round(11), Round(10) => true; "normal_successor")]

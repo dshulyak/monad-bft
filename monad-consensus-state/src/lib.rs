@@ -1766,7 +1766,12 @@ where
             .get_epoch(round)
             .expect("current epoch exists");
         let Some(validator_set) = self.val_epoch_map.get_val_set(&epoch) else {
-            todo!("handle non-existent validatorset for next round epoch");
+            debug!(
+                ?epoch,
+                ?round,
+                "cannot propose before current epoch validator set is available"
+            );
+            return cmds;
         };
 
         let leader = &self.election.get_leader(round, validator_set.get_members());
@@ -2016,18 +2021,19 @@ where
         (self.consensus.get_current_round().0 + (if INCLUDE_CURRENT_ROUND { 0 } else { 1 })..)
             .take(NUM_ROUNDS)
             .map(Round)
-            .map(|round| {
+            .filter_map(|round| {
                 let epoch = self.epoch_manager.get_epoch(round).expect("epoch exists");
 
                 let Some(next_validator_set) = self.val_epoch_map.get_val_set(&epoch) else {
-                    todo!("handle non-existent validatorset for next k round epoch");
+                    debug!(?epoch, ?round, "future validator set not available yet");
+                    return None;
                 };
 
                 let leader = self
                     .election
                     .get_leader(round, next_validator_set.get_members());
 
-                (leader, round)
+                Some((leader, round))
             })
     }
 
@@ -5835,6 +5841,73 @@ mod test {
                 (1..).take(NUM_LEADERS_SELF_UPCOMING).collect_vec()
             );
         }
+    }
+
+    #[test]
+    fn test_upcoming_leaders_skip_epoch_without_validator_set() {
+        let (_, mut ctx) = setup::<
+            SignatureType,
+            SignatureCollectionType,
+            BlockPolicyType,
+            ExecutionStateReadType,
+            BlockValidatorType,
+            _,
+            _,
+        >(
+            4,
+            ValidatorSetFactory::default(),
+            SimpleRoundRobin::default(),
+            || EthBlockPolicy::new(GENESIS_SEQ_NUM, SeqNum::MAX.0),
+            || InMemoryStateInner::genesis(SeqNum::MAX),
+            EthBlockValidator::default,
+            SeqNum::MAX,
+        );
+        ctx[0].epoch_manager = EpochManager::new(
+            EPOCH_LENGTH,
+            EPOCH_START_DELAY,
+            &[(Epoch(1), Round(0)), (Epoch(3), Round(2))],
+        );
+
+        let upcoming = ctx[0]
+            .wrapped_state()
+            .compute_upcoming_leader_round_pairs::<true, NUM_LEADERS_SELF_UPCOMING>()
+            .collect_vec();
+
+        assert_eq!(upcoming.len(), 1);
+        assert_eq!(upcoming[0].1, Round(1));
+    }
+
+    #[test]
+    fn test_try_propose_skips_epoch_without_validator_set() {
+        let (_, mut ctx) = setup::<
+            SignatureType,
+            SignatureCollectionType,
+            BlockPolicyType,
+            ExecutionStateReadType,
+            BlockValidatorType,
+            _,
+            _,
+        >(
+            4,
+            ValidatorSetFactory::default(),
+            SimpleRoundRobin::default(),
+            || EthBlockPolicy::new(GENESIS_SEQ_NUM, SeqNum::MAX.0),
+            || InMemoryStateInner::genesis(SeqNum::MAX),
+            EthBlockValidator::default,
+            SeqNum::MAX,
+        );
+        ctx[0].epoch_manager = EpochManager::new(
+            EPOCH_LENGTH,
+            EPOCH_START_DELAY,
+            &[(Epoch(1), Round(0)), (Epoch(3), Round(1))],
+        );
+
+        assert_eq!(ctx[0].consensus_state.get_current_round(), Round(1));
+        assert_eq!(ctx[0].epoch_manager.get_epoch(Round(1)), Some(Epoch(3)));
+        assert!(ctx[0].val_epoch_map.get_val_set(&Epoch(3)).is_none());
+
+        let cmds = ctx[0].wrapped_state().try_propose();
+        assert!(cmds.is_empty());
     }
 
     #[test]

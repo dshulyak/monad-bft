@@ -1556,7 +1556,11 @@ where
         for epoch_valset in locked_epoch_validators {
             let locked_epoch = epoch_valset.epoch;
 
-            if locked_epoch >= self.consensus_config.chain_config.get_staking_activation() {
+            if locked_epoch >= self.consensus_config.chain_config.get_staking_activation()
+                && locked_epoch
+                    <= delay_seq_num
+                        .latest_locked_epoch(self.consensus_config.chain_config.get_epoch_length())
+            {
                 let expected_val_data: BTreeMap<
                     NodeId<SCT::NodeIdPubKey>,
                     (Stake, SignatureCollectionPubKeyType<SCT>),
@@ -1572,7 +1576,7 @@ where
                     (Stake, SignatureCollectionPubKeyType<SCT>),
                 > = self
                     .state_read
-                    .read_valset_at_block(delay_seq_num, locked_epoch) // TODO use root_seq_num here
+                    .read_valset_at_block(delay_seq_num, locked_epoch)
                     .into_iter()
                     .map(|(pubkey, cert_pubkey, stake)| (NodeId::new(pubkey), (stake, cert_pubkey)))
                     .collect();

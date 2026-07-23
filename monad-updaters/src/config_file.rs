@@ -182,14 +182,21 @@ where
 
     fn write_validator_set(&mut self, new_validator_set: ValidatorSetDataWithEpoch<SCT>) {
         let epoch = new_validator_set.epoch;
-        let validator_sets = if let Some(last_validator_set) =
-            self.last_validator_set.replace(new_validator_set.clone())
-        {
+        let validator_sets = if let Some(last_validator_set) = &self.last_validator_set {
+            if epoch == last_validator_set.epoch {
+                assert!(
+                    new_validator_set == *last_validator_set,
+                    "conflicting validator set update for epoch {}",
+                    epoch.0
+                );
+                return;
+            }
             assert_eq!(epoch, last_validator_set.epoch + Epoch(1));
-            vec![last_validator_set, new_validator_set]
+            vec![last_validator_set.clone(), new_validator_set.clone()]
         } else {
-            vec![new_validator_set]
+            vec![new_validator_set.clone()]
         };
+        self.last_validator_set = Some(new_validator_set);
 
         let validators_config_file = ValidatorsConfigFile { validator_sets };
         let validators_str = toml::to_string_pretty(&validators_config_file)
