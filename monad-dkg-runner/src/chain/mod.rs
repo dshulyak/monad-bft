@@ -1,5 +1,6 @@
 //! Finalized contract reads, event delivery, and transaction submission.
 
+use alloy_consensus::TxEnvelope;
 use alloy_primitives::Address;
 use bytes::Bytes;
 use dkg_protocol::{ChainCall, ChainEvent};
@@ -10,6 +11,10 @@ use crate::DkgError;
 mod bindings;
 mod recovery;
 mod submitter;
+mod triedb;
+mod triedb_state;
+
+pub use triedb::new_triedb_manager;
 
 pub(crate) use recovery::{read_chain, ChainEventBatch, ChainEventReader, ChainEventSession};
 pub(crate) use submitter::TxSubmitter;
@@ -34,8 +39,8 @@ pub struct DkgTransactionContext {
     pub base_fee_per_gas: u64,
 }
 
-/// Raw signed transaction bytes prepared for insertion into the local txpool.
-pub type DkgLocalTransaction = Bytes;
+/// Signed Ethereum transaction prepared for insertion into the local txpool.
+pub type DkgLocalTransaction = TxEnvelope;
 
 /// The only boundary between the DKG manager and chain-specific I/O.
 ///
