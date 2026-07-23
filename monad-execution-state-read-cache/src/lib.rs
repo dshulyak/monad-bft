@@ -24,8 +24,12 @@ use itertools::Itertools;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
-use monad_execution_state_read::{ExecutionStateRead, ExecutionStateReadError};
+use monad_eth_types::{EthAccount, EthHeader, ReceiptWithLogIndex};
+use monad_ethcall::CallResult;
+use monad_execution_state_read::{
+    ExecutionStateRead, ExecutionStateReadError, ExecutionStateReadExt, ExecutionStateReadExtError,
+    FinalizedEthCallRequest,
+};
 use monad_types::{BlockId, DropTimer, Epoch, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use tracing::warn;
@@ -203,5 +207,45 @@ where
 
     fn total_db_lookups(&self) -> u64 {
         self.state_read.total_db_lookups()
+    }
+}
+
+impl<ST, SCT, ESRT> ExecutionStateReadExt<ST, SCT> for ExecutionStateReadCache<ST, SCT, ESRT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    ESRT: ExecutionStateReadExt<ST, SCT>,
+{
+    fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.state_read.get_latest_block_header()
+    }
+
+    fn get_finalized_account(
+        &mut self,
+        block: SeqNum,
+        address: Address,
+    ) -> Result<Option<EthAccount>, ExecutionStateReadExtError> {
+        self.state_read.get_finalized_account(block, address)
+    }
+
+    fn get_finalized_block_header(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.state_read.get_finalized_block_header(block)
+    }
+
+    fn get_finalized_receipts(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError> {
+        self.state_read.get_finalized_receipts(block)
+    }
+
+    fn eth_call(
+        &mut self,
+        request: FinalizedEthCallRequest,
+    ) -> Result<CallResult, ExecutionStateReadExtError> {
+        self.state_read.eth_call(request)
     }
 }

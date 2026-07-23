@@ -31,8 +31,15 @@ pub mod serde;
 
 pub const EMPTY_RLP_TX_LIST: u8 = 0xc0;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 10000;
+pub const BASE_FEE_SAFETY_NUMERATOR: u128 = 3;
+pub const BASE_FEE_SAFETY_DENOMINATOR: u128 = 2;
 const MAX_OMMERS: usize = 0;
 const MAX_WITHDRAWALS: usize = 0;
+
+/// Applies the base-fee safety buffer used when RPC fills EIP-1559 fees.
+pub const fn buffered_base_fee_per_gas(base_fee_per_gas: u128) -> u128 {
+    base_fee_per_gas.saturating_mul(BASE_FEE_SAFETY_NUMERATOR) / BASE_FEE_SAFETY_DENOMINATOR
+}
 
 pub type EthAddress = [u8; 20];
 pub type EthStorageKey = [u8; 32];
@@ -358,6 +365,16 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn buffered_base_fee_matches_rpc_safety_margin() {
+        assert_eq!(buffered_base_fee_per_gas(100), 150);
+        assert_eq!(buffered_base_fee_per_gas(101), 151);
+        assert_eq!(
+            buffered_base_fee_per_gas(u128::MAX),
+            u128::MAX / BASE_FEE_SAFETY_DENOMINATOR
+        );
+    }
 
     #[derive(Debug, RlpEncodable, RlpDecodable)]
     struct ProposedEthHeaderCancun {

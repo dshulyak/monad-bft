@@ -1133,7 +1133,7 @@ impl Triedb for TriedbEnv {
     }
 }
 
-fn parse_rlp_entries<T>(rlp_entries: Vec<TraverseEntry>) -> Result<Vec<T>, String>
+pub(crate) fn parse_rlp_entries<T>(rlp_entries: Vec<TraverseEntry>) -> Result<Vec<T>, String>
 where
     T: alloy_rlp::Decodable,
 {

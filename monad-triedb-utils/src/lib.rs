@@ -29,10 +29,17 @@ use futures::{channel::oneshot, executor::block_on, future::join_all, FutureExt}
 use key::Version;
 use monad_bls::{BlsPubKey, BlsSignatureCollection};
 use monad_crypto::certificate_signature::PubKey;
-use monad_eth_types::{EthAccount, EthHeader};
-use monad_execution_state_read::{ExecutionStateRead, ExecutionStateReadError};
+use monad_eth_types::{EthAccount, EthHeader, ReceiptWithLogIndex};
+use monad_ethcall::{
+    eth_call, ffi::PoolConfig, CallResult, EthCallExecutor, EthCallRequest, MonadTracer,
+    StateOverrideSet,
+};
+use monad_execution_state_read::{
+    ExecutionStateRead, ExecutionStateReadError, ExecutionStateReadExt, ExecutionStateReadExtError,
+    FinalizedEthCallRequest,
+};
 use monad_secp::SecpSignature;
-use monad_triedb::TriedbHandle;
+use monad_triedb::{TraverseEntry, TriedbHandle};
 use monad_types::{BlockId, Epoch, Hash, SeqNum, Stake};
 use tracing::{debug, trace, warn};
 
@@ -54,6 +61,7 @@ pub struct TriedbReader {
     /// read-only and an async executor which is mutated to submit async tasks.
     handle: TriedbHandle,
     state_read_total_lookups: Arc<AtomicU64>,
+    eth_call_executor: Option<EthCallExecutor>,
 }
 
 impl TriedbReader {
@@ -67,7 +75,44 @@ impl TriedbReader {
         TriedbHandle::try_new(triedb_path, RODB_NODE_LRU_MAX_MEM).map(|handle| Self {
             handle,
             state_read_total_lookups: Default::default(),
+            eth_call_executor: None,
         })
+    }
+
+    pub fn try_new_with_eth_call(
+        triedb_path: &Path,
+        low_pool_config: PoolConfig,
+        high_pool_config: PoolConfig,
+        block_pool_config: PoolConfig,
+        tx_exec_num_fibers: u32,
+        node_lru_max_mem: u64,
+    ) -> Option<Self> {
+        let mut reader = Self::try_new(triedb_path)?;
+        reader.eth_call_executor = Some(EthCallExecutor::new(
+            low_pool_config,
+            high_pool_config,
+            block_pool_config,
+            tx_exec_num_fibers,
+            node_lru_max_mem,
+            triedb_path,
+        ));
+        Some(reader)
+    }
+
+    fn ensure_finalized_available(&self, block: SeqNum) -> Result<(), ExecutionStateReadExtError> {
+        let Some(latest) = self.get_latest_finalized_block() else {
+            return Err(ExecutionStateReadExtError::NotAvailableYet);
+        };
+        if block > latest {
+            return Err(ExecutionStateReadExtError::NotAvailableYet);
+        }
+        if self
+            .get_earliest_finalized_block()
+            .is_some_and(|earliest| block < earliest)
+        {
+            return Err(ExecutionStateReadExtError::NeverAvailable);
+        }
+        Ok(())
     }
 
     pub fn get_latest_voted_block(&self) -> Option<SeqNum> {
@@ -138,6 +183,18 @@ impl TriedbReader {
         let block_header = Header::decode(&mut rlp_buf).expect("invalid rlp eth header");
 
         Some(EthHeader(block_header))
+    }
+
+    pub fn get_latest_proposed_eth_header(&self) -> Option<EthHeader> {
+        // Read the id twice so the id/height pair cannot straddle a proposal
+        // update. A transient mismatch is retried by the caller.
+        let block_id_before = self.get_latest_proposed_block_id()?;
+        let seq_num = self.get_latest_proposed_block()?;
+        let block_id_after = self.get_latest_proposed_block_id()?;
+        if block_id_before != block_id_after {
+            return None;
+        }
+        self.get_proposed_eth_header(&block_id_before, &seq_num)
     }
 
     // for accessing Version::Proposed, bft_id MUST BE VERIFIED
@@ -384,5 +441,85 @@ impl ExecutionStateRead<SecpSignature, BlsSignatureCollection<monad_secp::PubKey
     fn total_db_lookups(&self) -> u64 {
         self.state_read_total_lookups
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ExecutionStateReadExt<SecpSignature, BlsSignatureCollection<monad_secp::PubKey>>
+    for TriedbReader
+{
+    fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.get_latest_proposed_eth_header()
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)
+    }
+
+    fn get_finalized_account(
+        &mut self,
+        block: SeqNum,
+        address: Address,
+    ) -> Result<Option<EthAccount>, ExecutionStateReadExtError> {
+        self.ensure_finalized_available(block)?;
+        Ok(self.get_account_finalized(&block, address.as_ref()))
+    }
+
+    fn get_finalized_block_header(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.ensure_finalized_available(block)?;
+        self.get_finalized_eth_header(&block)
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)
+    }
+
+    fn get_finalized_receipts(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError> {
+        self.ensure_finalized_available(block)?;
+        let (sender, receiver) = oneshot::channel();
+        let (key, key_len_nibbles) =
+            create_triedb_key(Version::Finalized, KeyInput::ReceiptIndex(None));
+        self.handle
+            .traverse_triedb_sync(&key, key_len_nibbles, block.0, sender);
+        let entries: Vec<TraverseEntry> = block_on(receiver)
+            .map_err(|err| ExecutionStateReadExtError::Read(err.to_string()))?
+            .ok_or_else(|| {
+                ExecutionStateReadExtError::Read(format!(
+                    "receipt traversal returned no result for block {}",
+                    block.0
+                ))
+            })?;
+        triedb_env::parse_rlp_entries(entries).map_err(ExecutionStateReadExtError::Read)
+    }
+
+    fn eth_call(
+        &mut self,
+        request: FinalizedEthCallRequest,
+    ) -> Result<CallResult, ExecutionStateReadExtError> {
+        self.ensure_finalized_available(request.block)?;
+        let mut header = self
+            .get_finalized_eth_header(&request.block)
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)?
+            .0;
+        // Match RPC eth_call semantics when no gas price is supplied.
+        header.base_fee_per_gas = Some(0);
+        let executor = self
+            .eth_call_executor
+            .as_ref()
+            .ok_or(ExecutionStateReadExtError::Unsupported)?;
+        let overrides = StateOverrideSet::default();
+        Ok(block_on(eth_call(
+            EthCallRequest {
+                chain_id: request.chain_id,
+                transaction: &request.transaction,
+                block_header: &header,
+                sender: request.sender,
+                block_number: request.block.0,
+                block_id: None,
+                state_override_set: &overrides,
+                tracer: MonadTracer::NoopTracer,
+                gas_specified: request.gas_specified,
+            },
+            executor,
+        )))
     }
 }

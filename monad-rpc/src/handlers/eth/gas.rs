@@ -26,6 +26,7 @@ use alloy_primitives::{Address, Signature, TxKind, U256, U64, U8};
 use alloy_rpc_types::{FeeHistory, TransactionReceipt};
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use monad_eth_types::buffered_base_fee_per_gas;
 use monad_ethcall::{
     CallResult, EthCallExecutor, EthCallRequest, MonadTracer, StateOverrideObject, StateOverrideSet,
 };
@@ -507,11 +508,12 @@ async fn fill_transaction_with_provider<T: Triedb>(
         tx.nonce = Some(U64::from(account.nonce));
     }
 
-    let base_fee = U256::from(header.base_fee_per_gas.unwrap_or_default());
+    let latest_base_fee = header.base_fee_per_gas.unwrap_or_default();
+    let base_fee = U256::from(latest_base_fee);
     let (fill_base_fee, suggested_priority_fee) = match &tx.gas_price_details {
         GasPriceDetails::Legacy { .. } => (base_fee, None),
         GasPriceDetails::Eip1559 { .. } => (
-            base_fee.saturating_mul(U256::from(3)) / U256::from(2),
+            U256::from(buffered_base_fee_per_gas(u128::from(latest_base_fee))),
             Some(U256::from(
                 suggested_priority_fee().await.unwrap_or_default(),
             )),

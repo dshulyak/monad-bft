@@ -12,6 +12,7 @@ bench = false
 monad-bls = { workspace = true }
 monad-crypto = { workspace = true }
 monad-eth-types = { workspace = true }
+monad-ethcall = { workspace = true }
 monad-execution-state-read = { workspace = true }
 monad-secp = { workspace = true }
 monad-triedb = { workspace = true }

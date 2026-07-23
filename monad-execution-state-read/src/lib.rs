@@ -20,7 +20,8 @@ use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
+use monad_eth_types::{EthAccount, EthHeader, ReceiptWithLogIndex};
+use monad_ethcall::{CallResult, ChainId};
 use monad_types::{BlockId, Epoch, Round, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 
@@ -40,6 +41,31 @@ pub enum ExecutionStateReadError {
     NotAvailableYet,
     /// will never be available
     NeverAvailable,
+}
+
+/// An owned eth-call request against one finalized execution boundary.
+///
+/// The state reader supplies the block header and state from `block`; callers
+/// only supply the transaction inputs that are independent of storage.
+#[derive(Clone, Debug)]
+pub struct FinalizedEthCallRequest {
+    pub chain_id: ChainId,
+    pub transaction: TxEnvelope,
+    pub sender: Address,
+    pub block: SeqNum,
+    pub gas_specified: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutionStateReadExtError {
+    #[error("execution state is not available yet")]
+    NotAvailableYet,
+    #[error("execution state will never be available")]
+    NeverAvailable,
+    #[error("extended execution-state reads are not supported")]
+    Unsupported,
+    #[error("extended execution-state read failed: {0}")]
+    Read(String),
 }
 
 /// A read-only view of block state.
@@ -75,6 +101,45 @@ where
     ) -> Vec<(SCT::NodeIdPubKey, SignatureCollectionPubKeyType<SCT>, Stake)>;
 
     fn total_db_lookups(&self) -> u64;
+}
+
+/// Extended state access for consumers that need the latest block header,
+/// contract execution, and receipt logs in addition to the consensus/txpool
+/// account interface.
+///
+/// Implementations are synchronous because they are owned by the existing
+/// execution-state reader thread. Async consumers should submit work through
+/// [`ExecutionStateReadThreadClient`] rather than execute storage reads on a
+/// Tokio worker.
+pub trait ExecutionStateReadExt<ST, SCT>: ExecutionStateRead<ST, SCT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+{
+    /// Returns the latest proposed block header, matching the execution
+    /// boundary used by RPC's `latest` block tag.
+    fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError>;
+
+    fn get_finalized_account(
+        &mut self,
+        block: SeqNum,
+        address: Address,
+    ) -> Result<Option<EthAccount>, ExecutionStateReadExtError>;
+
+    fn get_finalized_block_header(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<EthHeader, ExecutionStateReadExtError>;
+
+    fn get_finalized_receipts(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError>;
+
+    fn eth_call(
+        &mut self,
+        request: FinalizedEthCallRequest,
+    ) -> Result<CallResult, ExecutionStateReadExtError>;
 }
 
 pub trait MockExecution<ST, SCT>

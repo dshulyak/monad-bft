@@ -13,25 +13,24 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{
-    marker::PhantomData,
-    sync::{mpsc, Arc},
-};
+use std::sync::{mpsc, Arc};
 
 use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
+use monad_eth_types::{EthAccount, EthHeader, ReceiptWithLogIndex};
+use monad_ethcall::CallResult;
 use monad_types::{BlockId, Epoch, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use tracing::warn;
 
-use crate::{ExecutionStateRead, ExecutionStateReadError};
+use crate::{
+    ExecutionStateRead, ExecutionStateReadError, ExecutionStateReadExt, ExecutionStateReadExtError,
+    FinalizedEthCallRequest,
+};
 
-// Since the ExecutionStateReadThreadClient is synchronous, it will only allow one inflight request
-// per sync context so a value of 16 allows 16 threads to simulatneously make execution state read
-// requests.
+// Each synchronous caller has at most one in-flight request.
 const MAX_INFLIGHT_REQUESTS: usize = 16;
 
 enum ExecutionStateReadThreadRequest<ST, SCT>
@@ -72,6 +71,106 @@ where
     TotalDbLookups {
         tx: mpsc::SyncSender<u64>,
     },
+    Extended(ExecutionStateReadExtThreadRequest),
+}
+
+enum ExecutionStateReadExtThreadRequest {
+    GetLatestBlockHeader {
+        tx: mpsc::SyncSender<Result<EthHeader, ExecutionStateReadExtError>>,
+    },
+    GetFinalizedAccount {
+        block: SeqNum,
+        address: Address,
+        tx: mpsc::SyncSender<Result<Option<EthAccount>, ExecutionStateReadExtError>>,
+    },
+    GetFinalizedBlockHeader {
+        block: SeqNum,
+        tx: mpsc::SyncSender<Result<EthHeader, ExecutionStateReadExtError>>,
+    },
+    GetFinalizedReceipts {
+        block: SeqNum,
+        tx: mpsc::SyncSender<Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError>>,
+    },
+    EthCall {
+        request: FinalizedEthCallRequest,
+        tx: mpsc::SyncSender<Result<CallResult, ExecutionStateReadExtError>>,
+    },
+}
+
+impl ExecutionStateReadExtThreadRequest {
+    fn execute<ST, SCT>(self, state_read: &mut impl ExecutionStateReadExt<ST, SCT>)
+    where
+        ST: CertificateSignatureRecoverable,
+        SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    {
+        match self {
+            Self::GetLatestBlockHeader { tx } => {
+                let _ = tx.send(state_read.get_latest_block_header());
+            }
+            Self::GetFinalizedAccount { block, address, tx } => {
+                let _ = tx.send(state_read.get_finalized_account(block, address));
+            }
+            Self::GetFinalizedBlockHeader { block, tx } => {
+                let _ = tx.send(state_read.get_finalized_block_header(block));
+            }
+            Self::GetFinalizedReceipts { block, tx } => {
+                let _ = tx.send(state_read.get_finalized_receipts(block));
+            }
+            Self::EthCall { request, tx } => {
+                let _ = tx.send(state_read.eth_call(request));
+            }
+        }
+    }
+}
+
+impl<ST, SCT> ExecutionStateReadThreadRequest<ST, SCT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+{
+    fn execute(self, state_read: &mut impl ExecutionStateReadExt<ST, SCT>) {
+        match self {
+            Self::GetAccountStatuses {
+                block_id,
+                seq_num,
+                is_finalized,
+                addresses,
+                tx,
+            } => tx
+                .send(state_read.get_account_statuses(
+                    &block_id,
+                    &seq_num,
+                    is_finalized,
+                    addresses.iter(),
+                ))
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::GetExecutionResult {
+                block_id,
+                seq_num,
+                is_finalized,
+                tx,
+            } => tx
+                .send(state_read.get_execution_result(&block_id, &seq_num, is_finalized))
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::RawReadEarliestFinalizedBlock { tx } => tx
+                .send(state_read.raw_read_earliest_finalized_block())
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::RawReadLatestFinalizedBlock { tx } => tx
+                .send(state_read.raw_read_latest_finalized_block())
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::ReadValidatorSetAtBlock {
+                block_num,
+                requested_epoch,
+                tx,
+            } => tx
+                .send(state_read.read_valset_at_block(block_num, requested_epoch))
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::TotalDbLookups { tx } => tx
+                .send(state_read.total_db_lookups())
+                .expect("ExecutionStateReadThreadClient is alive"),
+            Self::Extended(request) => request.execute(state_read),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -91,12 +190,17 @@ where
 {
     pub fn new<ESRT>(state_read: impl FnOnce() -> ESRT + Send + 'static) -> Self
     where
-        ESRT: ExecutionStateRead<ST, SCT>,
+        ESRT: ExecutionStateReadExt<ST, SCT>,
     {
-        let (request_tx, request_rx) = mpsc::sync_channel(MAX_INFLIGHT_REQUESTS);
+        let (request_tx, request_rx) =
+            mpsc::sync_channel::<ExecutionStateReadThreadRequest<ST, SCT>>(MAX_INFLIGHT_REQUESTS);
 
         let handle = Arc::new(std::thread::spawn(move || {
-            ExecutionStateReadThread::new(state_read, request_rx).run()
+            let mut state_read = state_read();
+            for request in request_rx {
+                request.execute(&mut state_read);
+            }
+            warn!("ExecutionStateReadThread terminating");
         }));
 
         Self { handle, request_tx }
@@ -186,95 +290,63 @@ where
     }
 }
 
-struct ExecutionStateReadThread<ST, SCT, ESRT>
+impl<ST, SCT> ExecutionStateReadExt<ST, SCT> for ExecutionStateReadThreadClient<ST, SCT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    ESRT: ExecutionStateRead<ST, SCT>,
 {
-    state_read: ESRT,
-    request_rx: mpsc::Receiver<ExecutionStateReadThreadRequest<ST, SCT>>,
-
-    _phantom: PhantomData<(ST, SCT)>,
-}
-
-impl<ST, SCT, ESRT> ExecutionStateReadThread<ST, SCT, ESRT>
-where
-    ST: CertificateSignatureRecoverable,
-    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    ESRT: ExecutionStateRead<ST, SCT>,
-{
-    fn new(
-        state_read: impl FnOnce() -> ESRT + Send + 'static,
-        request_rx: mpsc::Receiver<ExecutionStateReadThreadRequest<ST, SCT>>,
-    ) -> Self {
-        let state_read = state_read();
-
-        Self {
-            state_read,
-            request_rx,
-
-            _phantom: PhantomData,
-        }
+    fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.send_and_recv_request(|tx| {
+            ExecutionStateReadThreadRequest::Extended(
+                ExecutionStateReadExtThreadRequest::GetLatestBlockHeader { tx },
+            )
+        })
     }
 
-    fn run(self) {
-        let Self {
-            mut state_read,
-            request_rx,
-            ..
-        } = self;
+    fn get_finalized_account(
+        &mut self,
+        block: SeqNum,
+        address: Address,
+    ) -> Result<Option<EthAccount>, ExecutionStateReadExtError> {
+        self.send_and_recv_request(|tx| {
+            ExecutionStateReadThreadRequest::Extended(
+                ExecutionStateReadExtThreadRequest::GetFinalizedAccount { block, address, tx },
+            )
+        })
+    }
 
-        for request in request_rx.iter() {
-            match request {
-                ExecutionStateReadThreadRequest::GetAccountStatuses {
-                    block_id,
-                    seq_num,
-                    is_finalized,
-                    addresses,
-                    tx,
-                } => {
-                    tx.send(state_read.get_account_statuses(
-                        &block_id,
-                        &seq_num,
-                        is_finalized,
-                        addresses.iter(),
-                    ))
-                    .expect("ExecutionStateReadThreadClient is alive");
-                }
-                ExecutionStateReadThreadRequest::GetExecutionResult {
-                    block_id,
-                    seq_num,
-                    is_finalized,
-                    tx,
-                } => {
-                    tx.send(state_read.get_execution_result(&block_id, &seq_num, is_finalized))
-                        .expect("ExecutionStateReadThreadClient is alive");
-                }
-                ExecutionStateReadThreadRequest::RawReadEarliestFinalizedBlock { tx } => {
-                    tx.send(state_read.raw_read_earliest_finalized_block())
-                        .expect("ExecutionStateReadThreadClient is alive");
-                }
-                ExecutionStateReadThreadRequest::RawReadLatestFinalizedBlock { tx } => {
-                    tx.send(state_read.raw_read_latest_finalized_block())
-                        .expect("ExecutionStateReadThreadClient is alive");
-                }
-                ExecutionStateReadThreadRequest::ReadValidatorSetAtBlock {
-                    block_num,
-                    requested_epoch,
-                    tx,
-                } => {
-                    tx.send(state_read.read_valset_at_block(block_num, requested_epoch))
-                        .expect("ExecutionStateReadThreadClient is alive");
-                }
-                ExecutionStateReadThreadRequest::TotalDbLookups { tx } => {
-                    tx.send(state_read.total_db_lookups())
-                        .expect("ExecutionStateReadThreadClient is alive");
-                }
-            }
-        }
+    fn get_finalized_block_header(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<EthHeader, ExecutionStateReadExtError> {
+        self.send_and_recv_request(|tx| {
+            ExecutionStateReadThreadRequest::Extended(
+                ExecutionStateReadExtThreadRequest::GetFinalizedBlockHeader { block, tx },
+            )
+        })
+    }
 
-        warn!("ExecutionStateReadThread terminating");
+    fn get_finalized_receipts(
+        &mut self,
+        block: SeqNum,
+    ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError> {
+        self.send_and_recv_request(|tx| {
+            ExecutionStateReadThreadRequest::Extended(
+                ExecutionStateReadExtThreadRequest::GetFinalizedReceipts { block, tx },
+            )
+        })
+    }
+
+    fn eth_call(
+        &mut self,
+        request: FinalizedEthCallRequest,
+    ) -> Result<CallResult, ExecutionStateReadExtError> {
+        self.send_and_recv_request(|tx| {
+            ExecutionStateReadThreadRequest::Extended(ExecutionStateReadExtThreadRequest::EthCall {
+                request,
+                tx,
+            })
+        })
     }
 }
 
@@ -282,17 +354,69 @@ where
 mod test {
     use std::time::Duration;
 
+    use alloy_primitives::Address;
     use monad_crypto::NopSignature;
+    use monad_eth_types::{EthAccount, EthHeader, ReceiptWithLogIndex};
+    use monad_ethcall::CallResult;
     use monad_multi_sig::MultiSig;
     use monad_types::{SeqNum, GENESIS_BLOCK_ID, GENESIS_SEQ_NUM};
 
-    use crate::{ExecutionStateRead, ExecutionStateReadThreadClient, InMemoryStateInner};
+    use crate::{
+        ExecutionStateRead, ExecutionStateReadExt, ExecutionStateReadExtError,
+        ExecutionStateReadThreadClient, FinalizedEthCallRequest, InMemoryStateInner,
+    };
+
+    type TestState = InMemoryStateInner<NopSignature, MultiSig<NopSignature>>;
+
+    fn test_state() -> TestState {
+        std::sync::Arc::try_unwrap(TestState::genesis(SeqNum(4)))
+            .unwrap()
+            .into_inner()
+            .unwrap()
+    }
+
+    impl ExecutionStateReadExt<NopSignature, MultiSig<NopSignature>> for TestState {
+        fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
+            let mut header = alloy_consensus::Header::default();
+            header.number = 11;
+            Ok(EthHeader(header))
+        }
+
+        fn get_finalized_account(
+            &mut self,
+            _block: SeqNum,
+            _address: Address,
+        ) -> Result<Option<EthAccount>, ExecutionStateReadExtError> {
+            Ok(None)
+        }
+
+        fn get_finalized_block_header(
+            &mut self,
+            block: SeqNum,
+        ) -> Result<EthHeader, ExecutionStateReadExtError> {
+            let mut header = alloy_consensus::Header::default();
+            header.number = block.0;
+            Ok(EthHeader(header))
+        }
+
+        fn get_finalized_receipts(
+            &mut self,
+            _block: SeqNum,
+        ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError> {
+            Ok(Vec::new())
+        }
+
+        fn eth_call(
+            &mut self,
+            _request: FinalizedEthCallRequest,
+        ) -> Result<CallResult, ExecutionStateReadExtError> {
+            Ok(CallResult::Success(Default::default()))
+        }
+    }
 
     #[test]
     fn all_requests() {
-        let mut client = ExecutionStateReadThreadClient::new(|| {
-            InMemoryStateInner::<NopSignature, MultiSig<NopSignature>>::genesis(SeqNum(4))
-        });
+        let mut client = ExecutionStateReadThreadClient::new(test_state);
 
         {
             let get_account_statuses = client
@@ -323,9 +447,7 @@ mod test {
 
     #[test]
     fn shutdown() {
-        let client = ExecutionStateReadThreadClient::new(|| {
-            InMemoryStateInner::<NopSignature, MultiSig<NopSignature>>::genesis(SeqNum(4))
-        });
+        let client = ExecutionStateReadThreadClient::new(test_state);
 
         let handle = client.handle.clone();
 
@@ -334,5 +456,16 @@ mod test {
         std::thread::sleep(Duration::from_millis(10));
 
         assert!(handle.is_finished());
+    }
+
+    #[test]
+    fn extended_requests_use_the_same_worker() {
+        let mut client = ExecutionStateReadThreadClient::new(test_state);
+
+        let latest_header = client.get_latest_block_header().unwrap();
+        assert_eq!(latest_header.0.number, 11);
+        let header = client.get_finalized_block_header(SeqNum(7)).unwrap();
+        assert_eq!(header.0.number, 7);
+        assert!(client.get_finalized_receipts(SeqNum(7)).unwrap().is_empty());
     }
 }
