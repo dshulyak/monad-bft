@@ -26,7 +26,7 @@ use monad_types::{Epoch, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use thiserror::Error;
 
-use super::bindings::{record_to_chain_event, registration_from_contract, DkgState};
+use super::bindings::{record_to_chain_event, registration_from_contract, DkgContract};
 
 const DKG_ETH_CALL_GAS_LIMIT: u64 = 5_000_000;
 
@@ -155,7 +155,7 @@ impl TriedbDkgStateReader {
             block,
             contract,
             gas_limit,
-            DkgState::registeredPartyCountCall { epoch: epoch.0 },
+            DkgContract::registeredPartyCountCall { epoch: epoch.0 },
         )?;
         let count = usize::try_from(count).map_err(|_| TriedbStateError::CountOverflow {
             kind: "registered-party",
@@ -172,7 +172,7 @@ impl TriedbDkgStateReader {
                 block,
                 contract,
                 gas_limit,
-                DkgState::registeredPartyCall {
+                DkgContract::registeredPartyCall {
                     epoch: epoch.0,
                     index: U256::from(index),
                 },
@@ -186,7 +186,7 @@ impl TriedbDkgStateReader {
                 block,
                 contract,
                 gas_limit,
-                DkgState::registrationOfCall {
+                DkgContract::registrationOfCall {
                     epoch: epoch.0,
                     party: address,
                 },
@@ -224,7 +224,7 @@ impl TriedbDkgStateReader {
             block,
             contract,
             gas_limit,
-            DkgState::registrationOfCall {
+            DkgContract::registrationOfCall {
                 epoch: epoch.0,
                 party,
             },
@@ -266,7 +266,7 @@ impl TriedbDkgStateReader {
             block,
             contract,
             gas_limit,
-            DkgState::recordCountCall { epoch: epoch.0 },
+            DkgContract::recordCountCall { epoch: epoch.0 },
         )?;
         let count = usize::try_from(count)
             .map_err(|_| TriedbStateError::CountOverflow { kind: "record" })?;
@@ -277,7 +277,7 @@ impl TriedbDkgStateReader {
                 block,
                 contract,
                 gas_limit,
-                DkgState::recordAtCall {
+                DkgContract::recordAtCall {
                     epoch: epoch.0,
                     index: U256::from(index),
                 },

@@ -409,6 +409,7 @@ impl<'s> From<&'s MonadEventType> for GraphQLMonadEvent<'s> {
             MonadEvent::StateSyncEvent(event) => Self::StateSyncEvent(GraphQLStateSyncEvent(event)),
             MonadEvent::ConfigEvent(event) => Self::ConfigEvent(GraphQLConfigEvent(event)),
             MonadEvent::SecondaryRaptorcastPeersUpdate { .. } => todo!(),
+            MonadEvent::DkgEvent { .. } => todo!(),
         }
     }
 }

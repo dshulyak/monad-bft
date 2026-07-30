@@ -7,7 +7,6 @@ use std::{
 };
 
 use alloy_consensus::Transaction;
-use alloy_eips::eip2718::Decodable2718;
 use dkg_core::{PartyId, RecordId, SessionId};
 use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{ChainCall, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes};
@@ -18,22 +17,18 @@ use crate::{DkgLocalKeyMaterial, DkgTransactionContext};
 
 #[test]
 fn encodes_post_pc_qc_contract_calldata() {
-    let call = ChainCall::PostPCQc {
-        qc: PCQc {
-            dealer: PartyId(7),
-            digest: [0x11; 32],
-            signatures: vec![sig(0)],
-        },
+    let qc = PCQc {
+        dealer: PartyId(7),
+        digest: [0x11; 32],
+        signatures: vec![sig(0)],
     };
+    let call = ChainCall::PostPCQc { qc: qc.clone() };
     let calldata = contract_calldata(Epoch(9), &call, Address::ZERO).unwrap();
     assert_eq!(
         calldata,
         DkgContract::postPcQcCall {
             epoch: 9,
-            qc: pc_qc_to_contract(match &call {
-                ChainCall::PostPCQc { qc } => qc,
-                _ => unreachable!(),
-            }),
+            qc: pc_qc_to_contract(&qc),
         }
         .abi_encode()
     );
@@ -41,22 +36,18 @@ fn encodes_post_pc_qc_contract_calldata() {
 
 #[test]
 fn encodes_submit_result_contract_calldata() {
-    let call = ChainCall::PostDkgResult {
-        qc: DkgDoneQc {
-            epoch: SessionId(9),
-            g2x: BlsG2SerializedBytes([0x22; BLS_G2_SERIALIZED_BYTES]),
-            signatures: vec![sig(0)],
-        },
+    let qc = DkgDoneQc {
+        epoch: SessionId(9),
+        g2x: BlsG2SerializedBytes([0x22; BLS_G2_SERIALIZED_BYTES]),
+        signatures: vec![sig(0)],
     };
+    let call = ChainCall::PostDkgResult { qc: qc.clone() };
     let calldata = contract_calldata(Epoch(9), &call, Address::ZERO).unwrap();
     assert_eq!(
         calldata,
         DkgContract::submitResultCall {
             epoch: 9,
-            result: dkg_result_to_contract(match &call {
-                ChainCall::PostDkgResult { qc } => qc,
-                _ => unreachable!(),
-            }),
+            result: dkg_result_to_contract(&qc),
         }
         .abi_encode()
     );
@@ -90,6 +81,7 @@ fn retries_same_local_transaction_on_finalized_blocks_until_matching_event() {
 
     service.submit(Epoch(2), pc_call(qc));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(first.is_eip1559());
     service.finalized_block(Epoch(2), Vec::new(), false);
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(first, second);
@@ -218,7 +210,7 @@ struct TestChain {
     nonce: Arc<AtomicU64>,
     base_fee: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
-    transactions: flume::Sender<bytes::Bytes>,
+    transactions: flume::Sender<TxEnvelope>,
 }
 
 impl DkgChain for TestChain {
@@ -233,7 +225,7 @@ impl DkgChain for TestChain {
         })
     }
 
-    fn submit_transaction(&self, transaction: bytes::Bytes) -> Result<(), crate::DkgError> {
+    fn submit_transaction(&self, transaction: TxEnvelope) -> Result<(), crate::DkgError> {
         self.transactions
             .send(transaction)
             .map_err(|_| crate::DkgError::ChannelClosed("recording a test DKG transaction"))
@@ -243,14 +235,14 @@ impl DkgChain for TestChain {
 fn test_submitter(
     nonce: u64,
     reads: Arc<AtomicUsize>,
-) -> (TxSubmitter, flume::Receiver<bytes::Bytes>) {
+) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
     test_submitter_with_nonce(Arc::new(AtomicU64::new(nonce)), reads)
 }
 
 fn test_submitter_with_nonce(
     nonce: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
-) -> (TxSubmitter, flume::Receiver<bytes::Bytes>) {
+) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
     test_submitter_with_context(nonce, Arc::new(AtomicU64::new(100)), reads)
 }
 
@@ -258,7 +250,7 @@ fn test_submitter_with_context(
     nonce: Arc<AtomicU64>,
     base_fee: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
-) -> (TxSubmitter, flume::Receiver<bytes::Bytes>) {
+) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
     let (transactions, receiver) = flume::unbounded();
     let chain = Arc::new(TestChain {
         nonce,
@@ -289,12 +281,10 @@ fn sig(signer: u32) -> QcSignature {
     }
 }
 
-fn decode_nonce(raw: &[u8]) -> u64 {
-    TxEnvelope::decode_2718_exact(raw).unwrap().nonce()
+fn decode_nonce(tx: &TxEnvelope) -> u64 {
+    tx.nonce()
 }
 
-fn decode_max_fee_per_gas(raw: &[u8]) -> u128 {
-    TxEnvelope::decode_2718_exact(raw)
-        .unwrap()
-        .max_fee_per_gas()
+fn decode_max_fee_per_gas(tx: &TxEnvelope) -> u128 {
+    tx.max_fee_per_gas()
 }

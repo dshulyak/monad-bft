@@ -11,6 +11,9 @@ bench = false
 [features]
 default = ["jemallocator"]
 jemallocator = ["tikv-jemallocator", "monad-pprof/jemallocator"]
+blst-avx = [
+    "monad-dkg-runner/blst-avx",
+]
 
 [dependencies]
 monad-bls = { workspace = true }
@@ -20,9 +23,11 @@ monad-consensus-types = { workspace = true }
 monad-control-panel = { workspace = true }
 monad-crypto = { workspace = true }
 monad-dataplane = { workspace = true }
+monad-dkg-runner = { workspace = true }
 monad-eth-block-policy = { workspace = true }
 monad-eth-block-validator = { workspace = true }
 monad-eth-txpool-executor = { workspace = true }
+monad-ethcall = { workspace = true }
 monad-execution-state-read = { workspace = true }
 monad-execution-state-read-cache = { workspace = true }
 monad-executor = { workspace = true }
@@ -52,6 +57,7 @@ agent = { workspace = true }
 alloy-rlp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+flume = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }

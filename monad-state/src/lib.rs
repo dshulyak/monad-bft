@@ -576,6 +576,7 @@ where
     BlockSyncResponse(BlockSyncResponseMessage<ST, SCT, EPT>),
     ForwardedTx(Vec<Bytes>),
     StateSyncMessage(StateSyncNetworkMessage),
+    DkgMessage(Bytes),
 }
 
 impl<ST, SCT, EPT> From<Verified<ST, Validated<ConsensusMessage<ST, SCT, EPT>>>>
@@ -623,6 +624,10 @@ where
                 let enc: [&dyn Encodable; 3] = [&monad_version, &5u8, &m];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
+            Self::DkgMessage(m) => {
+                let enc: [&dyn Encodable; 3] = [&monad_version, &6u8, &m];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
         }
     }
 
@@ -653,6 +658,10 @@ where
                 let enc: Vec<&dyn Encodable> = vec![&monad_version, &5u8, &m];
                 Encodable::length(&enc)
             }
+            Self::DkgMessage(m) => {
+                let enc: Vec<&dyn Encodable> = vec![&monad_version, &6u8, &m];
+                Encodable::length(&enc)
+            }
         }
     }
 }
@@ -677,6 +686,8 @@ where
     ForwardedTx(Vec<Bytes>),
     /// State Sync msgs
     StateSyncMessage(StateSyncNetworkMessage),
+    /// DKG runner msgs
+    DkgMessage(Bytes),
 }
 
 impl<ST, SCT, EPT> Decodable for MonadMessage<ST, SCT, EPT>
@@ -699,6 +710,7 @@ where
             3 => Self::BlockSyncResponse(BlockSyncResponseMessage::decode(&mut payload)?),
             4 => Self::ForwardedTx(Vec::<Bytes>::decode(&mut payload)?),
             5 => Self::StateSyncMessage(StateSyncNetworkMessage::decode(&mut payload)?),
+            6 => Self::DkgMessage(Bytes::decode(&mut payload)?),
             _ => {
                 return Err(alloy_rlp::Error::Custom(
                     "failed to decode unknown MonadMessage",
@@ -777,6 +789,7 @@ where
             VerifiedMonadMessage::BlockSyncResponse(msg) => MonadMessage::BlockSyncResponse(msg),
             VerifiedMonadMessage::ForwardedTx(msg) => MonadMessage::ForwardedTx(msg),
             VerifiedMonadMessage::StateSyncMessage(msg) => MonadMessage::StateSyncMessage(msg),
+            VerifiedMonadMessage::DkgMessage(msg) => MonadMessage::DkgMessage(msg),
         }
     }
 }
@@ -824,6 +837,10 @@ where
             MonadMessage::StateSyncMessage(msg) => {
                 MonadEvent::StateSyncEvent(StateSyncEvent::Inbound(from, msg))
             }
+            MonadMessage::DkgMessage(message) => MonadEvent::DkgEvent {
+                sender: from,
+                message,
+            },
         }
     }
 }
@@ -1293,6 +1310,7 @@ where
                 }
                 vec![]
             }
+            MonadEvent::DkgEvent { .. } => Vec::new(),
             MonadEvent::ConfigEvent(config_event) => match config_event {
                 ConfigEvent::ConfigUpdate(config_update) => {
                     self.block_sync

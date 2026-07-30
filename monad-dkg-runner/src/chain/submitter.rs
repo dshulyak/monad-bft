@@ -4,12 +4,10 @@ use std::{
 };
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, FixedBytes, TxHash, TxKind, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
-use bytes::Bytes;
 use dkg_protocol::{ChainCall, ChainEvent};
 use monad_eth_types::buffered_base_fee_per_gas;
 use monad_types::Epoch;
@@ -37,7 +35,9 @@ pub(crate) struct TxSubmitter {
 impl TxSubmitter {
     pub(crate) fn new(config: &DkgChainConfig, chain: Arc<dyn DkgChain>) -> Result<Self, DkgError> {
         let config = config.clone();
-        let signer = signer_for_key(&config.signing_key)?;
+        let key = FixedBytes::<32>::from(config.signing_key);
+        let signer = PrivateKeySigner::from_bytes(&key)
+            .map_err(|err| DkgError::operation("construct DKG transaction signer", err))?;
         let signer_address = signer.address();
 
         Ok(Self {
@@ -70,24 +70,22 @@ impl TxSubmitter {
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
-        let id = ChainTxId::from_call(&call);
+        let key = (epoch, ChainTxId::from_call(&call));
         let immediate = matches!(&call, ChainCall::PostRegistration { .. });
 
-        if self.finalized.contains(&(epoch, id.clone()))
-            || self.pending.contains_key(&(epoch, id.clone()))
-        {
+        if self.finalized.contains(&key) || self.pending.contains_key(&key) {
             return;
         }
 
         self.pending.insert(
-            (epoch, id.clone()),
+            key.clone(),
             PendingTx {
                 call,
                 prepared: None,
             },
         );
         if immediate || self.ready_epochs.contains(&epoch) {
-            self.submit_keys([(epoch, id)]);
+            self.submit_keys([key]);
         }
     }
 
@@ -141,7 +139,7 @@ impl TxSubmitter {
     }
 
     fn submit_keys(&mut self, keys: impl IntoIterator<Item = (Epoch, ChainTxId)>) {
-        let keys = keys.into_iter().collect::<BTreeSet<_>>();
+        let keys = keys.into_iter().collect::<Vec<_>>();
         if keys.is_empty() {
             return;
         }
@@ -173,7 +171,7 @@ impl TxSubmitter {
         let active = self
             .pending
             .iter()
-            .find_map(|(key, pending)| pending.prepared.is_some().then(|| key.clone()));
+            .find_map(|(key, pending)| pending.prepared.is_some().then_some(key.clone()));
         let key = match active {
             Some(active) if keys.contains(&active) => active,
             Some(_) => return,
@@ -214,7 +212,7 @@ impl TxSubmitter {
         }
 
         let prepared = pending.prepared.as_ref().expect("prepared above");
-        match self.chain.submit_transaction(prepared.raw.clone()) {
+        match self.chain.submit_transaction(prepared.tx.clone()) {
             Ok(()) => {
                 info!(
                     epoch = epoch.0,
@@ -250,7 +248,7 @@ struct PreparedTx {
     nonce: u64,
     max_fee_per_gas: u128,
     tx_hash: TxHash,
-    raw: Bytes,
+    tx: TxEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -341,26 +339,18 @@ fn prepare_chain_call(
         to: TxKind::Call(config.contract),
         value: U256::ZERO,
         access_list: Default::default(),
-        input: calldata.clone().into(),
+        input: calldata.into(),
     };
     let signature = signer
         .sign_hash_sync(&transaction.signature_hash())
         .map_err(|err| DkgError::operation("sign DKG transaction", err))?;
-    let envelope: TxEnvelope = transaction.into_signed(signature).into();
-    let mut raw = Vec::new();
-    envelope.encode_2718(&mut raw);
+    let tx = TxEnvelope::Eip1559(transaction.into_signed(signature));
     Ok(PreparedTx {
         nonce,
         max_fee_per_gas,
-        tx_hash: *envelope.tx_hash(),
-        raw: raw.into(),
+        tx_hash: *tx.tx_hash(),
+        tx,
     })
-}
-
-fn signer_for_key(signing_key: &[u8; 32]) -> Result<PrivateKeySigner, DkgError> {
-    let key = FixedBytes::<32>::from(*signing_key);
-    PrivateKeySigner::from_bytes(&key)
-        .map_err(|err| DkgError::operation("construct DKG transaction signer", err))
 }
 
 fn contract_calldata(epoch: Epoch, call: &ChainCall, signer: Address) -> Result<Vec<u8>, DkgError> {

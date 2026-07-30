@@ -83,6 +83,8 @@ ENV GIT_TAG=$GIT_TAG
 ENV GIT_MODIFIED=$GIT_MODIFIED
 
 # Builder
+COPY --from=category-research-internal . /usr/category-research-internal/etx-dkg
+COPY --from=blst . /usr/blst
 COPY . .
 RUN cargo build --release --example txgen && \
     mv target/release/examples/txgen txgen

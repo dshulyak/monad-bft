@@ -1,10 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
+use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, Bloom, Log, B256};
 use alloy_sol_types::SolEvent;
 use dkg_core::RecordId;
 use dkg_protocol::ChainEvent;
-use alloy_consensus::TxEnvelope;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };

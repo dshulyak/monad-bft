@@ -24,6 +24,12 @@ statesync_max_concurrent_requests = 5
 #########################################################
 chain_id = 20143
 
+[dkg]
+enabled = false
+contract_address = "0x0000000000000000000000000000000000000000"
+tx_gas_limit = 5000000
+tx_max_priority_fee_per_gas = 1
+
 #########################################################
 # Node-specific configuration
 #########################################################

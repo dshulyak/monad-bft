@@ -81,6 +81,8 @@ ENV GIT_TAG=$GIT_TAG
 ENV GIT_MODIFIED=$GIT_MODIFIED
 
 # Builder
+COPY --from=category-research-internal . /usr/category-research-internal/etx-dkg
+COPY --from=blst . /usr/blst
 COPY . .
 RUN ASMFLAGS="-march=haswell" CFLAGS="-march=haswell" CXXFLAGS="-march=haswell" \
     CC=gcc-15 CXX=g++-15 cargo build --release \

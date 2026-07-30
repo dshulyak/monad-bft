@@ -49,6 +49,7 @@ impl<'s> From<&'s MonadMessageType> for GraphQLMonadMessage<'s> {
             MonadMessageType::BlockSyncResponse(_) => todo!("BlockSyncResponse"),
             MonadMessageType::ForwardedTx(_) => todo!("ForwardedTx"),
             MonadMessageType::StateSyncMessage(_) => todo!("StateSyncMessage"),
+            MonadMessageType::DkgMessage(_) => todo!("DkgMessage"),
         }
     }
 }

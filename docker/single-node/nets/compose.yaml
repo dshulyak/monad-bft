@@ -46,6 +46,8 @@ services:
       --db /monad/triedb/test.db
       --block_db /monad/ledger
       --statesync /monad/statesync.sock
+      --nthreads 1
+      --disable-sq-thread-cpu
       --log_level ERROR
     ulimits: *ulimits
 

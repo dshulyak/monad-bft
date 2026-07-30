@@ -138,6 +138,13 @@ impl NodeState {
 
         let node_config: MonadNodeConfig =
             toml::from_str(&std::fs::read_to_string(&node_config_path)?)?;
+        node_config
+            .dkg
+            .validate()
+            .map_err(|msg| NodeSetupError::Custom {
+                kind: ErrorKind::InvalidValue,
+                msg,
+            })?;
         let metrics = parse_metrics_config(node_config.prometheus.as_ref())?;
 
         if !matches!(
@@ -175,7 +182,6 @@ impl NodeState {
             (None, None) => None,
             _ => panic!("cli accepted otel_endpoint without record_metrics_interval_seconds"),
         };
-
         Ok(Self {
             node_config,
             node_config_path,

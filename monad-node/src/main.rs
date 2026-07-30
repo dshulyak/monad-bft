@@ -39,10 +39,12 @@ use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_txpool_executor::{EthTxPoolExecutor, EthTxPoolIpcConfig};
-use monad_execution_state_read::ExecutionStateReadThreadClient;
-use monad_execution_state_read_cache::ExecutionStateReadCache;
+use monad_execution_state_read::{ExecutionStateRead, ExecutionStateReadThreadClient};
 use monad_executor::{Executor, ExecutorMetricsChain};
-use monad_executor_glue::{LogFriendlyMonadEvent, Message, MonadEvent};
+use monad_executor_glue::{
+    Command, LogFriendlyMonadEvent, Message, MonadEvent, RouterCommand, StateSyncCommand,
+    ValSetCommand, ValidatorEvent,
+};
 use monad_ledger::MonadBlockFileLedger;
 use monad_node_config::{
     ExecutionProtocolType, FullNodeIdentityConfig, NodeBootstrapConfig, NodeBootstrapPeerConfig,
@@ -59,10 +61,10 @@ use monad_raptorcast::{
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
 };
 use monad_router_multi::MultiRouter;
+use monad_secp::ExtractEthAddress;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
 use monad_statesync_executor::StateSyncExecutor;
-use monad_triedb_utils::TriedbReader;
-use monad_types::{DropTimer, Epoch, NodeId, Round, SeqNum, GENESIS_SEQ_NUM};
+use monad_types::{DropTimer, Epoch, NodeId, Round, RouterTarget, SeqNum, GENESIS_SEQ_NUM};
 use monad_updaters::{
     config_file::ConfigFile, config_loader::ConfigLoader, loopback::LoopbackExecutor,
     parent::ParentExecutor, timer::TokioTimer, tokio_timestamp::TokioTimestamp,
@@ -83,6 +85,7 @@ use tracing::{error, event, info, warn, Instrument, Level};
 
 use self::{
     cli::Cli,
+    dkg::{build_manager, build_state_reader},
     error::NodeSetupError,
     metrics::{
         default_prometheus_labels, start_metrics_server, MetricsServerState, NodePrometheusMetrics,
@@ -91,6 +94,7 @@ use self::{
 };
 
 mod cli;
+mod dkg;
 mod error;
 mod metrics;
 mod state;
@@ -177,6 +181,34 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .qc()
         .get_round()
         + Round(1);
+    let dkg_epoch_length = node_state.chain_config.get_epoch_length();
+    let dkg_startup_validator_sets = locked_epoch_validators.clone();
+    let self_router_node_id = NodeId::new(node_state.router_identity.pubkey());
+    let dkg_storage_root = node_state.wal_path.join("dkg");
+    let state_read = build_state_reader(&node_state, SeqNum(EXECUTION_DELAY));
+    let (dkg_manager, dkg_local_tx_rx) = match build_manager(
+        &node_state,
+        self_router_node_id,
+        &dkg_storage_root,
+        state_read.clone(),
+        SeqNum(EXECUTION_DELAY),
+    ) {
+        Ok(manager) => manager,
+        Err(err) => {
+            error!(?err, "failed to configure DKG manager chain integration");
+            (
+                monad_dkg_runner::DkgManager::new(self_router_node_id, dkg_storage_root.clone()),
+                None,
+            )
+        }
+    };
+    let (dkg_events, dkg_event_rx) = monad_dkg_runner::DkgManagerHandle::channel();
+    let (dkg_outbound_tx, dkg_outbound_rx) = flume::unbounded();
+    tokio::spawn(async move {
+        if let Err(err) = dkg_manager.run(dkg_event_rx, dkg_outbound_tx).await {
+            error!(?err, "DKG manager task stopped");
+        }
+    });
     let (score_provider, score_reader) =
         ema::create::<NodeId<CertificateSignaturePubKey<SignatureType>>, StdClock>(
             node_state.node_config.txpool_peer_score.clone(),
@@ -245,17 +277,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             EXECUTION_DELAY,
         )
     };
-
-    let state_read = ExecutionStateReadThreadClient::new({
-        let triedb_path = node_state.triedb_path.clone();
-
-        move || {
-            let triedb_handle =
-                TriedbReader::try_new(triedb_path.as_path()).expect("triedb should exist in path");
-
-            ExecutionStateReadCache::new(triedb_handle, SeqNum(EXECUTION_DELAY))
-        }
-    });
 
     let mut executor = ParentExecutor {
         metrics: Default::default(),
@@ -393,7 +414,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         leader_election,
         block_validator: EthBlockValidator::default(),
         block_policy: create_block_policy(),
-        state_read,
+        state_read: state_read.clone(),
         key: node_state.secp256k1_identity,
         certkey: node_state.bls12_381_identity,
         beneficiary: node_state.node_config.beneficiary.into(),
@@ -420,6 +441,19 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     };
 
     let (mut state, init_commands) = builder.build();
+    if init_commands.iter().any(|command| {
+        matches!(
+            command,
+            Command::StateSyncCommand(StateSyncCommand::StartExecution)
+        )
+    }) {
+        sync_dkg_from_execution_state(
+            &dkg_events,
+            &state_read,
+            &dkg_startup_validator_sets,
+            dkg_epoch_length,
+        );
+    }
     executor.exec(init_commands);
 
     let mut ledger_span = tracing::info_span!(
@@ -538,11 +572,52 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     executor_metrics,
                 );
             }
+            local_tx = async {
+                match &dkg_local_tx_rx {
+                    Some(receiver) => receiver.recv_async().await,
+                    None => std::future::pending().await,
+                }
+            }.boxed() => {
+                match local_tx {
+                    Ok(transaction) => {
+                        info!(
+                            tx_hash = %transaction.tx_hash(),
+                            "inserting DKG transaction into local txpool"
+                        );
+                        executor.txpool.insert_local_txs(vec![transaction]);
+                    }
+                    Err(err) => warn!(?err, "DKG local transaction channel closed"),
+                }
+            }
+            dkg_outbound = dkg_outbound_rx.recv_async().boxed() => {
+                match dkg_outbound {
+                    Ok(output) => executor.exec(vec![Command::RouterCommand(
+                        RouterCommand::Publish {
+                            target: RouterTarget::TcpPointToPoint {
+                                to: output.to,
+                                completion: None,
+                            },
+                            message: VerifiedMonadMessage::DkgMessage(output.payload),
+                        }
+                    )]),
+                    Err(err) => warn!(?err, "DKG manager output channel closed"),
+                }
+            }
             event = executor.next().instrument(ledger_span.clone()) => {
                 let Some(event) = event else {
                     event!(Level::ERROR, "parent executor returned none!");
                     return Err(());
                 };
+                if let MonadEvent::DkgEvent { sender, message } = event {
+                    dkg_events.network(sender, message);
+                    continue;
+                }
+                if let MonadEvent::ValidatorEvent(ValidatorEvent::UpdateValidators(
+                    validator_set_data,
+                )) = &event
+                {
+                    schedule_dkg_session(&dkg_events, validator_set_data);
+                }
                 let event_debug = {
                     let _timer = DropTimer::start(Duration::from_millis(1), |elapsed| {
                         warn!(
@@ -593,6 +668,22 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 };
 
                 if !commands.is_empty() {
+                    for command in &commands {
+                        match command {
+                            Command::StateSyncCommand(StateSyncCommand::StartExecution) => {
+                                sync_dkg_from_execution_state(
+                                    &dkg_events,
+                                    &state_read,
+                                    &dkg_startup_validator_sets,
+                                    dkg_epoch_length,
+                                );
+                            }
+                            Command::ValSetCommand(ValSetCommand::NotifyFinalized(seq_num)) => {
+                                dkg_events.finalized(*seq_num, dkg_epoch_length);
+                            }
+                            _ => {}
+                        }
+                    }
                     let num_commands = commands.len();
                     let _timer = DropTimer::start(Duration::from_millis(50), |elapsed| {
                         warn!(
@@ -618,6 +709,42 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+fn sync_dkg_from_execution_state(
+    dkg_events: &monad_dkg_runner::DkgManagerHandle<SignatureType>,
+    state_read: &ExecutionStateReadThreadClient<SignatureType, SignatureCollectionType>,
+    validator_sets: &[ValidatorSetDataWithEpoch<SignatureCollectionType>],
+    epoch_length: SeqNum,
+) {
+    let Some(block) = state_read.raw_read_latest_finalized_block() else {
+        warn!("execution started without a finalized block for DKG recovery");
+        return;
+    };
+    dkg_events.sync_complete(block, epoch_length);
+    let latest_locked_epoch = block.latest_locked_epoch(epoch_length);
+    for validator_set in validator_sets
+        .iter()
+        .filter(|validator_set| validator_set.epoch <= latest_locked_epoch)
+    {
+        schedule_dkg_session(dkg_events, validator_set);
+    }
+}
+
+fn schedule_dkg_session(
+    dkg_events: &monad_dkg_runner::DkgManagerHandle<SignatureType>,
+    validator_set: &ValidatorSetDataWithEpoch<SignatureCollectionType>,
+) {
+    let validators = validator_set
+        .validators
+        .0
+        .iter()
+        .map(|validator| monad_dkg_runner::DkgValidator {
+            node_id: validator.node_id,
+            address: validator.node_id.pubkey().get_eth_address().into_array(),
+        })
+        .collect::<Vec<_>>();
+    dkg_events.start_session(validator_set.epoch, validators);
 }
 
 enum NonAuthRaptorcastBind {

@@ -78,6 +78,7 @@ where
             | VerifiedMonadMessage::BlockSyncResponse(_) => self.drop_block_sync,
             VerifiedMonadMessage::ForwardedTx(_) => false,
             VerifiedMonadMessage::StateSyncMessage(_) => false,
+            VerifiedMonadMessage::DkgMessage(_) => false,
         };
 
         if should_drop {
@@ -172,6 +173,7 @@ where
                 TwinsCapture::Drop
             }
             VerifiedMonadMessage::StateSyncMessage(_) => TwinsCapture::Spread(pid),
+            VerifiedMonadMessage::DkgMessage(_) => TwinsCapture::Spread(pid),
         };
 
         match capture {

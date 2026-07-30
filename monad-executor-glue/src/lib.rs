@@ -667,9 +667,6 @@ where
         txs: Vec<Bytes>,
     },
 
-    /// Inserts transactions produced by a local subsystem, bypassing network ingress.
-    InsertLocalTxs { txs: Vec<Bytes> },
-
     EnterRound {
         epoch: Epoch,
         round: Round,
@@ -734,9 +731,6 @@ where
                 .field("sender", sender)
                 .field("txs", txs)
                 .finish(),
-            Self::InsertLocalTxs { txs } => {
-                f.debug_struct("InsertLocalTxs").field("txs", txs).finish()
-            }
             Self::EnterRound {
                 epoch,
                 round,
@@ -2151,6 +2145,12 @@ where
     /// Events to statesync
     #[wal(enable(nested))]
     StateSyncEvent(StateSyncEvent<ST, SCT, EPT>),
+    /// Events for the DKG runner. These are handled by monad-node before
+    /// reaching consensus state.
+    DkgEvent {
+        sender: NodeId<SCT::NodeIdPubKey>,
+        message: Bytes,
+    },
     /// Config updates
     ConfigEvent(ConfigEvent<ST, SCT>),
     /// Secondary raptorcast updates
@@ -2209,6 +2209,10 @@ where
                 };
                 MonadEvent::StateSyncEvent(event)
             }
+            MonadEvent::DkgEvent { sender, message } => MonadEvent::DkgEvent {
+                sender: *sender,
+                message: message.clone(),
+            },
             MonadEvent::ConfigEvent(event) => MonadEvent::ConfigEvent(event.clone()),
             MonadEvent::SecondaryRaptorcastPeersUpdate {
                 expiry_round,
@@ -2257,6 +2261,10 @@ where
                 let enc: [&dyn Encodable; 2] = [&7u8, &event];
                 encode_list::<_, dyn Encodable>(&enc, out);
             }
+            Self::DkgEvent { sender, message } => {
+                let enc: [&dyn Encodable; 3] = [&10u8, &sender, &message];
+                encode_list::<_, dyn Encodable>(&enc, out);
+            }
             Self::ConfigEvent(event) => {
                 let enc: [&dyn Encodable; 2] = [&8u8, &event];
                 encode_list::<_, dyn Encodable>(&enc, out);
@@ -2300,6 +2308,11 @@ where
             7 => Ok(Self::StateSyncEvent(
                 StateSyncEvent::<ST, SCT, EPT>::decode(&mut payload)?,
             )),
+            10 => {
+                let sender = NodeId::<SCT::NodeIdPubKey>::decode(&mut payload)?;
+                let message = Bytes::decode(&mut payload)?;
+                Ok(Self::DkgEvent { sender, message })
+            }
             8 => Ok(Self::ConfigEvent(ConfigEvent::<ST, SCT>::decode(
                 &mut payload,
             )?)),
@@ -2380,6 +2393,9 @@ where
             MonadEvent::ControlPanelEvent(_) => "CONTROLPANELEVENT".to_string(),
             MonadEvent::TimestampUpdateEvent(t) => format!("MempoolEvent::TimestampUpdate: {t}"),
             MonadEvent::StateSyncEvent(_) => "STATESYNC".to_string(),
+            MonadEvent::DkgEvent { sender, message } => {
+                format!("DKG from={sender:?} bytes={}", message.len())
+            }
             MonadEvent::ConfigEvent(_) => "CONFIGEVENT".to_string(),
             MonadEvent::SecondaryRaptorcastPeersUpdate { .. } => {
                 "SecondaryRaptorcastPeersUpdate".to_string()

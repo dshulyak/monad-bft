@@ -44,6 +44,42 @@ pub use raptorcast::DeterministicProtocolRolloutStage;
 
 mod sync_peers;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DkgConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_eth_address_from_str")]
+    pub contract_address: Address,
+    pub tx_gas_limit: u64,
+    pub tx_max_priority_fee_per_gas: u128,
+}
+
+impl Default for DkgConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contract_address: Address::ZERO,
+            tx_gas_limit: 5_000_000,
+            tx_max_priority_fee_per_gas: 1,
+        }
+    }
+}
+
+impl DkgConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.contract_address.is_zero() {
+            return Err("dkg.contract_address must be nonzero when DKG is enabled".to_owned());
+        }
+        if self.tx_gas_limit == 0 {
+            return Err("dkg.tx_gas_limit must be nonzero".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(bound = "")]
@@ -56,6 +92,9 @@ pub struct NodeConfig<ST: CertificateSignatureRecoverable> {
 
     #[serde(default)]
     pub prometheus: Option<PrometheusConfig>,
+
+    #[serde(default)]
+    pub dkg: DkgConfig,
 
     #[serde(deserialize_with = "deserialize_eth_address_from_str")]
     pub beneficiary: Address,
@@ -116,3 +155,37 @@ pub type ValidatorsConfigType =
     monad_consensus_types::validator_data::ValidatorsConfig<SignatureCollectionType>;
 #[cfg(feature = "crypto")]
 pub type MonadNodeConfig = NodeConfig<SignatureType>;
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct DkgOnly {
+        #[serde(default)]
+        dkg: DkgConfig,
+    }
+
+    #[test]
+    fn dkg_config_defaults_to_disabled() {
+        let parsed: DkgOnly = toml::from_str("").unwrap();
+        assert_eq!(parsed.dkg, DkgConfig::default());
+    }
+
+    #[test]
+    fn dkg_config_parses_and_validates() {
+        let parsed: DkgOnly = toml::from_str(
+            r#"
+                [dkg]
+                enabled = true
+                contract_address = "0x0000000000000000000000000000000000001000"
+                tx_gas_limit = 4000000
+                tx_max_priority_fee_per_gas = 2
+            "#,
+        )
+        .unwrap();
+        assert!(parsed.dkg.validate().is_ok());
+    }
+}

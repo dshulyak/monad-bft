@@ -33,7 +33,13 @@ pub struct PubKey(secp256k1::PublicKey);
 pub struct KeyPair(secp256k1::Keypair);
 
 #[derive(ZeroizeOnDrop)]
-pub struct PrivKeyView(Vec<u8>);
+pub struct PrivKeyView([u8; 32]);
+
+impl PrivKeyView {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+}
 
 impl std::fmt::Display for PrivKeyView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
