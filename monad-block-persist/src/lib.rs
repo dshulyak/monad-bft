@@ -76,9 +76,36 @@ fn create_dir_safe(base: &Path, name: &str) -> PathBuf {
 fn atomic_symlink_update(target: &Path, link_path: &Path) -> io::Result<()> {
     let mut wip = link_path.to_path_buf();
     wip.set_extension("wip");
-    std::os::unix::fs::symlink(target, &wip)?;
+    match std::os::unix::fs::symlink(target, &wip) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&wip)?;
+            std::os::unix::fs::symlink(target, &wip)?;
+        }
+        Err(err) => return Err(err),
+    }
     std::fs::rename(&wip, link_path)?;
     Ok(())
+}
+
+fn atomic_file_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    match OpenOptions::new().write(true).open(path) {
+        Ok(existing) => {
+            existing.set_modified(SystemTime::now())?;
+            return Ok(());
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut wip = path.to_path_buf();
+    wip.set_extension("wip");
+
+    let mut file = File::create(&wip)?;
+    file.write_all(data)?;
+    drop(file);
+
+    std::fs::rename(wip, path)
 }
 
 fn read_and_decode<T: alloy_rlp::Decodable>(
@@ -153,32 +180,12 @@ where
 {
     fn write_bft_header(&mut self, block: &ConsensusBlockHeader<ST, SCT, EPT>) -> io::Result<()> {
         let file_path = self.header_path(&block.get_id());
-
-        if let Ok(existing_header) = OpenOptions::new().write(true).open(&file_path) {
-            existing_header
-                .set_modified(SystemTime::now())
-                .expect("failed to update timestamp meta of existing block header");
-            return Ok(());
-        }
-        let mut f = File::create(file_path).unwrap();
-        f.write_all(&alloy_rlp::encode(block)).unwrap();
-
-        Ok(())
+        atomic_file_write(&file_path, &alloy_rlp::encode(block))
     }
 
     fn write_bft_body(&mut self, body: &ConsensusBlockBody<EPT>) -> io::Result<()> {
         let file_path = self.body_path(&body.get_id());
-
-        if let Ok(existing_body) = OpenOptions::new().write(true).open(&file_path) {
-            existing_body
-                .set_modified(SystemTime::now())
-                .expect("failed to update timestamp meta of existing block body");
-            return Ok(());
-        }
-        let mut f = File::create(file_path).unwrap();
-        f.write_all(&alloy_rlp::encode(body)).unwrap();
-
-        Ok(())
+        atomic_file_write(&file_path, &alloy_rlp::encode(body))
     }
 
     fn update_proposed_head(&mut self, block_id: &BlockId) -> io::Result<()> {
@@ -248,6 +255,24 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_symlink_update_replaces_stale_wip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stale_target_path = temp_dir.path().join("stale_target_file");
+        let target_path = temp_dir.path().join("target_file");
+        let link_path = temp_dir.path().join("my_link");
+        let wip_path = temp_dir.path().join("my_link.wip");
+
+        fs::write(&stale_target_path, b"stale content").unwrap();
+        fs::write(&target_path, b"test content").unwrap();
+        std::os::unix::fs::symlink(&stale_target_path, &wip_path).unwrap();
+
+        atomic_symlink_update(&target_path, &link_path).unwrap();
+
+        assert_eq!(fs::read_link(&link_path).unwrap(), target_path);
+        assert!(!wip_path.is_symlink());
+    }
+
+    #[test]
     fn test_atomic_symlink_update_with_inotify() {
         let temp_dir = tempfile::tempdir().unwrap();
         let target_path = temp_dir.path().join("target_file");
@@ -302,5 +327,61 @@ mod tests {
             "Second event should be MOVED_TO"
         );
         assert_eq!(events[1].1, "my_link", "Second event should be for my_link");
+    }
+
+    #[test]
+    fn test_atomic_file_write_replaces_stale_wip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("content-addressed-file");
+        let wip = temp_dir.path().join("content-addressed-file.wip");
+        fs::write(&wip, b"partial").unwrap();
+
+        atomic_file_write(&path, b"complete").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"complete");
+        assert!(!wip.exists());
+    }
+
+    #[test]
+    fn test_atomic_file_write_publishes_with_rename() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("content-addressed-file");
+
+        let mut inotify = inotify::Inotify::init().unwrap();
+        inotify
+            .watches()
+            .add(
+                temp_dir.path(),
+                inotify::WatchMask::CREATE | inotify::WatchMask::MOVED_TO,
+            )
+            .unwrap();
+
+        atomic_file_write(&path, b"complete").unwrap();
+
+        let mut buffer = [0u8; 4096];
+        let events = inotify
+            .read_events_blocking(&mut buffer)
+            .unwrap()
+            .filter_map(|event| {
+                event
+                    .name
+                    .map(|name| (event.mask, name.to_string_lossy().to_string()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            [
+                (
+                    inotify::EventMask::CREATE,
+                    "content-addressed-file.wip".to_owned()
+                ),
+                (
+                    inotify::EventMask::MOVED_TO,
+                    "content-addressed-file".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"complete");
     }
 }

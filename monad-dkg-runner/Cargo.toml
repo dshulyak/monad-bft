@@ -1,0 +1,44 @@
+[package]
+name = "monad-dkg-runner"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+doctest = false
+
+[features]
+default = []
+blst-avx = ["dkg-protocol/blst-avx", "dkg-crypto/blst-avx"]
+
+[dependencies]
+dkg-core = { workspace = true }
+dkg-crypto = { workspace = true, features = ["blst-backend"] }
+dkg-protocol = { workspace = true, features = ["blst-backend"] }
+monad-chain-config = { workspace = true }
+monad-crypto = { workspace = true }
+monad-eth-types = { workspace = true }
+monad-ethcall = { workspace = true }
+monad-execution-state-read = { workspace = true }
+monad-types = { workspace = true }
+monad-validator = { workspace = true }
+
+alloy-rlp = { workspace = true, features = ["derive"] }
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-eips = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-sol-types = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+flume = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
