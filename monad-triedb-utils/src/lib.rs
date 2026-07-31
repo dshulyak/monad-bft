@@ -100,9 +100,9 @@ impl TriedbReader {
     }
 
     fn ensure_finalized_available(&self, block: SeqNum) -> Result<(), ExecutionStateReadExtError> {
-        let Some(latest) = self.get_latest_finalized_block() else {
-            return Err(ExecutionStateReadExtError::NotAvailableYet);
-        };
+        let latest = self
+            .get_latest_finalized_block()
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)?;
         if block > latest {
             return Err(ExecutionStateReadExtError::NotAvailableYet);
         }
@@ -183,18 +183,6 @@ impl TriedbReader {
         let block_header = Header::decode(&mut rlp_buf).expect("invalid rlp eth header");
 
         Some(EthHeader(block_header))
-    }
-
-    pub fn get_latest_proposed_eth_header(&self) -> Option<EthHeader> {
-        // Read the id twice so the id/height pair cannot straddle a proposal
-        // update. A transient mismatch is retried by the caller.
-        let block_id_before = self.get_latest_proposed_block_id()?;
-        let seq_num = self.get_latest_proposed_block()?;
-        let block_id_after = self.get_latest_proposed_block_id()?;
-        if block_id_before != block_id_after {
-            return None;
-        }
-        self.get_proposed_eth_header(&block_id_before, &seq_num)
     }
 
     // for accessing Version::Proposed, bft_id MUST BE VERIFIED
@@ -448,7 +436,17 @@ impl ExecutionStateReadExt<SecpSignature, BlsSignatureCollection<monad_secp::Pub
     for TriedbReader
 {
     fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
-        self.get_latest_proposed_eth_header()
+        // Read the id twice so the id/height pair cannot straddle a proposal update.
+        let block_id = self
+            .get_latest_proposed_block_id()
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)?;
+        let seq_num = self
+            .get_latest_proposed_block()
+            .ok_or(ExecutionStateReadExtError::NotAvailableYet)?;
+        if self.get_latest_proposed_block_id() != Some(block_id) {
+            return Err(ExecutionStateReadExtError::NotAvailableYet);
+        }
+        self.get_proposed_eth_header(&block_id, &seq_num)
             .ok_or(ExecutionStateReadExtError::NotAvailableYet)
     }
 

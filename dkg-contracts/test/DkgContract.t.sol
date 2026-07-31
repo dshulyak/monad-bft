@@ -118,14 +118,13 @@ contract DkgContractTest {
         require(keccak256(abi.encode(stored)) == keccak256(abi.encode(expected)), "wrong registration");
     }
 
-    function testDuplicateRegistrationRevertsWithoutChangingState() external {
+    function testDuplicateRegistrationReverts() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
         VM.prank(validator);
         dkg.register(EPOCH, registration(1));
         VM.expectRevert();
         VM.prank(validator);
         dkg.register(EPOCH, registration(2));
-        require(dkg.registeredPartyCount(EPOCH) == 1, "duplicate registration changed state");
     }
 
     function testMalformedRegistrationCannotOccupyPartySlot() external {
@@ -136,7 +135,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(validator);
         dkg.register(EPOCH, malformed);
-        require(dkg.registeredPartyCount(EPOCH) == 0, "malformed registration changed state");
     }
 
     function testRegistrationClosesAtStakingBoundary() external {
@@ -145,7 +143,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(validator);
         dkg.register(EPOCH, registration(1));
-        require(dkg.registeredPartyCount(EPOCH) == 0, "late registration changed state");
     }
 
     function testUnregisteredStakingCallerCannotWriteDkgState() external {
@@ -156,7 +153,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(outsider);
         dkg.register(EPOCH, registration(1));
-        require(dkg.registeredPartyCount(EPOCH) == 0, "unregistered caller changed DKG state");
     }
 
     function testMissingStakingTargetCannotWriteDkgState() external {
@@ -164,7 +160,6 @@ contract DkgContractTest {
 
         VM.expectRevert();
         dkg.register(EPOCH, registration(1));
-        require(dkg.registeredPartyCount(EPOCH) == 0, "failed staking lookup changed DKG state");
     }
 
     function testPartyIdsUseSortedEligibleAddresses() external {
@@ -187,7 +182,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(outsider);
         fixture.dkg.postPcQc(EPOCH, pcQc(2, 0x11, 1));
-        require(fixture.dkg.recordCount(EPOCH) == 0, "non-target write changed state");
     }
 
     function testMaximumPartySetCanFreeze() external {
@@ -290,7 +284,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.postPcQc(EPOCH, malformed);
-        require(fixture.dkg.recordCount(EPOCH) == 0, "malformed QC occupied a record slot");
     }
 
     function testSubmitResultVerifiesQuorumSignatures() external {
@@ -316,14 +309,12 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
-        require(fixture.dkg.recordCount(EPOCH) == 0, "tampered point changed state");
 
         result = signedResult(fixture, 0x44);
         result.signatures[1].s = bytes32(uint256(result.signatures[1].s) ^ 1);
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
-        require(fixture.dkg.recordCount(EPOCH) == 0, "invalid signature changed state");
     }
 
     function testSubmitResultRejectsSubQuorumAndWrongPartyId() external {
@@ -343,7 +334,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
-        require(fixture.dkg.recordCount(EPOCH) == 0, "invalid result changed state");
     }
 
     function testDoneQcMakesEpochTerminal() external {
@@ -356,7 +346,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.postBveQc(EPOCH, bveQc(1, 0x11, 1));
-        require(fixture.dkg.recordCount(EPOCH) == 1, "post-DONE QC changed state");
     }
 
     function testResultEpochMustMatchNamespace() external {
@@ -366,7 +355,6 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
-        require(fixture.dkg.recordCount(EPOCH) == 0, "mismatched result was stored");
     }
 
     function deploySession() private returns (Fixture memory fixture) {

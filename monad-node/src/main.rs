@@ -186,22 +186,20 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     let self_router_node_id = NodeId::new(node_state.router_identity.pubkey());
     let dkg_storage_root = node_state.wal_path.join("dkg");
     let state_read = build_state_reader(&node_state, SeqNum(EXECUTION_DELAY));
-    let (dkg_manager, dkg_local_tx_rx) = match build_manager(
+    let (dkg_manager, dkg_local_tx_rx) = build_manager(
         &node_state,
         self_router_node_id,
         &dkg_storage_root,
         state_read.clone(),
         SeqNum(EXECUTION_DELAY),
-    ) {
-        Ok(manager) => manager,
-        Err(err) => {
-            error!(?err, "failed to configure DKG manager chain integration");
-            (
-                monad_dkg_runner::DkgManager::new(self_router_node_id, dkg_storage_root.clone()),
-                None,
-            )
-        }
-    };
+    )
+    .unwrap_or_else(|err| {
+        error!(?err, "failed to configure DKG manager chain integration");
+        (
+            monad_dkg_runner::DkgManager::new(self_router_node_id, dkg_storage_root.clone()),
+            None,
+        )
+    });
     let (dkg_events, dkg_event_rx) = monad_dkg_runner::DkgManagerHandle::channel();
     let (dkg_outbound_tx, dkg_outbound_rx) = flume::unbounded();
     tokio::spawn(async move {
@@ -577,7 +575,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     Some(receiver) => receiver.recv_async().await,
                     None => std::future::pending().await,
                 }
-            }.boxed() => {
+            } => {
                 match local_tx {
                     Ok(transaction) => {
                         info!(
@@ -589,7 +587,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     Err(err) => warn!(?err, "DKG local transaction channel closed"),
                 }
             }
-            dkg_outbound = dkg_outbound_rx.recv_async().boxed() => {
+            dkg_outbound = dkg_outbound_rx.recv_async() => {
                 match dkg_outbound {
                     Ok(output) => executor.exec(vec![Command::RouterCommand(
                         RouterCommand::Publish {
@@ -743,7 +741,7 @@ fn schedule_dkg_session(
             node_id: validator.node_id,
             address: validator.node_id.pubkey().get_eth_address().into_array(),
         })
-        .collect::<Vec<_>>();
+        .collect();
     dkg_events.start_session(validator_set.epoch, validators);
 }
 

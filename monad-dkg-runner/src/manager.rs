@@ -213,9 +213,7 @@ where
             tokio::select! {
                 event = events.recv_async() => match event {
                     Ok(DkgManagerEvent::ChainProgress { block, next_epoch, sync_complete }) => {
-                        if let Err(err) = self.prepare_registration(next_epoch) {
-                            warn!(?err, epoch = next_epoch.0, "failed to prepare DKG registration");
-                        }
+                        self.prepare_registration(next_epoch);
                         if sync_complete {
                             self.notify_sync_complete(block);
                         } else {
@@ -251,23 +249,22 @@ where
     ///
     /// Calls are monotone and idempotent. Advancing the target abandons any
     /// unfinalized registration transaction for the older epoch.
-    pub fn prepare_registration(&mut self, epoch: Epoch) -> Result<(), DkgError> {
+    pub fn prepare_registration(&mut self, epoch: Epoch) {
         let Some(chain) = self.chain.as_mut() else {
-            return Ok(());
+            return;
         };
         if chain
             .registration
             .epoch
             .is_some_and(|current| current >= epoch)
         {
-            return Ok(());
+            return;
         }
         if let Some(previous) = chain.registration.epoch {
             chain.submitter.cancel_registration(previous);
         }
         chain.registration.start_epoch(epoch);
         self.schedule_local_registration_read();
-        Ok(())
     }
 
     /// Makes one more finalized block available to the active chain cursor.
@@ -433,7 +430,7 @@ where
         if chain.registration.epoch != Some(epoch) {
             return Ok(());
         }
-        let observed = state.registration.map(|bytes| bytes.to_vec());
+        let observed = state.registration;
         let local_bytes = match load_or_create_local_registration(
             &storage_root,
             epoch,
@@ -450,7 +447,7 @@ where
 
         if let Some(bytes) = observed {
             chain.registration.phase = LocalRegistrationPhase::Done;
-            if bytes != local_bytes {
+            if bytes.as_ref() != local_bytes.as_slice() {
                 return Err(DkgError::FinalizedRegistrationConflict {
                     address: chain.registration.address,
                 });
@@ -517,14 +514,12 @@ where
         epoch: Epoch,
         registrations: Vec<DkgRegistration>,
     ) -> Result<(), DkgError> {
-        if self
+        let Some((_, pending)) = self
             .pending_registered_session
-            .as_ref()
-            .is_none_or(|(pending_epoch, _)| *pending_epoch != epoch)
-        {
+            .take_if(|(pending_epoch, _)| *pending_epoch == epoch)
+        else {
             return Ok(());
-        }
-        let (_, pending) = self.pending_registered_session.take().unwrap();
+        };
         let recovery_block = pending
             .registration_block
             .expect("registration read has a finalized block");
@@ -543,8 +538,7 @@ where
             storage_root: self.storage_root.clone(),
             key_material: registered.key_material,
         };
-        self.start_session_at(config, Some(recovery_block))?;
-        Ok(())
+        self.start_session_at(config, Some(recovery_block))
     }
 
     fn start_session_at(
@@ -931,7 +925,7 @@ mod tests {
             chain.clone(),
         )
         .unwrap();
-        manager.prepare_registration(Epoch(2)).unwrap();
+        manager.prepare_registration(Epoch(2));
         manager.notify_sync_complete(SeqNum(10));
         let first = transaction_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let (address, keys) = {
@@ -1046,8 +1040,7 @@ mod tests {
             _contract: Address,
             _epoch: Epoch,
         ) -> Result<Option<Vec<DkgRegistration>>, crate::DkgError> {
-            let state = self.state.clone();
-            Ok(Some(state))
+            Ok(Some(self.state.clone()))
         }
 
         fn read_recovery_state(

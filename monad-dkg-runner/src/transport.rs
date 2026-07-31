@@ -196,12 +196,10 @@ where
         .encode();
         match self.outbox.entry(message_id.clone()) {
             Entry::Vacant(entry) => {
-                let mut recipients = BTreeMap::new();
-                recipients.insert(to, recipient);
                 entry.insert(OutboxMessage {
                     wire_payload: wire.clone(),
                     abort_group: send.abort_group,
-                    recipients,
+                    recipients: BTreeMap::from([(to, recipient)]),
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -226,10 +224,12 @@ where
         from: NodeId<CertificateSignaturePubKey<ST>>,
         key: DkgMessageKey,
     ) -> bool {
-        let message_id = DkgMessageId::single(key);
-        self.outbox.get(&message_id).is_some_and(|message| {
-            key.requires_transport_ack() && message.recipients.contains_key(&from)
-        })
+        if !key.requires_transport_ack() {
+            return false;
+        }
+        self.outbox
+            .get(&DkgMessageId::single(key))
+            .is_some_and(|message| message.recipients.contains_key(&from))
     }
 
     pub(crate) fn abort_group(&mut self, group: DeliveryAbortGroup) {

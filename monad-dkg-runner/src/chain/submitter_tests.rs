@@ -206,6 +206,26 @@ fn recovered_finalized_event_suppresses_late_submission() {
     assert!(local_rx.try_recv().is_err());
 }
 
+#[test]
+fn new_session_discards_old_artifacts_and_rejects_late_calls() {
+    let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
+    service.start_session(Epoch(2));
+    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    service.start_session(Epoch(3));
+    service.finalized_block(Epoch(3), Vec::new(), true);
+    service.submit(Epoch(2), pc_call(pc_qc(2, 2)));
+    let current = pc_call(pc_qc(3, 3));
+    service.submit(Epoch(3), current.clone());
+
+    let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let expected = contract_calldata(Epoch(3), &current, service.signer_address()).unwrap();
+    assert_eq!(transaction.input().as_ref(), expected.as_slice(),);
+    assert!(local_rx.try_recv().is_err());
+}
+
 struct TestChain {
     nonce: Arc<AtomicU64>,
     base_fee: Arc<AtomicU64>,

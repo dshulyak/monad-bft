@@ -3,11 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-use alloy_primitives::{Address, FixedBytes, TxHash, TxKind, U256};
+use alloy_consensus::{SignableTransaction, Transaction, TxEip1559, TxEnvelope};
+use alloy_primitives::{Address, FixedBytes, TxKind, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
+use dkg_crypto::BLS_G2_SERIALIZED_BYTES;
 use dkg_protocol::{ChainCall, ChainEvent};
 use monad_eth_types::buffered_base_fee_per_gas;
 use monad_types::Epoch;
@@ -25,11 +26,11 @@ use crate::DkgError;
 pub(crate) struct TxSubmitter {
     config: DkgChainConfig,
     signer: PrivateKeySigner,
-    signer_address: Address,
     chain: Arc<dyn DkgChain>,
     pending: BTreeMap<(Epoch, ChainTxId), PendingTx>,
     finalized: BTreeSet<(Epoch, ChainTxId)>,
-    ready_epochs: BTreeSet<Epoch>,
+    active_epoch: Option<Epoch>,
+    recovery_complete: bool,
 }
 
 impl TxSubmitter {
@@ -38,21 +39,20 @@ impl TxSubmitter {
         let key = FixedBytes::<32>::from(config.signing_key);
         let signer = PrivateKeySigner::from_bytes(&key)
             .map_err(|err| DkgError::operation("construct DKG transaction signer", err))?;
-        let signer_address = signer.address();
 
         Ok(Self {
             config,
             signer,
-            signer_address,
             chain,
             pending: BTreeMap::new(),
             finalized: BTreeSet::new(),
-            ready_epochs: BTreeSet::new(),
+            active_epoch: None,
+            recovery_complete: false,
         })
     }
 
     pub(crate) fn signer_address(&self) -> Address {
-        self.signer_address
+        self.signer.address()
     }
 
     pub(crate) fn submit_registration(&mut self, epoch: Epoch, bytes: Vec<u8>) {
@@ -66,12 +66,28 @@ impl TxSubmitter {
     }
 
     pub(crate) fn start_session(&mut self, epoch: Epoch) {
-        self.ready_epochs.remove(&epoch);
+        if self.active_epoch.is_none_or(|active| active < epoch) {
+            self.pending.retain(|(pending_epoch, id), _| {
+                *pending_epoch == epoch
+                    || (*pending_epoch > epoch && matches!(id, ChainTxId::Registration { .. }))
+            });
+            self.finalized.retain(|(finalized_epoch, id)| {
+                *finalized_epoch == epoch
+                    || (*finalized_epoch > epoch && matches!(id, ChainTxId::Registration { .. }))
+            });
+            self.active_epoch = Some(epoch);
+        }
+        if self.active_epoch == Some(epoch) {
+            self.recovery_complete = false;
+        }
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
         let key = (epoch, ChainTxId::from_call(&call));
         let immediate = matches!(&call, ChainCall::PostRegistration { .. });
+        if !immediate && self.active_epoch != Some(epoch) {
+            return;
+        }
 
         if self.finalized.contains(&key) || self.pending.contains_key(&key) {
             return;
@@ -84,7 +100,7 @@ impl TxSubmitter {
                 prepared: None,
             },
         );
-        if immediate || self.ready_epochs.contains(&epoch) {
+        if immediate || self.recovery_complete {
             self.submit_keys([key]);
         }
     }
@@ -119,15 +135,18 @@ impl TxSubmitter {
         events: Vec<ChainEvent>,
         recovery_complete_after: bool,
     ) {
+        if self.active_epoch != Some(epoch) {
+            return;
+        }
         for event in events {
             let id = ChainTxId::from_event(&event);
             self.finalized.insert((epoch, id.clone()));
             self.pending.remove(&(epoch, id));
         }
         if recovery_complete_after {
-            self.ready_epochs.insert(epoch);
+            self.recovery_complete = true;
         }
-        if self.ready_epochs.contains(&epoch) {
+        if self.recovery_complete {
             let keys = self
                 .pending
                 .keys()
@@ -146,8 +165,7 @@ impl TxSubmitter {
 
         let config = &self.config;
         let signer = &self.signer;
-        let signer_address = self.signer_address;
-        let transaction_context = match self.chain.transaction_context(signer_address) {
+        let transaction_context = match self.chain.transaction_context(signer.address()) {
             Ok(context) => context,
             Err(err) => {
                 warn!(?err, "failed to read DKG transaction context; will retry");
@@ -161,8 +179,9 @@ impl TxSubmitter {
 
         for pending in self.pending.values_mut() {
             if pending.prepared.as_ref().is_some_and(|prepared| {
-                prepared.nonce < chain_nonce
-                    || (prepared.nonce == chain_nonce && prepared.max_fee_per_gas < max_fee_per_gas)
+                prepared.nonce() < chain_nonce
+                    || (prepared.nonce() == chain_nonce
+                        && prepared.max_fee_per_gas() < max_fee_per_gas)
             }) {
                 pending.prepared = None;
             }
@@ -212,16 +231,16 @@ impl TxSubmitter {
         }
 
         let prepared = pending.prepared.as_ref().expect("prepared above");
-        match self.chain.submit_transaction(prepared.tx.clone()) {
+        match self.chain.submit_transaction(prepared.clone()) {
             Ok(()) => {
                 info!(
                     epoch = epoch.0,
                     call_kind,
-                    nonce = prepared.nonce,
+                    nonce = prepared.nonce(),
                     latest_base_fee_per_gas = transaction_context.base_fee_per_gas,
-                    max_fee_per_gas = prepared.max_fee_per_gas,
+                    max_fee_per_gas = prepared.max_fee_per_gas(),
                     max_priority_fee_per_gas = config.max_priority_fee_per_gas,
-                    tx_hash = %prepared.tx_hash,
+                    tx_hash = %prepared.tx_hash(),
                     "queued DKG transaction for local txpool insertion"
                 );
             }
@@ -230,8 +249,8 @@ impl TxSubmitter {
                     ?err,
                     epoch = epoch.0,
                     call_kind,
-                    nonce = prepared.nonce,
-                    tx_hash = %prepared.tx_hash,
+                    nonce = prepared.nonce(),
+                    tx_hash = %prepared.tx_hash(),
                     "failed to queue DKG chain tx; will retry"
                 );
             }
@@ -241,14 +260,7 @@ impl TxSubmitter {
 
 struct PendingTx {
     call: ChainCall,
-    prepared: Option<PreparedTx>,
-}
-
-struct PreparedTx {
-    nonce: u64,
-    max_fee_per_gas: u128,
-    tx_hash: TxHash,
-    tx: TxEnvelope,
+    prepared: Option<TxEnvelope>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -266,7 +278,7 @@ enum ChainTxId {
         digest: [u8; 32],
     },
     DkgResult {
-        g2x: Vec<u8>,
+        g2x: [u8; BLS_G2_SERIALIZED_BYTES],
     },
 }
 
@@ -288,9 +300,7 @@ impl ChainTxId {
                 commitment_digest: qc.commitment_digest,
                 digest: qc.digest,
             },
-            ChainCall::PostDkgResult { qc } => Self::DkgResult {
-                g2x: qc.g2x.0.to_vec(),
-            },
+            ChainCall::PostDkgResult { qc } => Self::DkgResult { g2x: qc.g2x.0 },
             ChainCall::PostRegistration { bytes, .. } => Self::registration(bytes),
         }
     }
@@ -306,9 +316,7 @@ impl ChainTxId {
                 commitment_digest: qc.commitment_digest,
                 digest: qc.digest,
             },
-            ChainEvent::DkgResultRecorded { qc, .. } => Self::DkgResult {
-                g2x: qc.g2x.0.to_vec(),
-            },
+            ChainEvent::DkgResultRecorded { qc, .. } => Self::DkgResult { g2x: qc.g2x.0 },
         }
     }
 }
@@ -320,7 +328,7 @@ fn prepare_chain_call(
     max_fee_per_gas: u128,
     epoch: Epoch,
     call: &ChainCall,
-) -> Result<PreparedTx, DkgError> {
+) -> Result<TxEnvelope, DkgError> {
     if let ChainCall::PostRegistration { dkg, .. } = call {
         if dkg.0 != config.contract.into_array() {
             return Err(DkgError::RegistrationContractMismatch {
@@ -344,13 +352,7 @@ fn prepare_chain_call(
     let signature = signer
         .sign_hash_sync(&transaction.signature_hash())
         .map_err(|err| DkgError::operation("sign DKG transaction", err))?;
-    let tx = TxEnvelope::Eip1559(transaction.into_signed(signature));
-    Ok(PreparedTx {
-        nonce,
-        max_fee_per_gas,
-        tx_hash: *tx.tx_hash(),
-        tx,
-    })
+    Ok(TxEnvelope::Eip1559(transaction.into_signed(signature)))
 }
 
 fn contract_calldata(epoch: Epoch, call: &ChainCall, signer: Address) -> Result<Vec<u8>, DkgError> {

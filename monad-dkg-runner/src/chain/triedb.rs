@@ -97,7 +97,7 @@ where
         &self,
         block: SeqNum,
         contract: Address,
-        epoch: monad_types::Epoch,
+        epoch: Epoch,
         party_count: usize,
     ) -> Result<Option<Vec<ChainEvent>>, DkgError> {
         let mut state = self.state_read.clone();
@@ -342,7 +342,7 @@ mod tests {
     fn matcher_decodes_all_contract_record_types() {
         let contract = Address::repeat_byte(0xD0);
         let matcher = DkgLogMatcher::new(contract);
-        let calls = vec![
+        let calls = [
             ChainCall::PostPCQc {
                 qc: PCQc {
                     dealer: PartyId(1),

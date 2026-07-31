@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use crate::{DkgLocalRegistrationState, DkgRegistration};
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
+use alloy_primitives::{Address, Signature, TxKind, U256};
 use alloy_sol_types::SolCall;
 use dkg_core::RecordId;
 use dkg_protocol::ChainEvent;
@@ -20,7 +20,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_ethcall::{CallResult, ChainId, EthCallResult};
 use monad_execution_state_read::{
-    ExecutionStateRead, ExecutionStateReadExt, ExecutionStateReadExtError, FinalizedEthCallRequest,
+    ExecutionStateReadExt, ExecutionStateReadExtError, FinalizedEthCallRequest,
 };
 use monad_types::{Epoch, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
@@ -88,21 +88,6 @@ impl TriedbDkgStateReader {
         })
     }
 
-    fn is_stable_finalized_state<ST, SCT>(
-        &self,
-        state_read: &impl ExecutionStateRead<ST, SCT>,
-        block: SeqNum,
-    ) -> bool
-    where
-        ST: CertificateSignatureRecoverable,
-        SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    {
-        let required_head = SeqNum(block.0.saturating_add(self.execution_delay.0));
-        state_read
-            .raw_read_latest_finalized_block()
-            .is_some_and(|latest| latest >= required_head)
-    }
-
     fn state_context<ST, SCT>(
         &self,
         state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
@@ -113,7 +98,11 @@ impl TriedbDkgStateReader {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        if !self.is_stable_finalized_state(state_read, block) {
+        let required_head = SeqNum(block.0.saturating_add(self.execution_delay.0));
+        if state_read
+            .raw_read_latest_finalized_block()
+            .is_none_or(|latest| latest < required_head)
+        {
             return Ok(None);
         }
         let header = match state_read.get_finalized_block_header(block) {
@@ -311,7 +300,6 @@ impl TriedbDkgStateReader {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        let input = call.abi_encode();
         let transaction = TxEip1559 {
             chain_id: self.numeric_chain_id,
             nonce: 0,
@@ -321,7 +309,7 @@ impl TriedbDkgStateReader {
             to: TxKind::Call(contract),
             value: U256::ZERO,
             access_list: Default::default(),
-            input: Bytes::from(input),
+            input: call.abi_encode().into(),
         };
         let transaction: TxEnvelope = transaction
             .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))

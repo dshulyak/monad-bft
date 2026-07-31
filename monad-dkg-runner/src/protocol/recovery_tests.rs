@@ -87,6 +87,12 @@ impl ContractModel {
         self.events.push(event.clone());
         Some(event)
     }
+
+    fn has_result(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| matches!(event, ChainEvent::DkgResultRecorded { .. }))
+    }
 }
 
 struct FourNodeRecoveryModel {
@@ -294,10 +300,7 @@ impl FourNodeRecoveryModel {
     }
 
     fn completed(&self) -> bool {
-        self.chain
-            .events
-            .iter()
-            .any(|event| matches!(event, ChainEvent::DkgResultRecorded { .. }))
+        self.chain.has_result()
             && self.nodes.iter().all(|node| {
                 node.runtime.as_ref().is_some_and(|runtime| {
                     runtime.runner.engine.phase() == DkgEnginePhase::Complete
@@ -375,11 +378,7 @@ fn fourth_node_recovers_after_other_nodes_finish() {
 
     for _ in 0..QUIET_RECOVERY_STEPS {
         model.exchange_step();
-        if model
-            .chain
-            .events
-            .iter()
-            .any(|event| matches!(event, ChainEvent::DkgResultRecorded { .. }))
+        if model.chain.has_result()
             && model.nodes[1..].iter().all(|node| {
                 node.runtime.as_ref().is_some_and(|runtime| {
                     runtime.runner.engine.phase() == DkgEnginePhase::Complete
@@ -390,11 +389,7 @@ fn fourth_node_recovers_after_other_nodes_finish() {
         }
     }
     assert!(
-        model
-            .chain
-            .events
-            .iter()
-            .any(|event| matches!(event, ChainEvent::DkgResultRecorded { .. })),
+        model.chain.has_result(),
         "three live nodes did not finalize DKG"
     );
 

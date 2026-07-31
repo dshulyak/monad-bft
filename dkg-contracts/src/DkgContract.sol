@@ -99,7 +99,6 @@ contract DkgContract {
     mapping(uint64 epoch => DkgRecord[] records) private recordsByEpoch;
     mapping(uint64 epoch => address[] parties) private registeredPartiesByEpoch;
     mapping(uint64 epoch => mapping(address party => Registration registration)) private registrations;
-    mapping(uint64 epoch => mapping(address party => bool registered)) private isRegistered;
     /// @dev Bit `i` says registration `i` belongs to the frozen target set.
     /// Registrations close before freezing, so one word preserves membership;
     /// canonical addresses are reconstructed and sorted when needed.
@@ -168,14 +167,13 @@ contract DkgContract {
 
     function register(uint64 epoch, Registration calldata registration) external onlyValidator {
         _requireRegistrationOpen(epoch);
-        if (isRegistered[epoch][msg.sender]) {
+        if (registrations[epoch][msg.sender].qcVerifyingKey.prefix != 0) {
             revert AlreadyRegistered(epoch, msg.sender);
         }
         if (registeredPartiesByEpoch[epoch].length == MAX_PARTIES) {
             revert TooManyRegistrations(epoch);
         }
         _validateRegistration(registration);
-        isRegistered[epoch][msg.sender] = true;
         registrations[epoch][msg.sender] = registration;
         registeredPartiesByEpoch[epoch].push(msg.sender);
         emit PartyRegistered(epoch, msg.sender, registration);
@@ -186,7 +184,7 @@ contract DkgContract {
             revert DkgAlreadyFinished(epoch);
         }
         _validateQc(qc.dealer, qc.signatures);
-        bytes32 witnessHash = keccak256(abi.encode(RecordKind.PcQc, qc));
+        bytes32 witnessHash = keccak256(abi.encode(qc));
         if (seenPcQcs[epoch][witnessHash]) {
             return;
         }
@@ -246,7 +244,8 @@ contract DkgContract {
         view
         returns (bool exists, Registration memory registration)
     {
-        return (isRegistered[epoch][party], registrations[epoch][party]);
+        registration = registrations[epoch][party];
+        exists = registration.qcVerifyingKey.prefix != 0;
     }
 
     function registeredPartyCount(uint64 epoch) external view returns (uint256) {

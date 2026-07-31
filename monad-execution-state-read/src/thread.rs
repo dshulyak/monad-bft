@@ -71,10 +71,6 @@ where
     TotalDbLookups {
         tx: mpsc::SyncSender<u64>,
     },
-    Extended(ExecutionStateReadExtThreadRequest),
-}
-
-enum ExecutionStateReadExtThreadRequest {
     GetLatestBlockHeader {
         tx: mpsc::SyncSender<Result<EthHeader, ExecutionStateReadExtError>>,
     },
@@ -95,32 +91,6 @@ enum ExecutionStateReadExtThreadRequest {
         request: FinalizedEthCallRequest,
         tx: mpsc::SyncSender<Result<CallResult, ExecutionStateReadExtError>>,
     },
-}
-
-impl ExecutionStateReadExtThreadRequest {
-    fn execute<ST, SCT>(self, state_read: &mut impl ExecutionStateReadExt<ST, SCT>)
-    where
-        ST: CertificateSignatureRecoverable,
-        SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    {
-        match self {
-            Self::GetLatestBlockHeader { tx } => {
-                let _ = tx.send(state_read.get_latest_block_header());
-            }
-            Self::GetFinalizedAccount { block, address, tx } => {
-                let _ = tx.send(state_read.get_finalized_account(block, address));
-            }
-            Self::GetFinalizedBlockHeader { block, tx } => {
-                let _ = tx.send(state_read.get_finalized_block_header(block));
-            }
-            Self::GetFinalizedReceipts { block, tx } => {
-                let _ = tx.send(state_read.get_finalized_receipts(block));
-            }
-            Self::EthCall { request, tx } => {
-                let _ = tx.send(state_read.eth_call(request));
-            }
-        }
-    }
 }
 
 impl<ST, SCT> ExecutionStateReadThreadRequest<ST, SCT>
@@ -168,7 +138,21 @@ where
             Self::TotalDbLookups { tx } => tx
                 .send(state_read.total_db_lookups())
                 .expect("ExecutionStateReadThreadClient is alive"),
-            Self::Extended(request) => request.execute(state_read),
+            Self::GetLatestBlockHeader { tx } => {
+                let _ = tx.send(state_read.get_latest_block_header());
+            }
+            Self::GetFinalizedAccount { block, address, tx } => {
+                let _ = tx.send(state_read.get_finalized_account(block, address));
+            }
+            Self::GetFinalizedBlockHeader { block, tx } => {
+                let _ = tx.send(state_read.get_finalized_block_header(block));
+            }
+            Self::GetFinalizedReceipts { block, tx } => {
+                let _ = tx.send(state_read.get_finalized_receipts(block));
+            }
+            Self::EthCall { request, tx } => {
+                let _ = tx.send(state_read.eth_call(request));
+            }
         }
     }
 }
@@ -296,10 +280,8 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
 {
     fn get_latest_block_header(&mut self) -> Result<EthHeader, ExecutionStateReadExtError> {
-        self.send_and_recv_request(|tx| {
-            ExecutionStateReadThreadRequest::Extended(
-                ExecutionStateReadExtThreadRequest::GetLatestBlockHeader { tx },
-            )
+        self.send_and_recv_request(|tx| ExecutionStateReadThreadRequest::GetLatestBlockHeader {
+            tx,
         })
     }
 
@@ -308,10 +290,10 @@ where
         block: SeqNum,
         address: Address,
     ) -> Result<Option<EthAccount>, ExecutionStateReadExtError> {
-        self.send_and_recv_request(|tx| {
-            ExecutionStateReadThreadRequest::Extended(
-                ExecutionStateReadExtThreadRequest::GetFinalizedAccount { block, address, tx },
-            )
+        self.send_and_recv_request(|tx| ExecutionStateReadThreadRequest::GetFinalizedAccount {
+            block,
+            address,
+            tx,
         })
     }
 
@@ -319,21 +301,18 @@ where
         &mut self,
         block: SeqNum,
     ) -> Result<EthHeader, ExecutionStateReadExtError> {
-        self.send_and_recv_request(|tx| {
-            ExecutionStateReadThreadRequest::Extended(
-                ExecutionStateReadExtThreadRequest::GetFinalizedBlockHeader { block, tx },
-            )
-        })
+        self.send_and_recv_request(
+            |tx| ExecutionStateReadThreadRequest::GetFinalizedBlockHeader { block, tx },
+        )
     }
 
     fn get_finalized_receipts(
         &mut self,
         block: SeqNum,
     ) -> Result<Vec<ReceiptWithLogIndex>, ExecutionStateReadExtError> {
-        self.send_and_recv_request(|tx| {
-            ExecutionStateReadThreadRequest::Extended(
-                ExecutionStateReadExtThreadRequest::GetFinalizedReceipts { block, tx },
-            )
+        self.send_and_recv_request(|tx| ExecutionStateReadThreadRequest::GetFinalizedReceipts {
+            block,
+            tx,
         })
     }
 
@@ -341,12 +320,7 @@ where
         &mut self,
         request: FinalizedEthCallRequest,
     ) -> Result<CallResult, ExecutionStateReadExtError> {
-        self.send_and_recv_request(|tx| {
-            ExecutionStateReadThreadRequest::Extended(ExecutionStateReadExtThreadRequest::EthCall {
-                request,
-                tx,
-            })
-        })
+        self.send_and_recv_request(|tx| ExecutionStateReadThreadRequest::EthCall { request, tx })
     }
 }
 
