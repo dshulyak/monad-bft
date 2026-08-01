@@ -101,6 +101,11 @@ impl DkgMessageStore {
         if identity.persistence == DkgMessagePersistence::Durable {
             self.wal.append(&RecoveryRecord::Incoming(record.clone()))?;
             self.index_incoming(record, identity.keys.iter().copied());
+            failpoint::failpoint!(
+                name = "dkg.peer.input_persisted",
+                description =
+                    "after durable peer ingress and before generated effects are dispatched",
+            );
         }
         Ok(IncomingStatus::New)
     }
@@ -191,6 +196,10 @@ impl DkgMessageStore {
 
         self.wal.append(&RecoveryRecord::Outgoing(record.clone()))?;
         self.index_outgoing(record, keys);
+        failpoint::failpoint!(
+            name = "dkg.network.outgoing_persisted",
+            description = "after durable DKG output and before network delivery is queued",
+        );
         Ok(true)
     }
 

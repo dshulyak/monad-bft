@@ -10,7 +10,7 @@ use alloy_consensus::Transaction;
 use dkg_core::{PartyId, RecordId, SessionId};
 use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{ChainCall, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes};
-use monad_types::Epoch;
+use monad_types::{Epoch, SeqNum};
 
 use super::*;
 use crate::{DkgLocalKeyMaterial, DkgTransactionContext};
@@ -60,10 +60,10 @@ fn submission_waits_for_chain_recovery_gate() {
     service.submit(Epoch(2), pc_call(pc_qc(1, 0x11)));
 
     assert!(local_rx.try_recv().is_err());
-    service.finalized_block(Epoch(2), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
     assert!(local_rx.try_recv().is_err());
 
-    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
     assert!(local_rx.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -77,19 +77,19 @@ fn retries_same_local_transaction_on_finalized_blocks_until_matching_event() {
     };
     let (mut service, local_rx) = test_submitter(5, Arc::clone(&nonce_reads));
     service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
 
     service.submit(Epoch(2), pc_call(qc));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(first.is_eip1559());
-    service.finalized_block(Epoch(2), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(first, second);
     assert_eq!(decode_nonce(&first), 5);
     assert_eq!(nonce_reads.load(Ordering::SeqCst), 2);
 
-    service.finalized_block(Epoch(2), vec![event], false);
-    service.finalized_block(Epoch(2), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(12), vec![event], false);
+    service.finalized_block(Epoch(2), SeqNum(13), Vec::new(), false);
     assert!(local_rx.try_recv().is_err());
 }
 
@@ -101,18 +101,30 @@ fn registration_retries_same_transaction_until_finalized_state_confirms_it() {
         .registration_bytes(service.signer_address().into_array(), 2)
         .unwrap();
 
-    service.submit_registration(Epoch(2), registration.clone());
+    service.submit_registration(Epoch(2), SeqNum(10), registration.clone());
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-    service.retry_registration(Epoch(2));
+    service.retry_registration(Epoch(2), SeqNum(11));
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(second, first);
     assert_eq!(decode_nonce(&second), 5);
     assert_eq!(nonce_reads.load(Ordering::SeqCst), 2);
 
     service.confirm_registration(Epoch(2), &registration);
-    service.retry_registration(Epoch(2));
+    service.retry_registration(Epoch(2), SeqNum(12));
     assert!(local_rx.try_recv().is_err());
+}
+
+#[test]
+fn nonce_read_uses_the_scanned_event_block() {
+    let context_block = Arc::new(AtomicU64::new(0));
+    let (mut service, local_rx) = test_submitter_with_context_block(Arc::clone(&context_block));
+    service.start_session(Epoch(2));
+    service.finalized_block(Epoch(2), SeqNum(42), Vec::new(), true);
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(context_block.load(Ordering::SeqCst), 42);
 }
 
 #[test]
@@ -120,7 +132,7 @@ fn serializes_artifacts_without_leaving_a_nonce_gap() {
     let nonce_reads = Arc::new(AtomicUsize::new(0));
     let (mut service, local_rx) = test_submitter(11, Arc::clone(&nonce_reads));
     service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
 
     let first_qc = pc_qc(1, 1);
     let second_qc = pc_qc(2, 2);
@@ -133,6 +145,7 @@ fn serializes_artifacts_without_leaving_a_nonce_gap() {
 
     service.finalized_block(
         Epoch(2),
+        SeqNum(11),
         vec![ChainEvent::PCQc {
             record_id: RecordId(9),
             qc: first_qc,
@@ -145,22 +158,69 @@ fn serializes_artifacts_without_leaving_a_nonce_gap() {
 }
 
 #[test]
-fn reprepares_active_artifact_after_finalized_nonce_advances() {
+fn retires_active_artifact_after_finalized_nonce_advances_without_event() {
     let nonce = Arc::new(AtomicU64::new(5));
     let (mut service, local_rx) =
         test_submitter_with_nonce(Arc::clone(&nonce), Arc::new(AtomicUsize::new(0)));
     service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
 
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     nonce.store(6, Ordering::SeqCst);
-    service.finalized_block(Epoch(2), Vec::new(), false);
-    let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
 
     assert_eq!(decode_nonce(&first), 5);
-    assert_eq!(decode_nonce(&second), 6);
-    assert_ne!(first, second);
+    assert!(local_rx.try_recv().is_err());
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    assert!(local_rx.try_recv().is_err());
+}
+
+#[test]
+fn new_artifact_uses_newest_context_across_sessions() {
+    let nonce = Arc::new(AtomicU64::new(5));
+    let context_block = Arc::new(AtomicU64::new(0));
+    let (mut service, local_rx) = test_submitter_with_context_and_block(
+        Arc::clone(&nonce),
+        Arc::new(AtomicU64::new(100)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::clone(&context_block),
+    );
+    service.start_session(Epoch(2));
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    let registration = DkgLocalKeyMaterial::derive([0x01; 32])
+        .registration_bytes(service.signer_address().into_array(), 3)
+        .unwrap();
+    service.submit_registration(Epoch(3), SeqNum(20), registration.clone());
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    service.confirm_registration(Epoch(3), &registration);
+    nonce.store(6, Ordering::SeqCst);
+
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(decode_nonce(&transaction), 6);
+    assert_eq!(context_block.load(Ordering::SeqCst), 20);
+}
+
+#[test]
+fn active_artifact_keeps_its_epoch_context() {
+    let context_block = Arc::new(AtomicU64::new(0));
+    let (mut service, local_rx) = test_submitter_with_context_block(Arc::clone(&context_block));
+    service.start_session(Epoch(2));
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let registration = DkgLocalKeyMaterial::derive([0x01; 32])
+        .registration_bytes(service.signer_address().into_array(), 3)
+        .unwrap();
+    service.submit_registration(Epoch(3), SeqNum(20), registration);
+
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
+    let retry = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(retry, first);
+    assert_eq!(context_block.load(Ordering::SeqCst), 10);
 }
 
 #[test]
@@ -173,14 +233,14 @@ fn reprepares_active_artifact_when_buffered_base_fee_increases() {
         Arc::new(AtomicUsize::new(0)),
     );
     service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
 
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(decode_max_fee_per_gas(&first), 151);
 
     base_fee.store(200, Ordering::SeqCst);
-    service.finalized_block(Epoch(2), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     assert_eq!(decode_nonce(&second), 5);
@@ -195,6 +255,7 @@ fn recovered_finalized_event_suppresses_late_submission() {
     let qc = pc_qc(3, 0x77);
     service.finalized_block(
         Epoch(2),
+        SeqNum(10),
         vec![ChainEvent::PCQc {
             record_id: RecordId(9),
             qc: qc.clone(),
@@ -207,22 +268,36 @@ fn recovered_finalized_event_suppresses_late_submission() {
 }
 
 #[test]
-fn new_session_discards_old_artifacts_and_rejects_late_calls() {
+fn overlapping_session_accepts_late_calls_from_previous_epoch() {
     let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
     service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), Vec::new(), true);
-    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
-    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
     service.start_session(Epoch(3));
-    service.finalized_block(Epoch(3), Vec::new(), true);
-    service.submit(Epoch(2), pc_call(pc_qc(2, 2)));
-    let current = pc_call(pc_qc(3, 3));
-    service.submit(Epoch(3), current.clone());
+    service.finalized_block(Epoch(3), SeqNum(20), Vec::new(), true);
+    let previous = pc_call(pc_qc(2, 2));
+    service.submit(Epoch(2), previous.clone());
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let expected = contract_calldata(Epoch(3), &current, service.signer_address()).unwrap();
+    let expected = contract_calldata(Epoch(2), &previous, service.signer_address()).unwrap();
     assert_eq!(transaction.input().as_ref(), expected.as_slice(),);
+    assert!(local_rx.try_recv().is_err());
+}
+
+#[test]
+fn third_session_evicts_oldest_epoch_and_rejects_its_late_calls() {
+    let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
+    for epoch in [Epoch(2), Epoch(3), Epoch(4)] {
+        service.start_session(epoch);
+        service.finalized_block(epoch, SeqNum(epoch.0 * 10), Vec::new(), true);
+    }
+
+    service.submit(Epoch(2), pc_call(pc_qc(2, 2)));
+    let current = pc_call(pc_qc(4, 4));
+    service.submit(Epoch(4), current.clone());
+
+    let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let expected = contract_calldata(Epoch(4), &current, service.signer_address()).unwrap();
+    assert_eq!(transaction.input().as_ref(), expected.as_slice());
     assert!(local_rx.try_recv().is_err());
 }
 
@@ -230,15 +305,18 @@ struct TestChain {
     nonce: Arc<AtomicU64>,
     base_fee: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
+    context_block: Arc<AtomicU64>,
     transactions: flume::Sender<TxEnvelope>,
 }
 
 impl DkgChain for TestChain {
     fn transaction_context(
         &self,
+        block: SeqNum,
         _address: Address,
     ) -> Result<DkgTransactionContext, crate::DkgError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.context_block.store(block.0, Ordering::SeqCst);
         Ok(DkgTransactionContext {
             nonce: self.nonce.load(Ordering::SeqCst),
             base_fee_per_gas: self.base_fee.load(Ordering::SeqCst),
@@ -271,11 +349,32 @@ fn test_submitter_with_context(
     base_fee: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
 ) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
+    test_submitter_with_context_and_block(nonce, base_fee, reads, Arc::new(AtomicU64::new(0)))
+}
+
+fn test_submitter_with_context_block(
+    context_block: Arc<AtomicU64>,
+) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
+    test_submitter_with_context_and_block(
+        Arc::new(AtomicU64::new(5)),
+        Arc::new(AtomicU64::new(100)),
+        Arc::new(AtomicUsize::new(0)),
+        context_block,
+    )
+}
+
+fn test_submitter_with_context_and_block(
+    nonce: Arc<AtomicU64>,
+    base_fee: Arc<AtomicU64>,
+    reads: Arc<AtomicUsize>,
+    context_block: Arc<AtomicU64>,
+) -> (TxSubmitter, flume::Receiver<TxEnvelope>) {
     let (transactions, receiver) = flume::unbounded();
     let chain = Arc::new(TestChain {
         nonce,
         base_fee,
         reads,
+        context_block,
         transactions,
     });
     let config = DkgChainConfig::new([0x01; 32], Address::repeat_byte(0x22), 0x4eaf);

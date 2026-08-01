@@ -57,6 +57,7 @@ agent = { workspace = true }
 alloy-rlp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+failpoint = { workspace = true, features = ["http"], optional = true }
 flume = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }

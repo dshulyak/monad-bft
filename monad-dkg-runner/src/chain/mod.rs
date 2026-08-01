@@ -104,12 +104,17 @@ pub trait DkgChain: Send + Sync + 'static {
         Err(DkgError::Unsupported("DKG finalized-event reads"))
     }
 
-    /// Reads the signer nonce and the latest proposed block's base fee.
+    /// Reads the signer nonce at `block` and the latest proposed block's base fee.
     ///
-    /// The base-fee boundary matches RPC's `latest` block tag. Implementations
-    /// may use a finalized account boundary for the nonce so retries never skip
-    /// an unfinalized transaction.
-    fn transaction_context(&self, _address: Address) -> Result<DkgTransactionContext, DkgError> {
+    /// The base-fee boundary matches RPC's `latest` block tag. Aligning the
+    /// nonce with the event scan prevents a transaction that has
+    /// finalized but whose event has not yet been scanned from being submitted
+    /// again at a new nonce.
+    fn transaction_context(
+        &self,
+        _block: SeqNum,
+        _address: Address,
+    ) -> Result<DkgTransactionContext, DkgError> {
         Err(DkgError::Unsupported("DKG transaction context reads"))
     }
 

@@ -342,6 +342,13 @@ pub(crate) fn recovery_wal_path(root: &Path, epoch: Epoch) -> PathBuf {
     root.join(format!("dkg-recovery-{}.wal", epoch.0))
 }
 
+pub(crate) fn recovery_epochs(root: &Path) -> Result<Vec<Epoch>, RecoveryWalError> {
+    Ok(recovery_wals(root)?
+        .into_iter()
+        .map(|(epoch, _)| epoch)
+        .collect())
+}
+
 fn retain_recent_epoch_wals(
     root: &Path,
     current_epoch: Epoch,
@@ -350,39 +357,46 @@ fn retain_recent_epoch_wals(
     if max_epochs == 0 {
         return Ok(());
     }
-    let mut epochs = Vec::new();
-    let prefix = "dkg-recovery-";
-    let suffix = ".wal";
-    for entry in fs::read_dir(root).map_err(|err| io_error("read root for", root, err))? {
-        let entry = entry.map_err(|err| io_error("read root entry for", root, err))?;
-        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(epoch) = file_name
-            .strip_prefix(prefix)
-            .and_then(|tail| tail.strip_suffix(suffix))
-            .and_then(|epoch| epoch.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        epochs.push((epoch, entry.path()));
-    }
-
-    epochs.sort_by_key(|(epoch, _)| *epoch);
+    let epochs = recovery_wals(root)?;
     let newer_count = epochs
         .iter()
-        .filter(|(epoch, _)| *epoch > current_epoch.0)
+        .filter(|(epoch, _)| *epoch > current_epoch)
         .count();
     let previous_to_keep = max_epochs.saturating_sub(1 + newer_count);
     let expired = epochs
         .into_iter()
         .rev()
-        .filter(|(epoch, _)| *epoch < current_epoch.0)
+        .filter(|(epoch, _)| *epoch < current_epoch)
         .skip(previous_to_keep);
     for (_, path) in expired {
         fs::remove_file(&path).map_err(|err| io_error("remove old", &path, err))?;
     }
     Ok(())
+}
+
+fn recovery_wals(root: &Path) -> Result<Vec<(Epoch, PathBuf)>, RecoveryWalError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(io_error("read root for", root, err)),
+    };
+    let mut epochs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read root entry for", root, err))?;
+        let Some(epoch) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("dkg-recovery-"))
+            .and_then(|name| name.strip_suffix(".wal"))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+            .map(Epoch)
+        else {
+            continue;
+        };
+        epochs.push((epoch, entry.path()));
+    }
+    epochs.sort_unstable_by_key(|(epoch, _)| *epoch);
+    Ok(epochs)
 }
 
 #[cfg(target_os = "linux")]

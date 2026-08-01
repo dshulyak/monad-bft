@@ -242,6 +242,22 @@ fn wal_rotation_does_not_delete_newer_epochs() {
 }
 
 #[test]
+fn lists_recoverable_epochs_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("dkg-recovery-9.wal"), []).unwrap();
+    fs::write(dir.path().join("dkg-recovery-7.wal"), []).unwrap();
+    fs::write(dir.path().join("unrelated"), []).unwrap();
+
+    assert_eq!(
+        recovery_epochs(dir.path()).unwrap(),
+        vec![Epoch(7), Epoch(9)]
+    );
+    assert!(recovery_epochs(&dir.path().join("missing"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn wal_open_truncates_torn_tail_after_last_valid_record() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = open_wal(dir.path(), 7);

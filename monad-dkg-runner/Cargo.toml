@@ -31,6 +31,7 @@ alloy-signer-local = { workspace = true }
 alloy-sol-types = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+failpoint = { workspace = true }
 flume = { workspace = true }
 getrandom = { workspace = true }
 libc = { workspace = true }
@@ -40,5 +41,6 @@ tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+failpoint = { workspace = true, features = ["failpoints"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }

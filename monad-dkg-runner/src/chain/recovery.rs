@@ -13,8 +13,6 @@ use tracing::info;
 use super::DkgChain;
 use crate::DkgError;
 
-const MAX_CHAIN_EVENT_SESSIONS: usize = 2;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChainEventSession {
     pub epoch: Epoch,
@@ -25,6 +23,7 @@ pub(crate) struct ChainEventSession {
 #[derive(Debug)]
 pub(crate) struct ChainEventBatch {
     pub session: ChainEventSession,
+    pub block: SeqNum,
     pub events: Vec<ChainEvent>,
     pub recovery_complete_after: bool,
 }
@@ -64,7 +63,7 @@ impl ChainEventReader {
     pub(crate) fn start_session(&mut self, session: ChainEventSession) {
         self.scans
             .insert(session.epoch, SessionScan::new(session, self.finalized));
-        while self.scans.len() > MAX_CHAIN_EVENT_SESSIONS {
+        while self.scans.len() > crate::MAX_RETAINED_DKG_SESSIONS {
             let (epoch, _) = self.scans.pop_first().expect("excess scan");
             info!(epoch = epoch.0, "retired old DKG chain cursor");
         }
@@ -110,6 +109,7 @@ impl ChainEventReader {
         }
         Ok(ChainEventBatch {
             session,
+            block: read.block(),
             events,
             recovery_complete_after,
         })

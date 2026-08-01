@@ -79,6 +79,7 @@ ARG GIT_BRANCH=""
 ARG GIT_TAG=""
 ARG GIT_MODIFIED="false"
 ARG TOOLCHAIN="gcc-avx512"
+ARG MONAD_NODE_FEATURES=""
 
 ENV GIT_COMMIT=$GIT_COMMIT
 ENV GIT_BRANCH=$GIT_BRANCH
@@ -95,7 +96,7 @@ RUN case "$TOOLCHAIN" in \
       *) echo "unsupported TOOLCHAIN=$TOOLCHAIN" >&2; exit 2 ;; \
     esac && \
     ASMFLAGS="$cpu_flags" CFLAGS="$cpu_flags -fno-omit-frame-pointer" CXXFLAGS="$cpu_flags -fno-omit-frame-pointer" \
-    RUSTFLAGS="-C target-cpu=$rust_cpu -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo build --release --bin monad-node --bin monad-keystore --bin monad-debug-node --example ledger-tail --example wal2json --example triedb-bench --example sign-name-record && \
+    RUSTFLAGS="-C target-cpu=$rust_cpu -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo build --release --features "$MONAD_NODE_FEATURES" --bin monad-node --bin monad-keystore --bin monad-debug-node --example ledger-tail --example wal2json --example triedb-bench --example sign-name-record && \
     mv target/release/monad-node monad-node && \
     mv target/release/monad-keystore keystore && \
     mv target/release/monad-debug-node monad-debug-node && \

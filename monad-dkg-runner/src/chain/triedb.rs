@@ -9,8 +9,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_execution_state_read::{
-    ExecutionStateRead, ExecutionStateReadExt, ExecutionStateReadExtError,
-    ExecutionStateReadThreadClient,
+    ExecutionStateReadExt, ExecutionStateReadExtError, ExecutionStateReadThreadClient,
 };
 use monad_types::{Epoch, NodeId, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
@@ -123,16 +122,15 @@ where
         .map_err(|source| DkgError::operation("read finalized DKG events", source))
     }
 
-    fn transaction_context(&self, address: Address) -> Result<DkgTransactionContext, DkgError> {
+    fn transaction_context(
+        &self,
+        block: SeqNum,
+        address: Address,
+    ) -> Result<DkgTransactionContext, DkgError> {
         let mut state_read = self.state_read.clone();
         let latest_header = state_read.get_latest_block_header().map_err(|source| {
             DkgError::operation("read latest DKG transaction base fee", source)
         })?;
-        let block = state_read
-            .raw_read_latest_finalized_block()
-            .ok_or(DkgError::Unsupported(
-                "DKG transaction context read without a finalized block",
-            ))?;
         let nonce = state_read
             .get_finalized_account(block, address)
             .map_err(|source| DkgError::operation("read finalized DKG nonce", source))?

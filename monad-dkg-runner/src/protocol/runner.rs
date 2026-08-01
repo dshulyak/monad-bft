@@ -131,6 +131,10 @@ where
     let engine_seed = recovery_state
         .load_or_create_engine_seed(&mut recovery_wal)
         .map_err(|err| DkgError::operation("persist DKG engine seed", err))?;
+    failpoint::failpoint!(
+        name = "dkg.session.seed_persisted",
+        description = "after the DKG engine seed is durable and before runner construction",
+    );
     let mut runner = Runner::new(RunnerInit {
         epoch,
         self_party,
@@ -521,6 +525,10 @@ where
                 })
             }
         };
+        failpoint::failpoint!(
+            name = "dkg.peer.engine_applied",
+            description = "after the engine applies a peer input and before durable ingress",
+        );
         if let Some(record) = record {
             if self.message_store.accept_incoming(record, &peer.identity)?
                 == IncomingStatus::Conflict
@@ -648,6 +656,10 @@ where
         self.delivery
             .abort_group(delivery_abort_group_for_chain_event(&event));
         self.enqueue_chain_event(event);
+        failpoint::failpoint!(
+            name = "dkg.chain.event_buffered",
+            description = "after a finalized chain event is buffered and before engine application",
+        );
         info!(
             epoch = self.epoch.0,
             event_kind,

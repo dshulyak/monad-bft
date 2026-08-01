@@ -17,8 +17,6 @@ use crate::{
     DkgLocalRegistrationState, DkgRegistration, DkgValidator,
 };
 
-const MAX_RETAINED_DKG_SESSIONS: usize = 2;
-
 struct ManagedChain {
     io: Arc<dyn DkgChain>,
     contract: alloy_primitives::Address,
@@ -391,7 +389,7 @@ where
             match result {
                 Ok(Some(state)) => {
                     self.chain.as_mut().unwrap().registration.unavailable_block = None;
-                    if let Err(err) = self.accept_local_registration_read(epoch, state) {
+                    if let Err(err) = self.accept_local_registration_read(epoch, block, state) {
                         error!(
                             ?err,
                             epoch = epoch.0,
@@ -421,6 +419,7 @@ where
     fn accept_local_registration_read(
         &mut self,
         epoch: Epoch,
+        block: SeqNum,
         state: DkgLocalRegistrationState,
     ) -> Result<(), DkgError> {
         let storage_root = self.storage_root.clone();
@@ -444,6 +443,11 @@ where
                 return Err(DkgError::operation("load local DKG registration", err));
             }
         };
+        failpoint::failpoint!(
+            name = "dkg.registration.loaded",
+            description =
+                "after durable local registration is loaded and before chain reconciliation",
+        );
 
         if let Some(bytes) = observed {
             chain.registration.phase = LocalRegistrationPhase::Done;
@@ -456,10 +460,12 @@ where
         } else {
             match chain.registration.phase {
                 LocalRegistrationPhase::Submitted => {
-                    chain.submitter.retry_registration(epoch);
+                    chain.submitter.retry_registration(epoch, block);
                 }
                 LocalRegistrationPhase::Open => {
-                    chain.submitter.submit_registration(epoch, local_bytes);
+                    chain
+                        .submitter
+                        .submit_registration(epoch, block, local_bytes);
                     chain.registration.phase = LocalRegistrationPhase::Submitted;
                 }
                 LocalRegistrationPhase::Done => {}
@@ -595,6 +601,11 @@ where
 
     fn handle_command(&mut self, command: DkgManagerCommand) {
         let DkgManagerCommand { epoch, call } = command;
+        failpoint::failpoint!(
+            name = "dkg.chain.call_buffered",
+            description =
+                "after a DKG chain call reaches the manager and before transaction submission",
+        );
         if let Some(chain) = self.chain.as_mut() {
             chain.submitter.submit(epoch, call);
         }
@@ -706,15 +717,18 @@ where
         self.pending_outbound
             .extend(session.take_delivery_outbound());
         if let Some(chain) = self.chain.as_mut() {
-            chain
-                .submitter
-                .finalized_block(epoch, batch.events, batch.recovery_complete_after);
+            chain.submitter.finalized_block(
+                epoch,
+                batch.block,
+                batch.events,
+                batch.recovery_complete_after,
+            );
         }
         Ok(())
     }
 
     fn retire_old_sessions(&mut self) {
-        while self.sessions.len() > MAX_RETAINED_DKG_SESSIONS {
+        while self.sessions.len() > crate::MAX_RETAINED_DKG_SESSIONS {
             self.sessions.pop_first().expect("excess DKG session");
         }
     }
@@ -1003,6 +1017,7 @@ mod tests {
 
         fn transaction_context(
             &self,
+            _block: SeqNum,
             _address: Address,
         ) -> Result<crate::DkgTransactionContext, crate::DkgError> {
             Ok(crate::DkgTransactionContext {

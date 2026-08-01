@@ -136,6 +136,11 @@ fn main() {
 
     MONAD_NODE_VERSION.map(|v| info!("starting monad-bft with version {}", v));
 
+    start_failpoints(&runtime).unwrap_or_else(|err| {
+        error!(?err, "failed to initialize failpoints");
+        process::exit(1);
+    });
+
     if !node_state.pprof.is_empty() {
         runtime.spawn({
             let pprof = node_state.pprof.clone();
@@ -157,6 +162,34 @@ fn main() {
     if let Err(e) = runtime.block_on(run(node_state)) {
         tracing::error!("monad consensus node crashed: {:?}", e);
     }
+}
+
+fn start_failpoints(_runtime: &tokio::runtime::Runtime) -> Result<(), String> {
+    #[cfg(feature = "failpoint")]
+    {
+        let Some(address) = std::env::var_os("FAILPOINT_ADDR") else {
+            return Ok(());
+        };
+        let address = address
+            .to_string_lossy()
+            .parse::<SocketAddr>()
+            .map_err(|err| format!("invalid FAILPOINT_ADDR: {err}"))?;
+        let mut server = failpoint::http();
+        if let Some(path) = std::env::var_os("FAILPOINT_CONFIG_PATH") {
+            server = server.with_configuration_at(path);
+        }
+        server = match std::env::var_os("FAILPOINT_HISTORY_PATH") {
+            Some(path) => server.with_history_at(path),
+            None => server.with_history(),
+        };
+        _runtime.spawn(async move {
+            if let Err(err) = server.bind_and_run(address).await {
+                error!(?err, %address, "failpoint server stopped");
+            }
+        });
+        info!(%address, "started failpoint server");
+    }
+    Ok(())
 }
 
 async fn run(node_state: NodeState) -> Result<(), ()> {
@@ -182,9 +215,35 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .get_round()
         + Round(1);
     let dkg_epoch_length = node_state.chain_config.get_epoch_length();
-    let dkg_startup_validator_sets = locked_epoch_validators.clone();
     let self_router_node_id = NodeId::new(node_state.router_identity.pubkey());
     let dkg_storage_root = node_state.wal_path.join("dkg");
+    let mut dkg_startup_validator_sets = locked_epoch_validators.clone();
+    match monad_dkg_runner::recovery_epochs(&dkg_storage_root) {
+        Ok(epochs) => {
+            for epoch in epochs {
+                if dkg_startup_validator_sets
+                    .iter()
+                    .any(|validator_set| validator_set.epoch == epoch)
+                {
+                    continue;
+                }
+                let Some(validators) = node_state.validators_config.get_validator_set(&epoch)
+                else {
+                    warn!(
+                        epoch = epoch.0,
+                        "missing validator set for retained DKG session"
+                    );
+                    continue;
+                };
+                dkg_startup_validator_sets.push(ValidatorSetDataWithEpoch {
+                    epoch,
+                    validators: validators.clone(),
+                });
+            }
+            dkg_startup_validator_sets.sort_by_key(|validator_set| validator_set.epoch);
+        }
+        Err(err) => warn!(?err, "failed to discover retained DKG sessions"),
+    }
     let state_read = build_state_reader(&node_state, SeqNum(EXECUTION_DELAY));
     let (dkg_manager, dkg_local_tx_rx) = build_manager(
         &node_state,
@@ -439,19 +498,14 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     };
 
     let (mut state, init_commands) = builder.build();
-    if init_commands.iter().any(|command| {
-        matches!(
-            command,
-            Command::StateSyncCommand(StateSyncCommand::StartExecution)
-        )
-    }) {
-        sync_dkg_from_execution_state(
-            &dkg_events,
-            &state_read,
-            &dkg_startup_validator_sets,
-            dkg_epoch_length,
-        );
-    }
+    // A restart can retain DKG WALs even when startup does not request execution
+    // state sync, so seed every recoverable session before running init commands.
+    sync_dkg_from_execution_state(
+        &dkg_events,
+        &state_read,
+        &dkg_startup_validator_sets,
+        dkg_epoch_length,
+    );
     executor.exec(init_commands);
 
     let mut ledger_span = tracing::info_span!(
