@@ -4,7 +4,7 @@ use dkg_protocol::{
 use monad_types::Epoch;
 
 use super::{
-    super::wal::{RecoveryWal, RecoveryWalConfig},
+    super::recovery::{RecoveryWal, RecoveryWalConfig},
     *,
 };
 fn proposal_id(dealer: PartyId, receivers: impl IntoIterator<Item = PartyId>) -> DkgMessageId {

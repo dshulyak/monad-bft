@@ -13,7 +13,7 @@ use super::{
     record::{
         DeliveryCompletionRecord, IncomingMessageRecord, OutgoingMessageRecord, RecoveryRecord,
     },
-    wal::{RecoveryState, RecoveryWal, RecoveryWalError},
+    recovery::{RecoveryState, RecoveryWal, RecoveryWalError},
 };
 
 #[derive(Debug, Error)]

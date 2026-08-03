@@ -2,10 +2,10 @@
 
 mod message_store;
 mod record;
-mod wal;
+mod recovery;
 
 pub(crate) use message_store::{DkgMessageStore, IncomingStatus, MessageStoreError};
 pub(crate) use record::{EngineSeed, IncomingMessageRecord, OutgoingMessageRecord};
-pub(crate) use wal::{
+pub(crate) use recovery::{
     recovery_epochs, RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError,
 };

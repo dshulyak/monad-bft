@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes};
 use dkg_core::PartyId;
 use dkg_protocol::{DkgMessageCodecError, DkgMessageId};
 use thiserror::Error;
+
+use crate::wal::WalRecord;
 
 pub(crate) const ENGINE_SEED_BYTES: usize = 32;
 pub(crate) type EngineSeed = [u8; ENGINE_SEED_BYTES];
@@ -40,8 +42,6 @@ pub(super) enum RecoveryRecord {
 
 #[derive(Debug, Error)]
 pub(crate) enum WalCodecError {
-    #[error("{0} length exceeds u32")]
-    LengthOverflow(&'static str),
     #[error("invalid {0} record")]
     Invalid(&'static str),
     #[error("unknown record kind {0}")]
@@ -52,8 +52,12 @@ pub(crate) enum WalCodecError {
     Rlp(#[from] alloy_rlp::Error),
 }
 
-impl RecoveryRecord {
-    pub(super) fn encode(&self) -> Result<(u8, Bytes), WalCodecError> {
+impl WalRecord for RecoveryRecord {
+    type Error = WalCodecError;
+
+    const MAGIC: [u8; 4] = *b"DKGW";
+
+    fn encode<B: BufMut>(&self, output: &mut B) -> Result<(), Self::Error> {
         let (kind, payload) = match self {
             Self::Seed(seed) => (1, Bytes::copy_from_slice(seed)),
             Self::Registration(bytes) if !bytes.is_empty() => (2, bytes.clone()),
@@ -62,10 +66,17 @@ impl RecoveryRecord {
             Self::Incoming(record) => (4, encode_incoming(record)),
             Self::Completion(record) => (5, encode_completion(record)),
         };
-        Ok((kind, payload))
+        output.put_u8(kind);
+        output.put_slice(&payload);
+        Ok(())
     }
 
-    pub(super) fn decode(kind: u8, payload: Bytes) -> Result<Self, WalCodecError> {
+    fn decode<B: Buf>(input: &mut B) -> Result<Self, Self::Error> {
+        if !input.has_remaining() {
+            return Err(WalCodecError::Invalid("empty"));
+        }
+        let kind = input.get_u8();
+        let payload = input.copy_to_bytes(input.remaining());
         Ok(match kind {
             1 if payload.len() == ENGINE_SEED_BYTES => {
                 Self::Seed(payload.as_ref().try_into().unwrap())

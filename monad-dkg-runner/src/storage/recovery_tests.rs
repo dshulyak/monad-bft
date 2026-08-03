@@ -1,9 +1,3 @@
-use std::{
-    fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
-    os::unix::fs::PermissionsExt,
-};
-
 use dkg_core::PartyId;
 use dkg_protocol::{DkgMessageId, DkgMessageKey};
 
@@ -38,8 +32,7 @@ fn open_wal(root: &Path, epoch: u64) -> RecoveryWal {
 
 #[test]
 fn default_preallocation_covers_one_maximum_record() {
-    let maximum_record_bytes =
-        u64::from(MAX_WAL_RECORD_PAYLOAD_BYTES) + WAL_RECORD_HEADER_LEN as u64;
+    let maximum_record_bytes = u64::from(MAX_RECOVERY_RECORD_BYTES) + FRAME_HEADER_LEN as u64;
 
     assert!(DEFAULT_RECOVERY_WAL_PREALLOCATE_BYTES >= maximum_record_bytes);
     assert_eq!(
@@ -49,33 +42,6 @@ fn default_preallocation_covers_one_maximum_record() {
     assert!(
         DEFAULT_RECOVERY_WAL_PREALLOCATE_BYTES < maximum_record_bytes + WAL_PREALLOCATE_ALIGNMENT
     );
-}
-
-#[test]
-fn wal_preallocates_without_growing_logical_size() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut wal, _) = RecoveryWal::open(
-        dir.path(),
-        Epoch(7),
-        RecoveryWalConfig {
-            preallocate_bytes: 4096,
-            max_epochs: 2,
-        },
-    )
-    .unwrap();
-
-    assert_eq!(fs::metadata(wal.path()).unwrap().len(), 0);
-    assert_eq!(
-        fs::metadata(wal.path()).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-
-    let record = incoming(1);
-    wal.append(&RecoveryRecord::Incoming(record.clone()))
-        .unwrap();
-
-    let loaded = RecoveryState::load(wal.path()).unwrap();
-    assert!(loaded.incoming.contains(&record));
 }
 
 #[test]
@@ -108,9 +74,8 @@ fn wal_creates_and_reuses_one_engine_seed() {
     assert_eq!(first, second);
     assert_ne!(first, [0; ENGINE_SEED_BYTES]);
     assert_eq!(
-        scan_wal_records(&path)
+        DurableWal::<RecoveryRecord>::read(&path, MAX_RECOVERY_RECORD_BYTES)
             .unwrap()
-            .0
             .iter()
             .filter(|record| matches!(record, RecoveryRecord::Seed(_)))
             .count(),
@@ -255,59 +220,4 @@ fn lists_recoverable_epochs_in_order() {
     assert!(recovery_epochs(&dir.path().join("missing"))
         .unwrap()
         .is_empty());
-}
-
-#[test]
-fn wal_open_truncates_torn_tail_after_last_valid_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut wal = open_wal(dir.path(), 7);
-
-    let record = incoming(1);
-    wal.append(&RecoveryRecord::Incoming(record.clone()))
-        .unwrap();
-    let path = wal.path().to_path_buf();
-    let valid_len = fs::metadata(&path).unwrap().len();
-    drop(wal);
-
-    OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"torn")
-        .unwrap();
-    assert!(fs::metadata(&path).unwrap().len() > valid_len);
-
-    let repaired = open_wal(dir.path(), 7);
-    assert_eq!(fs::metadata(repaired.path()).unwrap().len(), valid_len);
-    let loaded = RecoveryState::load(repaired.path()).unwrap();
-    assert!(loaded.incoming.contains(&record));
-}
-
-#[test]
-fn wal_open_truncates_bad_checksum_tail_after_last_valid_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut wal = open_wal(dir.path(), 7);
-
-    let first = incoming(1);
-    let second = incoming(2);
-    wal.append(&RecoveryRecord::Incoming(first.clone()))
-        .unwrap();
-    let first_len = fs::metadata(wal.path()).unwrap().len();
-    wal.append(&RecoveryRecord::Incoming(second.clone()))
-        .unwrap();
-    let path = wal.path().to_path_buf();
-    assert!(fs::metadata(&path).unwrap().len() > first_len);
-    drop(wal);
-
-    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-    file.seek(SeekFrom::Start(first_len + WAL_RECORD_HEADER_LEN as u64))
-        .unwrap();
-    file.write_all(b"x").unwrap();
-    file.sync_data().unwrap();
-
-    let repaired = open_wal(dir.path(), 7);
-    assert_eq!(fs::metadata(repaired.path()).unwrap().len(), first_len);
-    let loaded = RecoveryState::load(repaired.path()).unwrap();
-    assert!(loaded.incoming.contains(&first));
-    assert!(!loaded.incoming.contains(&second));
 }

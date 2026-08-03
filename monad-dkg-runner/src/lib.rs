@@ -6,6 +6,7 @@ mod registration;
 mod session;
 mod storage;
 mod transport;
+mod wal;
 
 const MAX_RETAINED_DKG_SESSIONS: usize = 2;
 
