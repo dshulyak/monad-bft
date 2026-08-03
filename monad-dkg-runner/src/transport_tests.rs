@@ -8,10 +8,7 @@ type TestSig = NopSignature;
 fn unwrap_delivered(
     inbound: DeliveryInbound<TestSig>,
 ) -> (NodeId<CertificateSignaturePubKey<TestSig>>, Bytes) {
-    match inbound {
-        DeliveryInbound::Delivered { sender, payload } => (sender, payload),
-        DeliveryInbound::TransportAck { .. } => panic!("expected delivered payload"),
-    }
+    (inbound.sender, inbound.payload)
 }
 
 fn node(byte: u8) -> NodeId<CertificateSignaturePubKey<TestSig>> {
@@ -44,51 +41,7 @@ fn send_command(
 }
 
 #[test]
-fn transport_ack_stops_one_way_message_after_runner_completion() {
-    let epoch = Epoch(7);
-    let message_id = message_id(1);
-    let ack_key = key(1);
-    let now = Instant::now();
-    let sender = node(1);
-    let receiver = node(2);
-    let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
-    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch);
-
-    let outbound = sender_delivery.send(
-        send_command(message_id.clone(), receiver, b"ladder", None),
-        now,
-    );
-    assert_eq!(outbound.len(), 1);
-    assert_delay_with_jitter(
-        sender_delivery.next_timer().unwrap().duration_since(now),
-        DKG_RETRY_INITIAL,
-    );
-
-    let (delivered_by, payload) = unwrap_delivered(
-        receiver_delivery
-            .handle_network_message(sender, outbound[0].payload.clone())
-            .expect("payload delivered"),
-    );
-    assert_eq!(delivered_by, sender);
-    assert_eq!(payload, Bytes::from_static(b"ladder"));
-
-    let ack = receiver_delivery.finish_inbound(sender, Some(ack_key));
-    match sender_delivery
-        .handle_network_message(receiver, ack.unwrap().payload)
-        .expect("transport acknowledgement delivered")
-    {
-        DeliveryInbound::TransportAck { sender, key } => {
-            assert_eq!(sender, receiver);
-            assert_eq!(key, ack_key);
-        }
-        DeliveryInbound::Delivered { .. } => panic!("expected transport acknowledgement"),
-    }
-    sender_delivery.complete(&message_id, receiver);
-    assert!(sender_delivery.outbox.is_empty());
-}
-
-#[test]
-fn configured_validator_sender_is_delivered_without_transport_ack() {
+fn configured_validator_sender_is_delivered() {
     let epoch = Epoch(8);
     let now = Instant::now();
     let sender = node(1);
@@ -108,64 +61,11 @@ fn configured_validator_sender_is_delivered_without_transport_ack() {
             .expect("payload delivered from configured validator"),
     );
     assert_eq!(payload, Bytes::from_static(b"pc-ack"));
-    assert!(receiver_delivery.finish_inbound(sender, None).is_none());
 
     let rejected = DeliveryEngine::<TestSig>::with_inbound_validators(epoch, vec![receiver]);
     assert!(rejected
         .handle_network_message(sender, outbound[0].payload.clone())
         .is_none());
-}
-
-#[test]
-fn transport_ack_cannot_complete_message_with_protocol_evidence() {
-    let epoch = Epoch(8);
-    let now = Instant::now();
-    let sender = node(1);
-    let receiver = node(2);
-    let key = DkgMessageKey::PcAck {
-        dealer: PartyId(2),
-        signer: PartyId(1),
-    };
-    let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
-    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch);
-
-    sender_delivery.send(
-        send_command(DkgMessageId::single(key), receiver, b"pc-ack", None),
-        now,
-    );
-    let ack = receiver_delivery.finish_inbound(sender, Some(key));
-    assert!(sender_delivery
-        .handle_network_message(receiver, ack.unwrap().payload)
-        .is_none());
-    assert_eq!(sender_delivery.outstanding_delivery_count(), 1);
-}
-
-#[test]
-fn application_completion_stops_request_without_transport_ack() {
-    let epoch = Epoch(8);
-    let id = DkgMessageId::single(DkgMessageKey::BveRetrievalRequest {
-        dealer: PartyId(3),
-        requester: PartyId(1),
-        responder: PartyId(2),
-    });
-    let now = Instant::now();
-    let receiver = node(2);
-    let mut delivery = DeliveryEngine::<TestSig>::new(epoch);
-    delivery.send(
-        send_command(
-            id.clone(),
-            receiver,
-            b"request",
-            Some(DeliveryAbortGroup::Extraction),
-        ),
-        now,
-    );
-    assert_eq!(
-        delivery.handle_timer(delivery.next_timer().unwrap()).len(),
-        1
-    );
-    delivery.complete(&id, receiver);
-    assert_eq!(delivery.outstanding_delivery_count(), 0);
 }
 
 #[test]
@@ -204,6 +104,10 @@ fn delivery_groups_use_typed_protocol_kind() {
         ),
         None
     );
+    assert_eq!(
+        delivery_abort_group_for_peer_payload(DkgMessageKind::Ladder, dealer, peer),
+        None
+    );
 }
 
 #[test]
@@ -226,8 +130,7 @@ fn one_message_id_reuses_one_outbox_message_for_multiple_peers() {
     assert!(delivery
         .send(send_command(id.clone(), peers[0], b"message", None), now)
         .is_empty());
-    delivery.complete(&id, peers[0]);
-    assert_eq!(delivery.outstanding_delivery_count(), 2);
+    assert_eq!(delivery.outstanding_delivery_count(), 3);
 }
 
 #[test]

@@ -10,9 +10,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::{
-    record::{
-        DeliveryCompletionRecord, IncomingMessageRecord, OutgoingMessageRecord, RecoveryRecord,
-    },
+    record::{IncomingMessageRecord, OutgoingMessageRecord, RecoveryRecord},
     recovery::{RecoveryState, RecoveryWal, RecoveryWalError},
 };
 
@@ -50,7 +48,6 @@ pub(crate) struct DkgMessageStore {
     incoming_by_key: HashMap<DkgMessageKey, usize>,
     outgoing_by_key: HashMap<DkgMessageKey, DkgMessageId>,
     outgoing_by_id: HashMap<DkgMessageId, Option<OutgoingMessageRecord>>,
-    delivery_completions: BTreeSet<DeliveryCompletionRecord>,
 }
 
 impl DkgMessageStore {
@@ -70,7 +67,6 @@ impl DkgMessageStore {
             incoming_by_key: HashMap::new(),
             outgoing_by_key: HashMap::new(),
             outgoing_by_id: HashMap::new(),
-            delivery_completions: recovery.delivery_completions,
         };
         for record in recovery.outbox.into_values() {
             store.load_outgoing(record);
@@ -222,45 +218,6 @@ impl DkgMessageStore {
             keys.extend(identity.keys);
         }
         Ok((keys, persistence.unwrap()))
-    }
-
-    pub(crate) fn complete_key(
-        &mut self,
-        key: DkgMessageKey,
-        target: PartyId,
-    ) -> Result<Option<DkgMessageId>, MessageStoreError> {
-        let Some(message_id) = self.outgoing_by_key.get(&key).cloned() else {
-            return Ok(None);
-        };
-        let Some(record) = self.outgoing_by_id.get(&message_id) else {
-            return Ok(None);
-        };
-        if record.is_none() {
-            for key in message_id.keys() {
-                self.outgoing_by_key.remove(key);
-            }
-            self.outgoing_by_id.remove(&message_id);
-            return Ok(Some(message_id));
-        }
-
-        let record = DeliveryCompletionRecord {
-            message_id: message_id.clone(),
-            target,
-        };
-        if !self.delivery_completions.contains(&record) {
-            self.wal
-                .append(&RecoveryRecord::Completion(record.clone()))?;
-            self.delivery_completions.insert(record);
-        }
-        Ok(Some(message_id))
-    }
-
-    pub(crate) fn is_complete(&self, message_id: &DkgMessageId, target: PartyId) -> bool {
-        self.delivery_completions
-            .contains(&DeliveryCompletionRecord {
-                message_id: message_id.clone(),
-                target,
-            })
     }
 
     pub(crate) fn clear_ephemeral(&mut self) {

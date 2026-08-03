@@ -79,7 +79,7 @@ fn runner_refuses_one_and_two_validator_sets() {
 }
 
 #[test]
-fn protocol_rejection_is_not_persisted_or_acknowledged() {
+fn protocol_rejection_is_not_persisted_or_dispatched() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(19);
     let validators = test_validators(4);

@@ -25,19 +25,12 @@ pub(crate) struct IncomingMessageRecord {
     pub(crate) payload: Bytes,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct DeliveryCompletionRecord {
-    pub(crate) message_id: DkgMessageId,
-    pub(crate) target: PartyId,
-}
-
 #[derive(Debug)]
 pub(super) enum RecoveryRecord {
     Seed(EngineSeed),
     Registration(Bytes),
     Outgoing(OutgoingMessageRecord),
     Incoming(IncomingMessageRecord),
-    Completion(DeliveryCompletionRecord),
 }
 
 #[derive(Debug, Error)]
@@ -64,7 +57,6 @@ impl WalRecord for RecoveryRecord {
             Self::Registration(_) => return Err(WalCodecError::Invalid("registration")),
             Self::Outgoing(record) => (3, encode_outgoing(record)),
             Self::Incoming(record) => (4, encode_incoming(record)),
-            Self::Completion(record) => (5, encode_completion(record)),
         };
         output.put_u8(kind);
         output.put_slice(&payload);
@@ -86,7 +78,6 @@ impl WalRecord for RecoveryRecord {
             2 => return Err(WalCodecError::Invalid("registration")),
             3 => Self::Outgoing(decode_outgoing(payload)?),
             4 => Self::Incoming(decode_incoming(payload)?),
-            5 => Self::Completion(decode_completion(payload)?),
             kind => return Err(WalCodecError::UnknownRecordKind(kind)),
         })
     }
@@ -106,12 +97,6 @@ struct OutgoingWire {
     payload: Bytes,
 }
 
-#[derive(RlpEncodable, RlpDecodable)]
-struct CompletionWire {
-    message_id: Bytes,
-    target: u32,
-}
-
 fn encode_incoming(record: &IncomingMessageRecord) -> Bytes {
     alloy_rlp::encode(IncomingWire {
         source: record.source.0,
@@ -126,14 +111,6 @@ fn encode_outgoing(record: &OutgoingMessageRecord) -> Bytes {
         message_id: record.message_id.encode(),
         recipients: record.recipients.iter().map(|party| party.0).collect(),
         payload: record.payload.clone(),
-    })
-    .into()
-}
-
-fn encode_completion(record: &DeliveryCompletionRecord) -> Bytes {
-    alloy_rlp::encode(CompletionWire {
-        message_id: record.message_id.encode(),
-        target: record.target.0,
     })
     .into()
 }
@@ -162,13 +139,5 @@ fn decode_outgoing(payload: Bytes) -> Result<OutgoingMessageRecord, WalCodecErro
         message_id: DkgMessageId::decode(&wire.message_id)?,
         recipients,
         payload: wire.payload,
-    })
-}
-
-fn decode_completion(payload: Bytes) -> Result<DeliveryCompletionRecord, WalCodecError> {
-    let wire = alloy_rlp::decode_exact::<CompletionWire>(&payload)?;
-    Ok(DeliveryCompletionRecord {
-        message_id: DkgMessageId::decode(&wire.message_id)?,
-        target: PartyId(wire.target),
     })
 }

@@ -7,14 +7,6 @@ use super::{
     super::recovery::{RecoveryWal, RecoveryWalConfig},
     *,
 };
-fn proposal_id(dealer: PartyId, receivers: impl IntoIterator<Item = PartyId>) -> DkgMessageId {
-    DkgMessageId::new(
-        receivers
-            .into_iter()
-            .map(|receiver| DkgMessageKey::PcProposal { dealer, receiver }),
-    )
-    .unwrap()
-}
 
 #[test]
 fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
@@ -79,20 +71,6 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
         ack[1] ^= 1;
     }
     assert_eq!(store.incoming_count(), 1);
-    let response = store
-        .classify(PartyId(3), self_party, &ack)
-        .expect("PC acknowledgement identity");
-    let (completed_key, target) = response
-        .completed_outgoing()
-        .next()
-        .expect("PC acknowledgement completes proposal");
-    assert_eq!(
-        store.complete_key(completed_key, target).unwrap(),
-        Some(proposal_id(
-            self_party,
-            [PartyId(1), PartyId(2), PartyId(3)]
-        ))
-    );
     drop(store);
 
     let recovery = RecoveryState::load(&path).unwrap();
@@ -110,10 +88,6 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
     .0;
     let mut store = DkgMessageStore::load(self_party, 4, 3, wal, recovery);
     assert_eq!(store.outgoing_records()[0].payload.as_ref(), proposal);
-    assert!(store.is_complete(
-        &proposal_id(self_party, [PartyId(1), PartyId(2), PartyId(3)]),
-        PartyId(3)
-    ));
     assert!(store
         .accept_outgoing(
             [PartyId(1), PartyId(2), PartyId(3)].into(),

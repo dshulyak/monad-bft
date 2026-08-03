@@ -13,8 +13,8 @@ use monad_types::Epoch;
 use thiserror::Error;
 
 use super::record::{
-    DeliveryCompletionRecord, EngineSeed, IncomingMessageRecord, OutgoingMessageRecord,
-    RecoveryRecord, WalCodecError, ENGINE_SEED_BYTES,
+    EngineSeed, IncomingMessageRecord, OutgoingMessageRecord, RecoveryRecord, WalCodecError,
+    ENGINE_SEED_BYTES,
 };
 use crate::wal::{DurableWal, WalConfig, WalError, FRAME_HEADER_LEN};
 
@@ -120,7 +120,6 @@ pub(crate) struct RecoveryState {
     pub(crate) registration: Option<Bytes>,
     pub(crate) outbox: BTreeMap<DkgMessageId, OutgoingMessageRecord>,
     pub(crate) incoming: BTreeSet<IncomingMessageRecord>,
-    pub(crate) delivery_completions: BTreeSet<DeliveryCompletionRecord>,
 }
 
 impl RecoveryState {
@@ -141,9 +140,6 @@ impl RecoveryState {
                 RecoveryRecord::Incoming(record) => {
                     state.incoming.insert(record);
                 }
-                RecoveryRecord::Completion(record) => {
-                    state.delivery_completions.insert(record);
-                }
             }
         }
         Ok(state)
@@ -156,10 +152,7 @@ impl RecoveryState {
         if let Some(seed) = self.engine_seed {
             return Ok(seed);
         }
-        if !self.outbox.is_empty()
-            || !self.incoming.is_empty()
-            || !self.delivery_completions.is_empty()
-        {
+        if !self.outbox.is_empty() || !self.incoming.is_empty() {
             return Err(RecoveryWalError::MissingSeed);
         }
 

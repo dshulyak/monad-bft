@@ -11,8 +11,8 @@ use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, Sess
 use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
 use dkg_protocol::{
     ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase, DkgInput,
-    DkgMessage, DkgMessageId, DkgMessageIdentity, DkgMessageKey, DkgMessageKind, DkgSetupContext,
-    DkgSetupError, DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
+    DkgMessage, DkgMessageId, DkgMessageIdentity, DkgMessageKind, DkgSetupContext, DkgSetupError,
+    DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -102,8 +102,6 @@ pub(crate) enum RunnerError {
     DurableIngressConflict,
     #[error("self-generated DKG message conflicts with recovery WAL")]
     SelfGeneratedMessageConflict,
-    #[error("transport-acknowledged DKG message has {actual} semantic keys, expected 1")]
-    TransportAckKeyCount { actual: usize },
 }
 
 pub(crate) fn start<ST>(
@@ -195,7 +193,6 @@ struct PendingPeerInput {
     input: CoreInput<DkgMessage>,
     identity: DkgMessageIdentity,
     record: Option<IncomingMessageRecord>,
-    acknowledge: bool,
 }
 
 impl<ST> Runner<ST>
@@ -311,25 +308,11 @@ where
     }
 
     fn accept_delivery(&mut self, inbound: DeliveryInbound<ST>) -> Result<(), RunnerError> {
-        match inbound {
-            DeliveryInbound::Delivered { sender, payload } => {
-                let from = self
-                    .mapping
-                    .party_id(&sender)
-                    .expect("delivery engine validated DKG sender");
-                self.handle_data_payload(from, payload)
-            }
-            DeliveryInbound::TransportAck { sender, key } => {
-                let from = self
-                    .mapping
-                    .party_id(&sender)
-                    .expect("delivery engine validated DKG acknowledgement");
-                let Some(message_id) = self.message_store.complete_key(key, from)? else {
-                    return Ok(());
-                };
-                self.complete_delivery(from, &message_id)
-            }
-        }
+        let from = self
+            .mapping
+            .party_id(&inbound.sender)
+            .expect("delivery engine validated DKG sender");
+        self.handle_data_payload(from, inbound.payload)
     }
 
     fn complete_chain_recovery(&mut self) -> Result<(), RunnerError> {
@@ -361,50 +344,6 @@ where
         Ok(())
     }
 
-    fn finish_inbound_delivery(
-        &mut self,
-        source: PartyId,
-        transport_ack: Option<DkgMessageKey>,
-    ) -> Result<(), RunnerError> {
-        let Some(to) = self.mapping.member_id(source) else {
-            return Err(RunnerError::UnknownParty {
-                action: "finish inbound",
-                party: source.0,
-            });
-        };
-        self.delivery_outbound
-            .extend(self.delivery.finish_inbound(to, transport_ack));
-        Ok(())
-    }
-
-    fn complete_delivery(
-        &mut self,
-        target: PartyId,
-        message_id: &DkgMessageId,
-    ) -> Result<(), RunnerError> {
-        let Some(peer) = self.mapping.member_id(target) else {
-            return Err(RunnerError::UnknownParty {
-                action: "complete outbound",
-                party: target.0,
-            });
-        };
-        self.delivery.complete(message_id, peer);
-        Ok(())
-    }
-
-    fn complete_from_application(
-        &mut self,
-        identity: &DkgMessageIdentity,
-    ) -> Result<(), RunnerError> {
-        for (outgoing, target) in identity.completed_outgoing() {
-            let Some(message_id) = self.message_store.complete_key(outgoing, target)? else {
-                continue;
-            };
-            self.complete_delivery(target, &message_id)?;
-        }
-        Ok(())
-    }
-
     fn handle_data_payload(&mut self, from: PartyId, payload: Bytes) -> Result<(), RunnerError> {
         let message = match DkgMessage::decode(payload.clone()) {
             Ok(message) => message,
@@ -429,7 +368,6 @@ where
             }
         };
         let message_id = identity.message_id();
-        let transport_ack = transport_ack_key(&identity)?;
         let record = IncomingMessageRecord {
             source: from,
             message_id: message_id.clone(),
@@ -437,8 +375,6 @@ where
         };
         match self.message_store.incoming_status(&record, &identity) {
             IncomingStatus::Duplicate => {
-                self.finish_inbound_delivery(from, transport_ack)?;
-                self.complete_from_application(&identity)?;
                 debug!(
                     from_party = from.0,
                     message_id = ?message_id,
@@ -461,7 +397,6 @@ where
                 input: CoreInput::new(from, message),
                 identity,
                 record: Some(record),
-                acknowledge: true,
             }));
         Ok(())
     }
@@ -495,9 +430,6 @@ where
         let effects = match self.engine.handle_peer_event(peer.input) {
             Ok(effects) => effects,
             Err(DkgEngineError::PeerInput(reason)) => {
-                if peer.acknowledge {
-                    self.finish_inbound_delivery(source, None)?;
-                }
                 debug!(
                     ?reason,
                     source = source.0,
@@ -524,10 +456,6 @@ where
             }
         }
         self.dispatch_effects(effects)?;
-        if peer.acknowledge {
-            self.finish_inbound_delivery(source, transport_ack_key(&peer.identity)?)?;
-        }
-        self.complete_from_application(&peer.identity)?;
         Ok(true)
     }
 
@@ -569,7 +497,6 @@ where
                                         input: CoreInput::new(self.self_party, payload.clone()),
                                         identity,
                                         record: Some(record),
-                                        acknowledge: false,
                                     },
                                 ));
                             }
@@ -623,7 +550,6 @@ where
                     input: CoreInput::new(record.source, message),
                     identity,
                     record: None,
-                    acknowledge: record.source != self.self_party,
                 }));
         }
     }
@@ -657,14 +583,6 @@ where
                 }
             };
             for to in record.recipients {
-                if self.message_store.is_complete(&record.message_id, to) {
-                    debug!(
-                        message_id = ?record.message_id,
-                        target_party = to.0,
-                        "skipping completed persisted outgoing DKG message"
-                    );
-                    continue;
-                }
                 self.queue_delivery_send(
                     record.message_id.clone(),
                     to,
@@ -818,16 +736,6 @@ fn build_engine(
     .map_err(RunnerError::Setup)?;
     DkgEngine::from_setup(setup, params, local_keys, seed)
         .map_err(RunnerError::EngineInitialization)
-}
-
-fn transport_ack_key(identity: &DkgMessageIdentity) -> Result<Option<DkgMessageKey>, RunnerError> {
-    if !identity.requires_transport_ack() {
-        return Ok(None);
-    }
-    match identity.keys.as_slice() {
-        [key] => Ok(Some(*key)),
-        keys => Err(RunnerError::TransportAckKeyCount { actual: keys.len() }),
-    }
 }
 
 fn delivery_abort_group_for_chain_call(call: &ChainCall) -> Option<DeliveryAbortGroup> {

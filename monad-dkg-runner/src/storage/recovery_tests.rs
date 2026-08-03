@@ -87,11 +87,7 @@ fn wal_creates_and_reuses_one_engine_seed() {
 fn wal_rejects_protocol_records_without_engine_seed() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = open_wal(dir.path(), 7);
-    wal.append(&RecoveryRecord::Completion(DeliveryCompletionRecord {
-        message_id: message_id(1),
-        target: PartyId(1),
-    }))
-    .unwrap();
+    wal.append(&RecoveryRecord::Incoming(incoming(1))).unwrap();
     let path = wal.path().to_path_buf();
 
     let err = RecoveryState::load(&path)
@@ -154,25 +150,17 @@ fn wal_loads_outgoing_message_records() {
 }
 
 #[test]
-fn wal_loads_incoming_messages_and_delivery_completions() {
+fn wal_loads_incoming_messages() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = open_wal(dir.path(), 8);
 
     let incoming = incoming(2);
-    let completion = DeliveryCompletionRecord {
-        message_id: message_id(42),
-        target: PartyId(2),
-    };
     wal.append(&RecoveryRecord::Incoming(incoming.clone()))
-        .unwrap();
-    wal.append(&RecoveryRecord::Completion(completion.clone()))
         .unwrap();
 
     let loaded = RecoveryState::load(wal.path()).unwrap();
     assert_eq!(loaded.incoming.len(), 1);
     assert!(loaded.incoming.contains(&incoming));
-    assert_eq!(loaded.delivery_completions.len(), 1);
-    assert!(loaded.delivery_completions.contains(&completion));
 }
 
 #[test]

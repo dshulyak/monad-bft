@@ -1,4 +1,4 @@
-//! Retry scheduling for DKG messages until the protocol reports completion.
+//! Retry scheduling for DKG messages until the protocol makes them obsolete.
 
 use std::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
@@ -8,24 +8,17 @@ use std::{
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
 use dkg_core::PartyId;
-use dkg_protocol::{DkgMessageCodecError, DkgMessageId, DkgMessageKey, DkgMessageKind};
+use dkg_protocol::{DkgMessageId, DkgMessageKind};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_types::{Epoch, NodeId};
 use rand::Rng;
-use thiserror::Error;
 use tracing::warn;
 
-pub(crate) enum DeliveryInbound<ST: CertificateSignatureRecoverable> {
-    Delivered {
-        sender: NodeId<CertificateSignaturePubKey<ST>>,
-        payload: Bytes,
-    },
-    TransportAck {
-        sender: NodeId<CertificateSignaturePubKey<ST>>,
-        key: DkgMessageKey,
-    },
+pub(crate) struct DeliveryInbound<ST: CertificateSignatureRecoverable> {
+    pub(crate) sender: NodeId<CertificateSignaturePubKey<ST>>,
+    pub(crate) payload: Bytes,
 }
 
 const DKG_RETRY_INITIAL: Duration = Duration::from_secs(2);
@@ -101,8 +94,8 @@ where
         sender: NodeId<CertificateSignaturePubKey<ST>>,
         payload: Bytes,
     ) -> Option<DeliveryInbound<ST>> {
-        match DkgWireMessage::decode(payload.as_ref()) {
-            Ok(DkgWireMessage::Data { epoch, payload }) if epoch == self.epoch => {
+        match decode_wire(payload.as_ref()) {
+            Ok(WireEnvelope { epoch, payload }) if epoch == self.epoch.0 => {
                 if self
                     .inbound_validators
                     .as_ref()
@@ -115,12 +108,7 @@ where
                     );
                     return None;
                 }
-                Some(DeliveryInbound::Delivered { sender, payload })
-            }
-            Ok(DkgWireMessage::TransportAck { epoch, key })
-                if epoch == self.epoch && self.expects_transport_ack(sender, key) =>
-            {
-                Some(DeliveryInbound::TransportAck { sender, key })
+                Some(DeliveryInbound { sender, payload })
             }
             Ok(_) => None,
             Err(err) => {
@@ -128,22 +116,6 @@ where
                 None
             }
         }
-    }
-
-    pub(crate) fn finish_inbound(
-        &self,
-        to: NodeId<CertificateSignaturePubKey<ST>>,
-        transport_ack: Option<DkgMessageKey>,
-    ) -> Option<DeliveryOutbound<ST>> {
-        let key = transport_ack?;
-        Some(DeliveryOutbound {
-            to,
-            payload: DkgWireMessage::TransportAck {
-                epoch: self.epoch,
-                key,
-            }
-            .encode(),
-        })
     }
 
     pub(crate) fn handle_timer(&mut self, now: Instant) -> Vec<DeliveryOutbound<ST>> {
@@ -184,11 +156,7 @@ where
             retry_delay: DKG_RETRY_INITIAL,
         };
 
-        let wire = DkgWireMessage::Data {
-            epoch: self.epoch,
-            payload: send.payload,
-        }
-        .encode();
+        let wire = encode_wire(self.epoch, send.payload);
         match self.outbox.entry(message_id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(OutboxMessage {
@@ -214,19 +182,6 @@ where
         vec![DeliveryOutbound { to, payload: wire }]
     }
 
-    fn expects_transport_ack(
-        &self,
-        from: NodeId<CertificateSignaturePubKey<ST>>,
-        key: DkgMessageKey,
-    ) -> bool {
-        if !key.requires_transport_ack() {
-            return false;
-        }
-        self.outbox
-            .get(&DkgMessageId::single(key))
-            .is_some_and(|message| message.recipients.contains_key(&from))
-    }
-
     pub(crate) fn abort_group(&mut self, group: DeliveryAbortGroup) {
         self.aborted_groups.insert(group);
         self.outbox.retain(|_, message| {
@@ -234,19 +189,6 @@ where
                 .abort_group
                 .is_some_and(|message_group| message_group.is_aborted_by(group))
         });
-    }
-
-    pub(crate) fn complete(
-        &mut self,
-        message_id: &DkgMessageId,
-        to: NodeId<CertificateSignaturePubKey<ST>>,
-    ) {
-        let remove_message = self.outbox.get_mut(message_id).is_some_and(|message| {
-            message.recipients.remove(&to).is_some() && message.recipients.is_empty()
-        });
-        if remove_message {
-            self.outbox.remove(message_id);
-        }
     }
 
     #[cfg(test)]
@@ -290,37 +232,19 @@ pub(crate) fn delivery_abort_group_for_peer_payload(
         DkgMessageKind::BveRetrievalRequest | DkgMessageKind::PcRetrievalRequest => {
             Some(DeliveryAbortGroup::Extraction)
         }
-        // A completed peer must still be able to serve a recovering peer after
-        // its own extraction phase has ended.
-        DkgMessageKind::BveRetrievalResponse | DkgMessageKind::PcRetrievalResponse => None,
+        // A peer that finishes first must keep serving a late recovering peer.
+        DkgMessageKind::BveRetrievalResponse
+        | DkgMessageKind::PcRetrievalResponse
+        | DkgMessageKind::Ladder
+        | DkgMessageKind::LowerConversion
+        | DkgMessageKind::OpenPower => None,
         DkgMessageKind::Done => Some(DeliveryAbortGroup::DoneQc),
-        _ => None,
     }
 }
 
-const DATA_TAG: u8 = 100;
-const TRANSPORT_ACK_TAG: u8 = 101;
-
-#[derive(Debug, Error)]
-enum WireError {
-    #[error("RLP decode failed: {0}")]
-    Rlp(#[from] alloy_rlp::Error),
-    #[error("unknown DKG wire message tag {0}")]
-    UnknownTag(u8),
-    #[error("invalid DKG transport acknowledgement: {0}")]
-    MessageKey(#[from] DkgMessageCodecError),
-}
-
-enum DkgWireMessage {
-    Data { epoch: Epoch, payload: Bytes },
-    TransportAck { epoch: Epoch, key: DkgMessageKey },
-}
-
 pub(crate) fn delivery_epoch(payload: &[u8]) -> Option<Epoch> {
-    match DkgWireMessage::decode(payload) {
-        Ok(DkgWireMessage::Data { epoch, .. } | DkgWireMessage::TransportAck { epoch, .. }) => {
-            Some(epoch)
-        }
+    match decode_wire(payload) {
+        Ok(wire) => Some(Epoch(wire.epoch)),
         Err(err) => {
             warn!(?err, "dropping malformed DKG delivery message");
             None
@@ -330,42 +254,20 @@ pub(crate) fn delivery_epoch(payload: &[u8]) -> Option<Epoch> {
 
 #[derive(RlpEncodable, RlpDecodable)]
 struct WireEnvelope {
-    tag: u8,
     epoch: u64,
     payload: Bytes,
 }
 
-impl DkgWireMessage {
-    fn encode(&self) -> Bytes {
-        let wire = match self {
-            Self::Data { epoch, payload } => WireEnvelope {
-                tag: DATA_TAG,
-                epoch: epoch.0,
-                payload: payload.clone(),
-            },
-            Self::TransportAck { epoch, key } => WireEnvelope {
-                tag: TRANSPORT_ACK_TAG,
-                epoch: epoch.0,
-                payload: Bytes::copy_from_slice(&key.encode()),
-            },
-        };
-        alloy_rlp::encode(wire).into()
-    }
+fn encode_wire(epoch: Epoch, payload: Bytes) -> Bytes {
+    alloy_rlp::encode(WireEnvelope {
+        epoch: epoch.0,
+        payload,
+    })
+    .into()
+}
 
-    fn decode(data: &[u8]) -> Result<Self, WireError> {
-        let wire = alloy_rlp::decode_exact::<WireEnvelope>(data)?;
-        Ok(match wire.tag {
-            DATA_TAG => Self::Data {
-                epoch: Epoch(wire.epoch),
-                payload: wire.payload,
-            },
-            TRANSPORT_ACK_TAG => Self::TransportAck {
-                epoch: Epoch(wire.epoch),
-                key: DkgMessageKey::decode(&wire.payload)?,
-            },
-            tag => return Err(WireError::UnknownTag(tag)),
-        })
-    }
+fn decode_wire(data: &[u8]) -> Result<WireEnvelope, alloy_rlp::Error> {
+    alloy_rlp::decode_exact(data)
 }
 
 #[cfg(test)]
