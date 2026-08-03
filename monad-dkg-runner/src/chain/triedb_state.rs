@@ -3,14 +3,11 @@
 //! Recovery orchestration lives in `monad-dkg-runner`; this module only maps
 //! one requested finalized state boundary to protocol chain events.
 
-use std::collections::BTreeSet;
-
-use crate::{DkgLocalRegistrationState, DkgRegistration};
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_primitives::{Address, Signature, TxKind, U256};
 use alloy_sol_types::SolCall;
 use dkg_core::RecordId;
-use dkg_protocol::ChainEvent;
+use dkg_protocol::{ChainEvent, RegistrationCall};
 use monad_chain_config::{
     ETHEREUM_MAINNET_CHAIN_ID, HIVE_CHAIN_ID, MONAD_DEVNET_CHAIN_ID, MONAD_MAINNET_CHAIN_ID,
     MONAD_TESTNET_CHAIN_ID,
@@ -40,12 +37,6 @@ pub(super) enum TriedbStateError {
     ContractMissing { contract: Address, block: u64 },
     #[error("DKG {kind} count exceeds usize")]
     CountOverflow { kind: &'static str },
-    #[error("DKG contract has {count} registrations; maximum supported is 256")]
-    TooManyRegistrations { count: usize },
-    #[error("duplicate DKG registered party {address}")]
-    DuplicateRegistration { address: Address },
-    #[error("DKG registration for {address} is empty")]
-    EmptyRegistration { address: Address },
     #[error("DKG contract supports at most 256 parties; got {count}")]
     TooManyParties { count: usize },
     #[error("DKG result epoch {actual} does not match requested epoch {expected}")]
@@ -130,7 +121,8 @@ impl TriedbDkgStateReader {
         block: SeqNum,
         contract: Address,
         epoch: Epoch,
-    ) -> Result<Option<Vec<DkgRegistration>>, TriedbStateError>
+        parties: &[Address],
+    ) -> Result<Option<Vec<RegistrationCall>>, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -139,37 +131,14 @@ impl TriedbDkgStateReader {
             return Ok(None);
         };
 
-        let count = self.call(
-            state_read,
-            block,
-            contract,
-            gas_limit,
-            DkgContract::registeredPartyCountCall { epoch: epoch.0 },
-        )?;
-        let count = usize::try_from(count).map_err(|_| TriedbStateError::CountOverflow {
-            kind: "registered-party",
-        })?;
-        if count > 256 {
-            return Err(TriedbStateError::TooManyRegistrations { count });
+        if parties.len() > 256 {
+            return Err(TriedbStateError::TooManyParties {
+                count: parties.len(),
+            });
         }
 
-        let mut seen = BTreeSet::new();
-        let mut registrations = Vec::with_capacity(count);
-        for index in 0..count {
-            let address = self.call(
-                state_read,
-                block,
-                contract,
-                gas_limit,
-                DkgContract::registeredPartyCall {
-                    epoch: epoch.0,
-                    index: U256::from(index),
-                },
-            )?;
-            if !seen.insert(address) {
-                return Err(TriedbStateError::DuplicateRegistration { address });
-            }
-
+        let mut registrations = Vec::with_capacity(parties.len());
+        for &party in parties {
             let registration = self.call(
                 state_read,
                 block,
@@ -177,53 +146,18 @@ impl TriedbDkgStateReader {
                 gas_limit,
                 DkgContract::registrationOfCall {
                     epoch: epoch.0,
-                    party: address,
+                    party,
                 },
             )?;
-            if !registration.exists {
-                return Err(TriedbStateError::EmptyRegistration { address });
+            if registration.exists {
+                registrations.push(registration_from_contract(
+                    party,
+                    &registration.registration,
+                ));
             }
-            registrations.push(DkgRegistration {
-                address,
-                bytes: registration_from_contract(address, &registration.registration),
-            });
         }
 
         Ok(Some(registrations))
-    }
-
-    pub(super) fn read_local_registration<ST, SCT>(
-        &self,
-        state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
-        block: SeqNum,
-        contract: Address,
-        epoch: Epoch,
-        party: Address,
-    ) -> Result<Option<DkgLocalRegistrationState>, TriedbStateError>
-    where
-        ST: CertificateSignatureRecoverable,
-        SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    {
-        let Some(gas_limit) = self.state_context(state_read, block, contract)? else {
-            return Ok(None);
-        };
-
-        let registration = self.call(
-            state_read,
-            block,
-            contract,
-            gas_limit,
-            DkgContract::registrationOfCall {
-                epoch: epoch.0,
-                party,
-            },
-        )?;
-
-        Ok(Some(DkgLocalRegistrationState {
-            registration: registration
-                .exists
-                .then(|| registration_from_contract(party, &registration.registration)),
-        }))
     }
 
     pub(super) fn read<ST, SCT>(

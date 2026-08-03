@@ -1,9 +1,12 @@
 use std::sync::Mutex;
 
+use alloy_consensus::TxEnvelope;
+use alloy_primitives::Address;
 use dkg_core::{PartyId, RecordId};
-use dkg_protocol::PCQc;
+use dkg_protocol::{PCQc, RegistrationCall};
 
 use super::*;
+use crate::chain::{DkgChain, DkgTransactionContext};
 
 #[test]
 fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
@@ -18,7 +21,6 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
     assert!(
         !reader
             .complete(snapshot, vec![pc_event(10)])
-            .unwrap()
             .recovery_complete_after
     );
 
@@ -27,7 +29,6 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
     assert!(
         !reader
             .complete(block_11, vec![pc_event(11)])
-            .unwrap()
             .recovery_complete_after
     );
 
@@ -36,49 +37,21 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
     assert!(
         reader
             .complete(block_12, vec![pc_event(12)])
-            .unwrap()
             .recovery_complete_after
     );
     assert!(reader.next_read().is_none());
 }
 
 #[test]
-fn snapshot_is_sorted_and_duplicate_sequence_is_rejected() {
-    let session = test_session();
-    let mut reader = ChainEventReader::default();
-    reader.start_session(session);
-    let read = reader.next_read().unwrap();
-    let batch = reader
-        .complete(read, vec![pc_event(9), pc_event(3), pc_event(7)])
-        .unwrap();
-    assert_eq!(
-        batch
-            .events
-            .iter()
-            .map(ChainEvent::record_id)
-            .collect::<Vec<_>>(),
-        vec![RecordId(3), RecordId(7), RecordId(9)]
-    );
-
-    let mut reader = ChainEventReader::default();
-    reader.start_session(session);
-    let read = reader.next_read().unwrap();
-    assert!(matches!(
-        reader
-            .complete(read, vec![pc_event(3), pc_event(3)])
-            .unwrap_err(),
-        crate::DkgError::DuplicateRecoverySequence { sequence: 3 }
-    ));
-}
-
-#[test]
 fn read_job_uses_snapshot_then_receipts() {
     let chain = RecordingChain::default();
     let session = test_session();
-    let snapshot = read_chain(&chain, Address::ZERO, ChainRead::Snapshot(session))
+    let snapshot = chain
+        .read_events(ChainRead::Snapshot(session))
         .unwrap()
         .unwrap();
-    let block = read_chain(&chain, Address::ZERO, ChainRead::Block(SeqNum(11), session))
+    let block = chain
+        .read_events(ChainRead::Block(SeqNum(11), session))
         .unwrap()
         .unwrap();
 
@@ -104,26 +77,33 @@ struct RecordingChain {
 }
 
 impl DkgChain for RecordingChain {
-    fn read_recovery_state(
+    fn read_registrations(
         &self,
-        block: SeqNum,
-        _contract: Address,
+        _block: SeqNum,
         _epoch: Epoch,
-        _party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
-        self.reads.lock().unwrap().push((true, block));
-        Ok(Some(vec![pc_event(block.0)]))
+        _parties: &[Address],
+    ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+        unreachable!()
     }
 
-    fn read_finalized_events(
+    fn read_events(&self, read: ChainRead) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push((matches!(read, ChainRead::Snapshot(_)), read.block()));
+        Ok(Some(vec![pc_event(read.block().0)]))
+    }
+
+    fn transaction_context(
         &self,
-        block: SeqNum,
-        _contract: Address,
-        _epoch: Epoch,
-        _party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
-        self.reads.lock().unwrap().push((false, block));
-        Ok(Some(vec![pc_event(block.0)]))
+        _block: SeqNum,
+        _address: Address,
+    ) -> Result<DkgTransactionContext, crate::DkgError> {
+        unreachable!()
+    }
+
+    fn submit_transaction(&self, _transaction: TxEnvelope) -> Result<(), crate::DkgError> {
+        unreachable!()
     }
 }
 

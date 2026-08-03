@@ -1,16 +1,14 @@
-use alloy_primitives::Address;
-use bytes::Bytes;
+use dkg_protocol::RegistrationCall;
 use monad_crypto::{
     certificate_signature::{CertificateKeyPair, CertificateSignaturePubKey},
     NopKeyPair, NopSignature,
 };
 use monad_types::{Epoch, NodeId};
+use zeroize::Zeroize;
 
 use crate::{
-    registration::{
-        assemble_registered_session, load_or_create_local_registration, RegistrationError,
-    },
-    DkgLocalKeyMaterial, DkgRegistration, DkgValidator,
+    registration::{assemble_registered_session, load_or_create_local_registration},
+    DkgLocalKeyMaterial, DkgValidator,
 };
 
 const EPOCH: Epoch = Epoch(17);
@@ -35,10 +33,16 @@ fn assembles_registered_parties_in_canonical_address_order() {
         .map(|(address, keys)| registration(address, keys))
         .collect();
 
-    let session = assemble_registered_session(EPOCH, validators, keys[0], registrations).unwrap();
+    let session =
+        assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], registrations).unwrap();
 
     assert_eq!(
-        session.key_material.addresses,
+        session
+            .key_material
+            .registrations
+            .iter()
+            .map(|registration| registration.address)
+            .collect::<Vec<_>>(),
         vec![
             dkg_core::Address([1; 20]),
             dkg_core::Address([2; 20]),
@@ -67,35 +71,23 @@ fn intersects_registrations_with_finalized_validators() {
         .map(|index| registration([index as u8 + 1; 20], &keys[index]))
         .collect();
 
-    let session = assemble_registered_session(EPOCH, validators, keys[0], registrations).unwrap();
+    let session =
+        assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], registrations).unwrap();
 
     assert_eq!(session.validators, vec![nodes[0], nodes[1], nodes[2]]);
     assert_eq!(
-        session.key_material.addresses,
+        session
+            .key_material
+            .registrations
+            .iter()
+            .map(|registration| registration.address)
+            .collect::<Vec<_>>(),
         vec![
             dkg_core::Address([1; 20]),
             dkg_core::Address([2; 20]),
             dkg_core::Address([3; 20])
         ]
     );
-}
-
-#[test]
-fn rejects_mismatched_encoded_address() {
-    let nodes = test_nodes(1);
-    let keys = test_keys(1);
-    let validators = vec![DkgValidator::<NopSignature> {
-        node_id: nodes[0],
-        address: [1; 20],
-    }];
-    let state = vec![DkgRegistration {
-        address: Address::from([2; 20]),
-        bytes: keys[0].registration_bytes([1; 20], EPOCH.0).unwrap().into(),
-    }];
-    assert!(matches!(
-        assemble_registered_session(EPOCH, validators, keys[0], state).err(),
-        Some(RegistrationError::AddressMismatch { .. })
-    ));
 }
 
 #[test]
@@ -108,22 +100,27 @@ fn local_key_derivation_is_stable_and_domain_separated() {
 }
 
 #[test]
+fn local_key_material_zeroizes() {
+    let mut keys = DkgLocalKeyMaterial::derive([7; 32]);
+    keys.zeroize();
+    assert_eq!(keys.receiver_secret_key, [0; 32]);
+    assert_eq!(keys.qc_signing_key, [0; 32]);
+}
+
+#[test]
 fn encoded_registration_is_reused_from_recovery_wal() {
     let directory = tempfile::tempdir().unwrap();
     let keys = DkgLocalKeyMaterial::derive([7; 32]);
     let first =
-        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], keys, None).unwrap();
+        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], &keys, None).unwrap();
     let second =
-        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], keys, None).unwrap();
+        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], &keys, None).unwrap();
 
     assert_eq!(first, second);
 }
 
-fn registration(address: [u8; 20], keys: &DkgLocalKeyMaterial) -> DkgRegistration {
-    DkgRegistration {
-        address: Address::from(address),
-        bytes: Bytes::from(keys.registration_bytes(address, EPOCH.0).unwrap()),
-    }
+fn registration(address: [u8; 20], keys: &DkgLocalKeyMaterial) -> RegistrationCall {
+    keys.registration(address, EPOCH.0).unwrap()
 }
 
 fn test_keys(count: usize) -> Vec<DkgLocalKeyMaterial> {

@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, path::Path};
 use alloy_primitives::Address;
 use dkg_crypto::{K256SecpBackend, ReceiverKeyRegistrationError};
 use dkg_protocol::{
-    decode_registration, verify_party_registration, PartyRegistration, RegistrationCodecError,
+    decode_registration, encode_registration, verify_party_registration, PartyRegistration,
+    RegistrationCall, RegistrationCodecError,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -14,7 +15,7 @@ use thiserror::Error;
 use crate::{
     session::DkgRegisteredKeyMaterial,
     storage::{RecoveryWal, RecoveryWalConfig, RecoveryWalError},
-    DkgLocalKeyMaterial, DkgRegistration, DkgValidator,
+    DkgLocalKeyMaterial, DkgValidator,
 };
 
 #[derive(Debug, Error)]
@@ -66,9 +67,10 @@ where
 
 pub(crate) fn assemble_registered_session<ST>(
     epoch: Epoch,
+    self_id: NodeId<CertificateSignaturePubKey<ST>>,
     validators: Vec<DkgValidator<ST>>,
-    local_keys: DkgLocalKeyMaterial,
-    registrations: Vec<DkgRegistration>,
+    local_keys: &DkgLocalKeyMaterial,
+    registrations: Vec<RegistrationCall>,
 ) -> Result<RegisteredSession<ST>, RegistrationError>
 where
     ST: CertificateSignatureRecoverable,
@@ -87,13 +89,13 @@ where
 
     let mut registrations_by_address = BTreeMap::new();
     for record in registrations {
-        let address = record.address.into_array();
+        let address = record.address.0;
         if registrations_by_address.contains_key(&address) {
             return Err(RegistrationError::DuplicateRegistration {
                 address: Address::from(address),
             });
         }
-        let registration = decode_verified_registration(address, epoch, &record.bytes)?;
+        let registration = verify_registration(record, epoch)?;
         registrations_by_address.insert(address, registration);
     }
 
@@ -109,26 +111,26 @@ where
         return Err(RegistrationError::NoEligibleValidator);
     }
 
+    let local = local_keys.decode().map_err(RegistrationError::LocalKeys)?;
+    if let Some((_, _, registration)) = eligible.iter().find(|(_, node_id, _)| *node_id == self_id)
+    {
+        if registration.receiver.public_key != local.receiver_public_key {
+            return Err(RegistrationError::ReceiverKeyMismatch);
+        }
+        if registration.qc_verifying_key != local.qc_verifying_key {
+            return Err(RegistrationError::QcKeyMismatch);
+        }
+    }
     let validators = eligible.iter().map(|(_, node_id, _)| *node_id).collect();
-    let receiver_public_keys = eligible
-        .iter()
-        .map(|(_, _, registration)| registration.receiver.public_key)
-        .collect();
-    let qc_verifying_keys = eligible
-        .iter()
-        .map(|(_, _, registration)| registration.qc_verifying_key)
-        .collect();
-    let addresses = eligible
-        .iter()
-        .map(|(address, _, _)| dkg_core::Address(*address))
+    let registrations = eligible
+        .into_iter()
+        .map(|(_, _, registration)| registration)
         .collect();
     Ok(RegisteredSession {
         validators,
         key_material: DkgRegisteredKeyMaterial {
-            local: local_keys.decode().map_err(RegistrationError::LocalKeys)?,
-            receiver_public_keys,
-            qc_verifying_keys,
-            addresses,
+            local_keys: local.secret_keys,
+            registrations,
         },
     })
 }
@@ -137,14 +139,16 @@ pub(crate) fn load_or_create_local_registration(
     storage_root: &Path,
     epoch: Epoch,
     address: [u8; 20],
-    local_keys: DkgLocalKeyMaterial,
-    finalized: Option<&[u8]>,
-) -> Result<Vec<u8>, RegistrationError> {
+    local_keys: &DkgLocalKeyMaterial,
+    finalized: Option<&RegistrationCall>,
+) -> Result<RegistrationCall, RegistrationError> {
     let (mut wal, mut recovery) =
         RecoveryWal::open(storage_root, epoch, RecoveryWalConfig::default())?;
     let bytes = recovery.load_or_create_registration(&mut wal, || match finalized {
-        Some(bytes) => Ok(bytes.to_vec()),
-        None => local_keys.registration_bytes(address, epoch.0),
+        Some(registration) => Ok(encode_registration(registration)),
+        None => local_keys
+            .registration(address, epoch.0)
+            .map(|registration| encode_registration(&registration)),
     })?;
     let registration = decode_verified_registration(address, epoch, &bytes)?;
 
@@ -156,7 +160,21 @@ pub(crate) fn load_or_create_local_registration(
     if registration.qc_verifying_key != local.qc_verifying_key {
         return Err(RegistrationError::QcKeyMismatch);
     }
-    Ok(bytes)
+    Ok(RegistrationCall::from_party(&registration))
+}
+
+fn verify_registration(
+    registration: RegistrationCall,
+    epoch: Epoch,
+) -> Result<PartyRegistration<K256SecpBackend>, RegistrationError> {
+    let address = registration.address.0;
+    let registration = registration
+        .into_party()
+        .map_err(|source| RegistrationError::Decode {
+            address: Address::from(address),
+            source,
+        })?;
+    verify_decoded_registration(address, epoch, registration)
 }
 
 fn decode_verified_registration(
@@ -171,6 +189,15 @@ fn decode_verified_registration(
             source,
         }
     })?;
+    verify_decoded_registration(address, epoch, registration)
+}
+
+fn verify_decoded_registration(
+    address: [u8; 20],
+    epoch: Epoch,
+    registration: PartyRegistration<K256SecpBackend>,
+) -> Result<PartyRegistration<K256SecpBackend>, RegistrationError> {
+    let requested = Address::from(address);
     if registration.address.0 != address {
         return Err(RegistrationError::AddressMismatch {
             requested,

@@ -4,7 +4,7 @@ use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, Bloom, Log, B256};
 use alloy_sol_types::SolEvent;
 use dkg_core::RecordId;
-use dkg_protocol::ChainEvent;
+use dkg_protocol::{ChainEvent, RegistrationCall};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
@@ -14,10 +14,7 @@ use monad_execution_state_read::{
 use monad_types::{Epoch, NodeId, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 
-use crate::{
-    DkgChain, DkgChainConfig, DkgError, DkgLocalRegistrationState, DkgManager, DkgRegistration,
-    DkgTransactionContext,
-};
+use crate::{DkgChainConfig, DkgError, DkgManager};
 
 #[cfg(test)]
 use super::bindings::{bve_qc_to_contract, dkg_result_to_contract, pc_qc_to_contract};
@@ -27,6 +24,7 @@ use super::{
         PcQcPosted,
     },
     triedb_state::TriedbDkgStateReader,
+    ChainRead, DkgChain, DkgTransactionContext,
 };
 
 pub fn new_triedb_manager<ST, SCT>(
@@ -46,6 +44,7 @@ where
     let chain = Arc::new(TriedbDkgChain {
         state_read,
         state_reader,
+        contract: chain_config.contract,
         transactions,
     });
     let manager = DkgManager::new_with_chain(self_id, storage_root, chain_config, chain)?;
@@ -59,6 +58,7 @@ where
 {
     state_read: ExecutionStateReadThreadClient<ST, SCT>,
     state_reader: TriedbDkgStateReader,
+    contract: Address,
     transactions: flume::Sender<TxEnvelope>,
 }
 
@@ -67,59 +67,38 @@ where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Send + Sync + 'static,
 {
-    fn read_local_registration(
+    fn read_registrations(
         &self,
         block: SeqNum,
-        contract: Address,
         epoch: Epoch,
-        party: Address,
-    ) -> Result<Option<DkgLocalRegistrationState>, DkgError> {
+        parties: &[Address],
+    ) -> Result<Option<Vec<RegistrationCall>>, DkgError> {
         let mut state = self.state_read.clone();
         self.state_reader
-            .read_local_registration(&mut state, block, contract, epoch, party)
-            .map_err(|source| DkgError::operation("read local DKG registration", source))
+            .read_registrations(&mut state, block, self.contract, epoch, parties)
+            .map_err(|source| DkgError::operation("read DKG registrations", source))
     }
 
-    fn read_registered_parties(
-        &self,
-        block: SeqNum,
-        contract: Address,
-        epoch: Epoch,
-    ) -> Result<Option<Vec<DkgRegistration>>, DkgError> {
-        let mut state = self.state_read.clone();
-        self.state_reader
-            .read_registrations(&mut state, block, contract, epoch)
-            .map_err(|source| DkgError::operation("read registered DKG parties", source))
-    }
-
-    fn read_recovery_state(
-        &self,
-        block: SeqNum,
-        contract: Address,
-        epoch: Epoch,
-        party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, DkgError> {
-        let mut state = self.state_read.clone();
-        self.state_reader
-            .read(&mut state, block, contract, epoch, party_count)
-            .map_err(|source| DkgError::operation("read DKG recovery state", source))
-    }
-
-    fn read_finalized_events(
-        &self,
-        block: SeqNum,
-        contract: Address,
-        epoch: Epoch,
-        party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, DkgError> {
-        read_dkg_events(
-            &mut self.state_read.clone(),
-            block,
-            &DkgLogMatcher::new(contract),
-            epoch,
-            party_count,
-        )
-        .map_err(|source| DkgError::operation("read finalized DKG events", source))
+    fn read_events(&self, read: ChainRead) -> Result<Option<Vec<ChainEvent>>, DkgError> {
+        let session = read.session();
+        match read {
+            ChainRead::Snapshot(_) => self.state_reader.read(
+                &mut self.state_read.clone(),
+                read.block(),
+                self.contract,
+                session.epoch,
+                session.party_count,
+            ),
+            ChainRead::Block(block, _) => read_dkg_events(
+                &mut self.state_read.clone(),
+                block,
+                &DkgLogMatcher::new(self.contract),
+                session.epoch,
+                session.party_count,
+            )
+            .map_err(Into::into),
+        }
+        .map_err(|source| DkgError::operation("read DKG chain events", source))
     }
 
     fn transaction_context(

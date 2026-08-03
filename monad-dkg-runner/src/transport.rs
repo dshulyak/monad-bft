@@ -8,7 +8,7 @@ use std::{
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
 use dkg_core::PartyId;
-use dkg_protocol::{ChainCall, DkgMessageCodecError, DkgMessageId, DkgMessageKey, DkgMessageKind};
+use dkg_protocol::{DkgMessageCodecError, DkgMessageId, DkgMessageKey, DkgMessageKind};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
@@ -31,11 +31,6 @@ pub(crate) enum DeliveryInbound<ST: CertificateSignatureRecoverable> {
 const DKG_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const DKG_RETRY_STEP: Duration = Duration::from_secs(2);
 const DKG_RETRY_MAX: Duration = Duration::from_secs(30);
-pub(crate) struct DkgManagerCommand {
-    pub(crate) epoch: Epoch,
-    pub(crate) call: ChainCall,
-}
-
 pub(crate) struct DkgSend<ST: CertificateSignatureRecoverable> {
     pub(crate) message_id: DkgMessageId,
     pub(crate) to: NodeId<CertificateSignaturePubKey<ST>>,
@@ -319,6 +314,18 @@ enum WireError {
 enum DkgWireMessage {
     Data { epoch: Epoch, payload: Bytes },
     TransportAck { epoch: Epoch, key: DkgMessageKey },
+}
+
+pub(crate) fn delivery_epoch(payload: &[u8]) -> Option<Epoch> {
+    match DkgWireMessage::decode(payload) {
+        Ok(DkgWireMessage::Data { epoch, .. } | DkgWireMessage::TransportAck { epoch, .. }) => {
+            Some(epoch)
+        }
+        Err(err) => {
+            warn!(?err, "dropping malformed DKG delivery message");
+            None
+        }
+    }
 }
 
 #[derive(RlpEncodable, RlpDecodable)]

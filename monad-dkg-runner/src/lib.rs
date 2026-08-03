@@ -12,10 +12,7 @@ const MAX_RETAINED_DKG_SESSIONS: usize = 2;
 #[cfg(test)]
 mod registration_tests;
 
-pub use chain::{
-    new_triedb_manager, DkgChain, DkgChainConfig, DkgLocalRegistrationState, DkgLocalTransaction,
-    DkgRegistration, DkgTransactionContext,
-};
+pub use chain::{new_triedb_manager, DkgChainConfig};
 pub use error::DkgError;
 pub use manager::{DkgManager, DkgManagerHandle, DkgManagerInbox};
 pub use session::{DkgLocalKeyMaterial, DkgValidator};

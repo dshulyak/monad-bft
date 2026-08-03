@@ -21,8 +21,6 @@ pub enum DkgError {
     RegistrationContractMismatch { expected: Address, actual: Address },
     #[error("DKG result epoch {actual} does not match submission epoch {expected}")]
     ResultEpochMismatch { expected: u64, actual: u64 },
-    #[error("duplicate DKG recovery sequence {sequence}")]
-    DuplicateRecoverySequence { sequence: u64 },
     #[error("duplicate validator in DKG party map")]
     DuplicateValidator,
     #[error("finalized DKG registration for {address} conflicts with the recovery WAL")]

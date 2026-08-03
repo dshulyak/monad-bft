@@ -5,13 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use alloy_primitives::Address;
 use dkg_protocol::ChainEvent;
 use monad_types::{Epoch, SeqNum};
 use tracing::info;
-
-use super::DkgChain;
-use crate::DkgError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChainEventSession {
@@ -85,16 +81,8 @@ impl ChainEventReader {
         })
     }
 
-    pub(crate) fn complete(
-        &mut self,
-        read: ChainRead,
-        mut events: Vec<ChainEvent>,
-    ) -> Result<ChainEventBatch, DkgError> {
-        if matches!(read, ChainRead::Snapshot(_)) {
-            sort_recovery_events(&mut events)?;
-        }
+    pub(crate) fn complete(&mut self, read: ChainRead, events: Vec<ChainEvent>) -> ChainEventBatch {
         let session = read.session();
-        events.retain(|event| event_matches_session(event, session.epoch));
         let scan = self
             .scans
             .get_mut(&session.epoch)
@@ -107,12 +95,12 @@ impl ChainEventReader {
                 "completed DKG chain recovery"
             );
         }
-        Ok(ChainEventBatch {
+        ChainEventBatch {
             session,
             block: read.block(),
             events,
             recovery_complete_after,
-        })
+        }
     }
 }
 
@@ -163,43 +151,6 @@ impl SessionScan {
             !self.recovery_complete && !self.snapshot_pending && processed >= self.recovery_through;
         self.recovery_complete |= complete;
         complete
-    }
-}
-
-pub(crate) fn read_chain(
-    chain: &dyn DkgChain,
-    contract: Address,
-    read: ChainRead,
-) -> Result<Option<Vec<ChainEvent>>, DkgError> {
-    let session = read.session();
-    match read {
-        ChainRead::Snapshot(_) => {
-            chain.read_recovery_state(read.block(), contract, session.epoch, session.party_count)
-        }
-        ChainRead::Block(block, _) => {
-            chain.read_finalized_events(block, contract, session.epoch, session.party_count)
-        }
-    }
-}
-
-fn event_matches_session(event: &ChainEvent, epoch: Epoch) -> bool {
-    match event {
-        ChainEvent::DkgResultRecorded { qc, .. } => qc.epoch.0 == epoch.0,
-        ChainEvent::PCQc { .. } | ChainEvent::BveQcFinalized { .. } => true,
-    }
-}
-
-fn sort_recovery_events(events: &mut [ChainEvent]) -> Result<(), DkgError> {
-    events.sort_unstable_by_key(ChainEvent::record_id);
-    if let Some(duplicate) = events
-        .windows(2)
-        .find(|pair| pair[0].record_id() == pair[1].record_id())
-    {
-        Err(DkgError::DuplicateRecoverySequence {
-            sequence: duplicate[0].record_id().0,
-        })
-    } else {
-        Ok(())
     }
 }
 

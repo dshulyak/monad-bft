@@ -1,10 +1,9 @@
 use std::path::Path;
 
+use alloy_consensus::TxEnvelope;
 use monad_chain_config::ChainConfig;
 use monad_crypto::certificate_signature::CertificateSignaturePubKey;
-use monad_dkg_runner::{
-    new_triedb_manager, DkgChainConfig, DkgError, DkgLocalTransaction, DkgManager,
-};
+use monad_dkg_runner::{new_triedb_manager, DkgChainConfig, DkgError, DkgManager};
 use monad_ethcall::ffi::PoolConfig;
 use monad_execution_state_read::ExecutionStateReadThreadClient;
 use monad_execution_state_read_cache::ExecutionStateReadCache;
@@ -57,7 +56,7 @@ pub fn build_manager(
 ) -> Result<
     (
         DkgManager<SignatureType>,
-        Option<flume::Receiver<DkgLocalTransaction>>,
+        Option<flume::Receiver<TxEnvelope>>,
     ),
     DkgError,
 > {

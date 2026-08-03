@@ -46,7 +46,6 @@ enum ChainInput {
 
 struct NodeRuntime {
     runner: Runner<NopSignature>,
-    commands: flume::Receiver<DkgManagerCommand>,
 }
 
 struct ModelNode {
@@ -185,8 +184,8 @@ impl FourNodeRecoveryModel {
                     .into_iter()
                     .map(|outbound| NetworkMessage { source, outbound }),
             );
-            for command in runtime.commands.try_iter() {
-                let Some(event) = self.chain.post(command.call) else {
+            for call in runtime.runner.take_chain_calls() {
+                let Some(event) = self.chain.post(call) else {
                     continue;
                 };
                 self.chain_messages
@@ -424,7 +423,6 @@ fn start_runtime(
         },
     )
     .unwrap();
-    let (command_tx, commands) = flume::unbounded();
     let engine_seed = recovery_state
         .load_or_create_engine_seed(&mut recovery_wal)
         .unwrap();
@@ -436,12 +434,10 @@ fn start_runtime(
         key_material: test_registered_key_material(self_party, validators.len(), TEST_EPOCH),
         recovery_wal,
         recovery_state,
-        commands: command_tx,
-        wait_for_chain_recovery: true,
     })
     .unwrap();
     runner.initialize().unwrap();
-    NodeRuntime { runner, commands }
+    NodeRuntime { runner }
 }
 
 fn test_validators(count: u8) -> Vec<NodeId<CertificateSignaturePubKey<NopSignature>>> {

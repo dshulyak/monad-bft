@@ -13,7 +13,10 @@ use dkg_protocol::{ChainCall, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes};
 use monad_types::{Epoch, SeqNum};
 
 use super::*;
-use crate::{DkgLocalKeyMaterial, DkgTransactionContext};
+use crate::{
+    chain::{ChainRead, DkgTransactionContext},
+    DkgLocalKeyMaterial,
+};
 
 #[test]
 fn encodes_post_pc_qc_contract_calldata() {
@@ -98,10 +101,10 @@ fn registration_retries_same_transaction_until_finalized_state_confirms_it() {
     let nonce_reads = Arc::new(AtomicUsize::new(0));
     let (mut service, local_rx) = test_submitter(5, Arc::clone(&nonce_reads));
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration_bytes(service.signer_address().into_array(), 2)
+        .registration(service.signer_address().into_array(), 2)
         .unwrap();
 
-    service.submit_registration(Epoch(2), SeqNum(10), registration.clone());
+    service.submit_registration(Epoch(2), SeqNum(10), registration);
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     service.retry_registration(Epoch(2), SeqNum(11));
@@ -189,9 +192,9 @@ fn new_artifact_uses_newest_context_across_sessions() {
     service.start_session(Epoch(2));
     service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration_bytes(service.signer_address().into_array(), 3)
+        .registration(service.signer_address().into_array(), 3)
         .unwrap();
-    service.submit_registration(Epoch(3), SeqNum(20), registration.clone());
+    service.submit_registration(Epoch(3), SeqNum(20), registration);
     local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     service.confirm_registration(Epoch(3), &registration);
     nonce.store(6, Ordering::SeqCst);
@@ -212,7 +215,7 @@ fn active_artifact_keeps_its_epoch_context() {
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration_bytes(service.signer_address().into_array(), 3)
+        .registration(service.signer_address().into_array(), 3)
         .unwrap();
     service.submit_registration(Epoch(3), SeqNum(20), registration);
 
@@ -310,6 +313,19 @@ struct TestChain {
 }
 
 impl DkgChain for TestChain {
+    fn read_registrations(
+        &self,
+        _block: SeqNum,
+        _epoch: Epoch,
+        _parties: &[Address],
+    ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+        unreachable!()
+    }
+
+    fn read_events(&self, _read: ChainRead) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
+        unreachable!()
+    }
+
     fn transaction_context(
         &self,
         block: SeqNum,

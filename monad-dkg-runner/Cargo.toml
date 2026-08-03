@@ -24,7 +24,6 @@ monad-validator = { workspace = true }
 
 alloy-rlp = { workspace = true, features = ["derive"] }
 alloy-consensus = { workspace = true, features = ["k256"] }
-alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-signer = { workspace = true }
 alloy-signer-local = { workspace = true }
@@ -39,6 +38,7 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 failpoint = { workspace = true, features = ["failpoints"] }

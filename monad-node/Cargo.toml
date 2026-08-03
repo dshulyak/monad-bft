@@ -54,6 +54,7 @@ monad-wireauth = { workspace = true }
 actix-server = { workspace = true }
 actix-web = { workspace = true }
 agent = { workspace = true }
+alloy-consensus = { workspace = true }
 alloy-rlp = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

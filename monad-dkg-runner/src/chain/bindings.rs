@@ -1,9 +1,9 @@
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::sol;
 use dkg_core::{PartyId, RecordId, SessionId};
-use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
+use dkg_crypto::{BlsG2SerializedBytes, SecpPointBytes, SecpScalarBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
-    BveQc, ChainEvent, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes, REGISTRATION_RECORD_LEN,
+    BveQc, ChainEvent, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes, RegistrationCall,
 };
 use thiserror::Error;
 
@@ -68,8 +68,6 @@ sol! {
         function postPcQc(uint64 epoch, ContractPcQc qc);
         function postBveQc(uint64 epoch, ContractBveQc qc);
         function submitResult(uint64 epoch, ContractDkgResult result);
-        function registeredPartyCount(uint64 epoch) external view returns (uint256);
-        function registeredParty(uint64 epoch, uint256 index) external view returns (address);
         function registrationOf(uint64 epoch, address party)
             external view returns (bool exists, ContractRegistration registration);
         function recordCount(uint64 epoch) external view returns (uint256);
@@ -104,8 +102,6 @@ const COMPRESSED_SECP_POINT_BYTES: usize = 33;
 
 #[derive(Debug, Error)]
 pub(super) enum ContractCodecError {
-    #[error("typed DKG registration is {actual} bytes, expected {expected}")]
-    RegistrationLength { expected: usize, actual: usize },
     #[error("typed DKG registration address {actual} does not match signer {expected}")]
     RegistrationAddress { expected: Address, actual: Address },
     #[error("typed DKG QC has {count} signatures, expected 1..={maximum}")]
@@ -119,16 +115,10 @@ pub(super) enum ContractCodecError {
 }
 
 pub(super) fn registration_to_contract(
-    bytes: &[u8],
+    registration: &RegistrationCall,
     signer: Address,
 ) -> Result<ContractRegistration, ContractCodecError> {
-    if bytes.len() != REGISTRATION_RECORD_LEN {
-        return Err(ContractCodecError::RegistrationLength {
-            expected: REGISTRATION_RECORD_LEN,
-            actual: bytes.len(),
-        });
-    }
-    let encoded = Address::from_slice(&bytes[..20]);
+    let encoded = Address::from(registration.address.0);
     if encoded != signer {
         return Err(ContractCodecError::RegistrationAddress {
             expected: signer,
@@ -136,37 +126,31 @@ pub(super) fn registration_to_contract(
         });
     }
 
-    let mut offset = 20;
-    let qc_verifying_key = take_point(bytes, &mut offset);
-    let receiver_public_key = take_point(bytes, &mut offset);
-    let receiver_key_image = take_point(bytes, &mut offset);
-    let proof_u0 = take_point(bytes, &mut offset);
-    let proof_v0 = take_point(bytes, &mut offset);
-    let proof_z = B256::from_slice(&bytes[offset..offset + 32]);
     Ok(ContractRegistration {
-        qcVerifyingKey: qc_verifying_key,
-        receiverPublicKey: receiver_public_key,
-        receiverKeyImage: receiver_key_image,
-        proofU0: proof_u0,
-        proofV0: proof_v0,
-        proofZ: proof_z,
+        qcVerifyingKey: point_to_contract(registration.qc_verifying_key.0),
+        receiverPublicKey: point_to_contract(registration.receiver_public_key.0),
+        receiverKeyImage: point_to_contract(registration.receiver_key_image.0),
+        proofU0: point_to_contract(registration.proof_u0.0),
+        proofV0: point_to_contract(registration.proof_v0.0),
+        proofZ: B256::from(registration.proof_z.0),
     })
 }
 
 pub(super) fn registration_from_contract(
     address: Address,
     registration: &ContractRegistration,
-) -> bytes::Bytes {
-    let mut bytes = Vec::with_capacity(REGISTRATION_RECORD_LEN);
-    bytes.extend_from_slice(address.as_slice());
-    append_point(&mut bytes, &registration.qcVerifyingKey);
-    append_point(&mut bytes, &registration.receiverPublicKey);
-    append_point(&mut bytes, &registration.receiverKeyImage);
-    append_point(&mut bytes, &registration.proofU0);
-    append_point(&mut bytes, &registration.proofV0);
-    bytes.extend_from_slice(registration.proofZ.as_slice());
-    debug_assert_eq!(bytes.len(), REGISTRATION_RECORD_LEN);
-    bytes.into()
+) -> RegistrationCall {
+    RegistrationCall {
+        address: dkg_core::Address(address.into_array()),
+        qc_verifying_key: dkg_protocol::QcVerifyingKeyBytes(point_from_contract(
+            &registration.qcVerifyingKey,
+        )),
+        receiver_public_key: SecpPointBytes(point_from_contract(&registration.receiverPublicKey)),
+        receiver_key_image: SecpPointBytes(point_from_contract(&registration.receiverKeyImage)),
+        proof_u0: SecpPointBytes(point_from_contract(&registration.proofU0)),
+        proof_v0: SecpPointBytes(point_from_contract(&registration.proofV0)),
+        proof_z: SecpScalarBytes(registration.proofZ.0),
+    }
 }
 
 pub(super) fn pc_qc_to_contract(qc: &PCQc) -> ContractPcQc {
@@ -286,18 +270,18 @@ pub(super) fn record_to_chain_event(
     }
 }
 
-fn take_point(bytes: &[u8], offset: &mut usize) -> ContractSecpPoint {
-    let point = &bytes[*offset..*offset + COMPRESSED_SECP_POINT_BYTES];
-    *offset += COMPRESSED_SECP_POINT_BYTES;
+fn point_to_contract(point: [u8; COMPRESSED_SECP_POINT_BYTES]) -> ContractSecpPoint {
     ContractSecpPoint {
         prefix: point[0],
         x: B256::from_slice(&point[1..]),
     }
 }
 
-fn append_point(bytes: &mut Vec<u8>, point: &ContractSecpPoint) {
-    bytes.push(point.prefix);
-    bytes.extend_from_slice(point.x.as_slice());
+fn point_from_contract(point: &ContractSecpPoint) -> [u8; COMPRESSED_SECP_POINT_BYTES] {
+    let mut bytes = [0; COMPRESSED_SECP_POINT_BYTES];
+    bytes[0] = point.prefix;
+    bytes[1..].copy_from_slice(point.x.as_slice());
+    bytes
 }
 
 fn signatures_to_contract(signatures: &[QcSignature]) -> Vec<ContractQcSignature> {
@@ -358,15 +342,12 @@ mod tests {
     #[test]
     fn registration_boundary_round_trips_protocol_encoding() {
         let address = Address::repeat_byte(0xA5);
-        let bytes = DkgLocalKeyMaterial::derive([0x11; 32])
-            .registration_bytes(address.into_array(), 7)
+        let registration = DkgLocalKeyMaterial::derive([0x11; 32])
+            .registration(address.into_array(), 7)
             .unwrap();
 
-        let registration = registration_to_contract(&bytes, address).unwrap();
+        let contract = registration_to_contract(&registration, address).unwrap();
 
-        assert_eq!(
-            registration_from_contract(address, &registration).as_ref(),
-            bytes
-        );
+        assert_eq!(registration_from_contract(address, &contract), registration);
     }
 }

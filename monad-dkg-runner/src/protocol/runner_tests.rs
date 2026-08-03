@@ -15,7 +15,7 @@ use crate::session::test_registered_key_material;
 fn runner_submits_chain_call_and_processes_finalized_event() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(11);
-    let (mut runner, command_rx, wal_path) = test_runner(temp.path(), epoch);
+    let (mut runner, wal_path) = test_runner(temp.path(), epoch);
 
     let qc = DkgDoneQc {
         epoch: SessionId(epoch.0),
@@ -25,9 +25,10 @@ fn runner_submits_chain_call_and_processes_finalized_event() {
     runner
         .handle_chain_call(ChainCall::PostDkgResult { qc: qc.clone() })
         .unwrap();
-    let command = command_rx.recv().unwrap();
-    assert_eq!(command.epoch, epoch);
-    assert_eq!(command.call, ChainCall::PostDkgResult { qc: qc.clone() });
+    assert_eq!(
+        runner.take_chain_calls(),
+        vec![ChainCall::PostDkgResult { qc: qc.clone() }]
+    );
     let wal_len = std::fs::metadata(&wal_path).unwrap().len();
 
     let event = ChainEvent::DkgResultRecorded {
@@ -35,7 +36,6 @@ fn runner_submits_chain_call_and_processes_finalized_event() {
         qc,
     };
     runner.handle_chain_event(event.clone()).unwrap();
-    assert_eq!(runner.chain_events.get(&RecordId(77)), Some(&event));
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
     assert!(runner.pending_inputs.is_empty());
 
@@ -59,17 +59,14 @@ fn runner_refuses_one_and_two_validator_sets() {
     for count in [1, 2] {
         let temp = TempDir::new().unwrap();
         let validators = test_validators(count);
-        let (commands, _command_rx) = flume::unbounded();
-
         let epoch = Epoch(u64::from(count));
-        let config = DkgSessionConfig {
+        let result = start::<NopSignature>(
             epoch,
-            self_id: validators[0],
+            validators[0],
             validators,
-            storage_root: temp.path().to_path_buf(),
-            key_material: test_registered_key_material(PartyId(0), usize::from(count), epoch),
-        };
-        let result = start::<NopSignature>(config, commands, false);
+            temp.path(),
+            test_registered_key_material(PartyId(0), usize::from(count), epoch),
+        );
 
         assert!(matches!(
             result,
@@ -86,7 +83,7 @@ fn protocol_rejection_is_not_persisted_or_acknowledged() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(19);
     let validators = test_validators(4);
-    let (mut runner, _, _) = test_runner(temp.path(), epoch);
+    let (mut runner, _) = test_runner(temp.path(), epoch);
     let sender = validators[1];
     let self_id = validators[0];
     let self_party = runner.self_party;
@@ -122,14 +119,7 @@ fn protocol_rejection_is_not_persisted_or_acknowledged() {
     assert!(sender_delivery.next_timer().is_some());
 }
 
-fn test_runner(
-    root: &std::path::Path,
-    epoch: Epoch,
-) -> (
-    Runner<NopSignature>,
-    flume::Receiver<DkgManagerCommand>,
-    std::path::PathBuf,
-) {
+fn test_runner(root: &std::path::Path, epoch: Epoch) -> (Runner<NopSignature>, std::path::PathBuf) {
     let validators = test_validators(4);
     let mapping = DkgPeerMap::<NopSignature>::new_ordered(validators.clone()).unwrap();
     let self_party = mapping.party_id(&validators[0]).unwrap();
@@ -145,8 +135,7 @@ fn test_runner(
     let wal_path = wal.path().to_path_buf();
     let mut recovery = RecoveryState::default();
     let engine_seed = recovery.load_or_create_engine_seed(&mut wal).unwrap();
-    let (commands, command_rx) = flume::unbounded();
-    let runner = Runner::new(RunnerInit {
+    let mut runner = Runner::new(RunnerInit {
         epoch,
         self_party,
         mapping,
@@ -154,11 +143,13 @@ fn test_runner(
         key_material: test_registered_key_material(self_party, 4, epoch),
         recovery_wal: wal,
         recovery_state: recovery,
-        commands,
-        wait_for_chain_recovery: false,
     })
     .unwrap();
-    (runner, command_rx, wal_path)
+    runner.initialize().unwrap();
+    runner.finish_chain_recovery().unwrap();
+    runner.take_chain_calls();
+    runner.take_delivery_outbound();
+    (runner, wal_path)
 }
 
 fn test_validators(count: u8) -> Vec<NodeId<CertificateSignaturePubKey<NopSignature>>> {

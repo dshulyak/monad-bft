@@ -2,9 +2,9 @@
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::Address;
-use bytes::Bytes;
-use dkg_protocol::{ChainCall, ChainEvent};
+use dkg_protocol::{ChainCall, ChainEvent, RegistrationCall};
 use monad_types::{Epoch, SeqNum};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::DkgError;
 
@@ -16,93 +16,39 @@ mod triedb_state;
 
 pub use triedb::new_triedb_manager;
 
-pub(crate) use recovery::{read_chain, ChainEventBatch, ChainEventReader, ChainEventSession};
+pub(crate) use recovery::{ChainEventBatch, ChainEventReader, ChainEventSession, ChainRead};
 pub(crate) use submitter::TxSubmitter;
 
 const DEFAULT_TX_GAS_LIMIT: u64 = 5_000_000;
 const DEFAULT_TX_MAX_PRIORITY_FEE_PER_GAS: u128 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DkgRegistration {
-    pub address: Address,
-    pub bytes: Bytes,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DkgLocalRegistrationState {
-    pub registration: Option<Bytes>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DkgTransactionContext {
+pub(crate) struct DkgTransactionContext {
     pub nonce: u64,
     pub base_fee_per_gas: u64,
 }
-
-/// Signed Ethereum transaction prepared for insertion into the local txpool.
-pub type DkgLocalTransaction = TxEnvelope;
 
 /// The only boundary between the DKG manager and chain-specific I/O.
 ///
 /// The manager owns recovery timing, retry, ordering, and delivery into the
 /// protocol engine. Implementations only read a requested chain boundary or
 /// finalized block and submit transactions through the host node.
-pub trait DkgChain: Send + Sync + 'static {
-    /// Reads all recovery-relevant DKG state at exactly `block`.
+pub(crate) trait DkgChain: Send + Sync + 'static {
+    /// Reads registrations for the requested parties at exactly `block`.
     ///
-    /// `None` means the execution state for the requested block is not available
-    /// yet. Returned events must use the same record identities as live logs.
-    fn read_recovery_state(
+    /// `None` means the execution state is not available yet. The returned
+    /// registrations must be in request order and omit unregistered parties.
+    fn read_registrations(
         &self,
-        _block: SeqNum,
-        _contract: Address,
-        _epoch: Epoch,
-        _party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, DkgError> {
-        Err(DkgError::Unsupported("DKG recovery reads"))
-    }
+        block: SeqNum,
+        epoch: Epoch,
+        parties: &[Address],
+    ) -> Result<Option<Vec<RegistrationCall>>, DkgError>;
 
-    /// Reads the complete registration set at exactly `block`.
+    /// Reads either the recovery snapshot or one finalized block.
     ///
-    /// `None` means the execution state for the requested block is not
-    /// available yet. The manager validates and intersects these records with
-    /// the finalized validator set before constructing the protocol engine.
-    fn read_registered_parties(
-        &self,
-        _block: SeqNum,
-        _contract: Address,
-        _epoch: Epoch,
-    ) -> Result<Option<Vec<DkgRegistration>>, DkgError> {
-        Err(DkgError::Unsupported("DKG registration reads"))
-    }
-
-    /// Reads this node's registration at exactly `block`.
-    ///
-    /// This lightweight read drives pre-boundary registration retries without
-    /// loading every party's registration on each finalized block.
-    fn read_local_registration(
-        &self,
-        _block: SeqNum,
-        _contract: Address,
-        _epoch: Epoch,
-        _party: Address,
-    ) -> Result<Option<DkgLocalRegistrationState>, DkgError> {
-        Err(DkgError::Unsupported("DKG local registration reads"))
-    }
-
-    /// Reads DKG events from exactly one finalized block.
-    ///
-    /// `None` means the block or its receipts are not available yet. The
-    /// manager retries and delivers successful reads to the protocol engine.
-    fn read_finalized_events(
-        &self,
-        _block: SeqNum,
-        _contract: Address,
-        _epoch: Epoch,
-        _party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, DkgError> {
-        Err(DkgError::Unsupported("DKG finalized-event reads"))
-    }
+    /// `None` means the requested state or receipts are not available yet.
+    fn read_events(&self, read: ChainRead) -> Result<Option<Vec<ChainEvent>>, DkgError>;
 
     /// Reads the signer nonce at `block` and the latest proposed block's base fee.
     ///
@@ -112,24 +58,24 @@ pub trait DkgChain: Send + Sync + 'static {
     /// again at a new nonce.
     fn transaction_context(
         &self,
-        _block: SeqNum,
-        _address: Address,
-    ) -> Result<DkgTransactionContext, DkgError> {
-        Err(DkgError::Unsupported("DKG transaction context reads"))
-    }
+        block: SeqNum,
+        address: Address,
+    ) -> Result<DkgTransactionContext, DkgError>;
 
-    fn submit_transaction(&self, _transaction: DkgLocalTransaction) -> Result<(), DkgError> {
-        Err(DkgError::Unsupported("DKG transaction submission"))
-    }
+    fn submit_transaction(&self, transaction: TxEnvelope) -> Result<(), DkgError>;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DkgChainConfig {
     pub signing_key: [u8; 32],
     pub local_keys: crate::DkgLocalKeyMaterial,
+    #[zeroize(skip)]
     pub contract: Address,
+    #[zeroize(skip)]
     pub chain_id: u64,
+    #[zeroize(skip)]
     pub gas_limit: u64,
+    #[zeroize(skip)]
     pub max_priority_fee_per_gas: u128,
 }
 

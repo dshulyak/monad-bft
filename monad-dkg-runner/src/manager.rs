@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, mem, path::PathBuf, sync::Arc, time::Instant};
 
 use bytes::Bytes;
+use dkg_protocol::RegistrationCall;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
@@ -8,18 +9,15 @@ use monad_types::{Epoch, NodeId, SeqNum};
 use tracing::{debug, error, warn};
 
 use crate::{
-    chain::{read_chain, ChainEventBatch, ChainEventReader, ChainEventSession, TxSubmitter},
-    protocol::runner::{start, Runner},
+    chain::{ChainEventBatch, ChainEventReader, ChainEventSession, DkgChain, TxSubmitter},
+    protocol::{start, Runner},
     registration::{assemble_registered_session, load_or_create_local_registration},
-    session::DkgSessionConfig,
-    transport::DkgManagerCommand,
-    DeliveryOutbound, DkgChain, DkgChainConfig, DkgError, DkgLocalKeyMaterial,
-    DkgLocalRegistrationState, DkgRegistration, DkgValidator,
+    transport::delivery_epoch,
+    DeliveryOutbound, DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
 };
 
 struct ManagedChain {
     io: Arc<dyn DkgChain>,
-    contract: alloy_primitives::Address,
     local_keys: DkgLocalKeyMaterial,
     submitter: TxSubmitter,
     event_reader: ChainEventReader,
@@ -145,8 +143,6 @@ where
 {
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
     storage_root: PathBuf,
-    command_tx: flume::Sender<DkgManagerCommand>,
-    command_rx: flume::Receiver<DkgManagerCommand>,
     pending_outbound: Vec<DeliveryOutbound<ST>>,
     sessions: BTreeMap<Epoch, Runner<ST>>,
     latest_started_epoch: Option<Epoch>,
@@ -162,12 +158,9 @@ where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
     pub fn new(self_id: NodeId<CertificateSignaturePubKey<ST>>, storage_root: PathBuf) -> Self {
-        let (command_tx, command_rx) = flume::unbounded();
         Self {
             self_id,
             storage_root,
-            command_tx,
-            command_rx,
             pending_outbound: Vec::new(),
             sessions: BTreeMap::new(),
             latest_started_epoch: None,
@@ -179,7 +172,7 @@ where
         }
     }
 
-    pub fn new_with_chain(
+    pub(crate) fn new_with_chain(
         self_id: NodeId<CertificateSignaturePubKey<ST>>,
         storage_root: PathBuf,
         config: DkgChainConfig,
@@ -190,8 +183,7 @@ where
         let registration = LocalRegistration::new(submitter.signer_address());
         manager.chain = Some(ManagedChain {
             io: chain,
-            contract: config.contract,
-            local_keys: config.local_keys,
+            local_keys: config.local_keys.clone(),
             submitter,
             event_reader: ChainEventReader::default(),
             registration,
@@ -205,7 +197,6 @@ where
         outbound: flume::Sender<DeliveryOutbound<ST>>,
     ) -> Result<(), DkgError> {
         let events = inbox.events;
-        let commands = self.command_rx.clone();
         loop {
             let timer = self.next_timer();
             tokio::select! {
@@ -226,10 +217,6 @@ where
                     Ok(DkgManagerEvent::Network { sender, message }) => {
                         self.handle_network_message(sender, message)
                     }
-                    Err(_) => return Ok(()),
-                },
-                command = commands.recv_async() => match command {
-                    Ok(command) => self.handle_command(command),
                     Err(_) => return Ok(()),
                 },
                 () = wait_for_timer(timer) => self.handle_timer(Instant::now()),
@@ -375,21 +362,21 @@ where
                     (
                         epoch,
                         block,
-                        chain.io.read_local_registration(
-                            block,
-                            chain.contract,
-                            epoch,
-                            registration.address,
-                        ),
+                        chain
+                            .io
+                            .read_registrations(block, epoch, &[registration.address]),
                     )
                 })
             }) else {
                 return;
             };
             match result {
-                Ok(Some(state)) => {
+                Ok(Some(mut registrations)) => {
                     self.chain.as_mut().unwrap().registration.unavailable_block = None;
-                    if let Err(err) = self.accept_local_registration_read(epoch, block, state) {
+                    debug_assert!(registrations.len() <= 1);
+                    if let Err(err) =
+                        self.accept_local_registration_read(epoch, block, registrations.pop())
+                    {
                         error!(
                             ?err,
                             epoch = epoch.0,
@@ -420,7 +407,7 @@ where
         &mut self,
         epoch: Epoch,
         block: SeqNum,
-        state: DkgLocalRegistrationState,
+        observed: Option<RegistrationCall>,
     ) -> Result<(), DkgError> {
         let storage_root = self.storage_root.clone();
         let Some(chain) = self.chain.as_mut() else {
@@ -429,13 +416,12 @@ where
         if chain.registration.epoch != Some(epoch) {
             return Ok(());
         }
-        let observed = state.registration;
         let local_bytes = match load_or_create_local_registration(
             &storage_root,
             epoch,
             chain.registration.address.into_array(),
-            chain.local_keys,
-            observed.as_deref(),
+            &chain.local_keys,
+            observed.as_ref(),
         ) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -451,7 +437,7 @@ where
 
         if let Some(bytes) = observed {
             chain.registration.phase = LocalRegistrationPhase::Done;
-            if bytes.as_ref() != local_bytes.as_slice() {
+            if bytes != local_bytes {
                 return Err(DkgError::FinalizedRegistrationConflict {
                     address: chain.registration.address,
                 });
@@ -480,21 +466,26 @@ where
         if self.sync_block.is_none() {
             return;
         }
-        let Some((io, contract)) = self
-            .chain
-            .as_ref()
-            .map(|chain| (Arc::clone(&chain.io), chain.contract))
+        let Some(io) = self.chain.as_ref().map(|chain| Arc::clone(&chain.io)) else {
+            return;
+        };
+        let Some((epoch, block, parties)) =
+            self.pending_registered_session
+                .as_ref()
+                .and_then(|(epoch, pending)| {
+                    pending.registration_block.map(|block| {
+                        let parties = pending
+                            .validators
+                            .iter()
+                            .map(|validator| alloy_primitives::Address::from(validator.address))
+                            .collect::<Vec<_>>();
+                        (*epoch, block, parties)
+                    })
+                })
         else {
             return;
         };
-        let Some((epoch, block)) = self
-            .pending_registered_session
-            .as_ref()
-            .and_then(|(epoch, pending)| pending.registration_block.map(|block| (*epoch, block)))
-        else {
-            return;
-        };
-        match io.read_registered_parties(block, contract, epoch) {
+        match io.read_registrations(block, epoch, &parties) {
             Ok(Some(state)) => {
                 if let Err(err) = self.accept_registration_snapshot(epoch, state) {
                     error!(
@@ -518,7 +509,7 @@ where
     fn accept_registration_snapshot(
         &mut self,
         epoch: Epoch,
-        registrations: Vec<DkgRegistration>,
+        registrations: Vec<RegistrationCall>,
     ) -> Result<(), DkgError> {
         let Some((_, pending)) = self
             .pending_registered_session
@@ -529,48 +520,52 @@ where
         let recovery_block = pending
             .registration_block
             .expect("registration read has a finalized block");
-        let local_keys = self
+        let local_keys = &self
             .chain
             .as_ref()
             .expect("registered session requires chain integration")
             .local_keys;
-        let registered =
-            assemble_registered_session(epoch, pending.validators, local_keys, registrations)
-                .map_err(|err| DkgError::operation("assemble registered DKG session", err))?;
-        let config = DkgSessionConfig {
+        let registered = assemble_registered_session(
             epoch,
-            validators: registered.validators,
-            self_id: self.self_id,
-            storage_root: self.storage_root.clone(),
-            key_material: registered.key_material,
-        };
-        self.start_session_at(config, Some(recovery_block))
+            self.self_id,
+            pending.validators,
+            local_keys,
+            registrations,
+        )
+        .map_err(|err| DkgError::operation("assemble registered DKG session", err))?;
+        self.start_session_at(
+            epoch,
+            registered.validators,
+            registered.key_material,
+            Some(recovery_block),
+        )
     }
 
     fn start_session_at(
         &mut self,
-        config: DkgSessionConfig<ST>,
+        epoch: Epoch,
+        validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+        key_material: crate::session::DkgRegisteredKeyMaterial,
         recovery_block: Option<SeqNum>,
     ) -> Result<(), DkgError> {
-        let epoch = config.epoch;
-        let party_count = config.validators.len();
+        let party_count = validators.len();
         if self
             .latest_started_epoch
             .is_some_and(|started| started >= epoch)
         {
             return Ok(());
         }
-        let Some(mut runner) = start(
-            config,
-            self.command_tx.clone(),
-            recovery_block.is_some() && self.chain.is_some(),
+        let Some(runner) = start(
+            epoch,
+            self.self_id,
+            validators,
+            &self.storage_root,
+            key_material,
         )?
         else {
             self.latest_started_epoch = Some(epoch);
             return Ok(());
         };
-        self.pending_outbound
-            .extend(runner.take_delivery_outbound());
         self.latest_started_epoch = Some(epoch);
         self.sessions.insert(epoch, runner);
         self.start_chain_session(epoch, party_count, recovery_block);
@@ -599,26 +594,17 @@ where
         self.schedule_chain_read();
     }
 
-    fn handle_command(&mut self, command: DkgManagerCommand) {
-        let DkgManagerCommand { epoch, call } = command;
-        failpoint::failpoint!(
-            name = "dkg.chain.call_buffered",
-            description =
-                "after a DKG chain call reaches the manager and before transaction submission",
-        );
-        if let Some(chain) = self.chain.as_mut() {
-            chain.submitter.submit(epoch, call);
-        }
-    }
-
     pub fn handle_timer(&mut self, now: Instant) {
-        for session in self.sessions.values_mut() {
-            if session.next_timer().is_some_and(|deadline| deadline <= now) {
-                if let Err(err) = session.handle_timer(now) {
+        let epochs = self.sessions.keys().copied().collect::<Vec<_>>();
+        for epoch in epochs {
+            if self.sessions[&epoch]
+                .next_timer()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                if let Err(err) = self.sessions.get_mut(&epoch).unwrap().handle_timer(now) {
                     error!(?err, "failed to process DKG retry timer");
                 }
-                self.pending_outbound
-                    .extend(session.take_delivery_outbound());
+                self.collect_runner_effects(epoch);
             }
         }
     }
@@ -628,13 +614,16 @@ where
         sender: NodeId<CertificateSignaturePubKey<ST>>,
         message: Bytes,
     ) {
-        for session in self.sessions.values_mut() {
-            if let Err(err) = session.handle_network_message(sender, message.clone()) {
-                error!(?err, ?sender, "failed to process DKG network message");
-            }
-            self.pending_outbound
-                .extend(session.take_delivery_outbound());
+        let Some(epoch) = delivery_epoch(&message) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&epoch) else {
+            return;
+        };
+        if let Err(err) = session.handle_network_message(sender, message) {
+            error!(?err, ?sender, "failed to process DKG network message");
         }
+        self.collect_runner_effects(epoch);
     }
 
     pub fn next_timer(&self) -> Option<Instant> {
@@ -646,17 +635,45 @@ where
         mem::take(&mut self.pending_outbound)
     }
 
+    fn collect_runner_effects(&mut self, epoch: Epoch) {
+        let calls = self.take_runner_effects(epoch);
+        self.submit_chain_calls(epoch, calls);
+    }
+
+    fn take_runner_effects(&mut self, epoch: Epoch) -> Vec<dkg_protocol::ChainCall> {
+        let Some(session) = self.sessions.get_mut(&epoch) else {
+            return Vec::new();
+        };
+        self.pending_outbound
+            .extend(session.take_delivery_outbound());
+        session.take_chain_calls()
+    }
+
+    fn submit_chain_calls(&mut self, epoch: Epoch, calls: Vec<dkg_protocol::ChainCall>) {
+        let Some(chain) = self.chain.as_mut() else {
+            return;
+        };
+        for call in calls {
+            failpoint::failpoint!(
+                name = "dkg.chain.call_buffered",
+                description =
+                    "after a DKG chain call is buffered and before transaction submission",
+            );
+            chain.submitter.submit(epoch, call);
+        }
+    }
+
     fn schedule_chain_read(&mut self) {
         loop {
-            let Some((read, io, contract)) = self.chain.as_ref().and_then(|chain| {
+            let Some((read, io)) = self.chain.as_ref().and_then(|chain| {
                 chain
                     .event_reader
                     .next_read()
-                    .map(|read| (read, Arc::clone(&chain.io), chain.contract))
+                    .map(|read| (read, Arc::clone(&chain.io)))
             }) else {
                 return;
             };
-            let events = match read_chain(io.as_ref(), contract, read) {
+            let events = match io.read_events(read) {
                 Ok(Some(events)) => events,
                 Ok(None) => return,
                 Err(err) => {
@@ -669,24 +686,12 @@ where
                     return;
                 }
             };
-            let batch = match self
+            let batch = self
                 .chain
                 .as_mut()
                 .expect("chain checked before blocking read")
                 .event_reader
-                .complete(read, events)
-            {
-                Ok(batch) => batch,
-                Err(err) => {
-                    error!(
-                        ?err,
-                        epoch = read.session().epoch.0,
-                        block = read.block().0,
-                        "failed to advance DKG chain reader"
-                    );
-                    return;
-                }
-            };
+                .complete(read, events);
             if let Err(err) = self.accept_chain_batch(batch) {
                 error!(
                     ?err,
@@ -714,9 +719,10 @@ where
                 .finish_chain_recovery()
                 .map_err(|err| DkgError::operation("finish DKG chain recovery", err))?;
         }
-        self.pending_outbound
-            .extend(session.take_delivery_outbound());
+        let calls = self.take_runner_effects(epoch);
         if let Some(chain) = self.chain.as_mut() {
+            // Apply the observed events before their engine-generated calls so
+            // recovery cannot resubmit an effect that this same batch finalized.
             chain.submitter.finalized_block(
                 epoch,
                 batch.block,
@@ -724,6 +730,7 @@ where
                 batch.recovery_complete_after,
             );
         }
+        self.submit_chain_calls(epoch, calls);
         Ok(())
     }
 
@@ -882,14 +889,11 @@ mod tests {
             .enumerate()
             .map(|(index, address)| {
                 let keys = if index == 0 {
-                    chain_config.local_keys
+                    chain_config.local_keys.clone()
                 } else {
                     DkgLocalKeyMaterial::derive([index as u8 + 20; 32])
                 };
-                crate::DkgRegistration {
-                    address: Address::from(*address),
-                    bytes: keys.registration_bytes(*address, 2).unwrap().into(),
-                }
+                keys.registration(*address, 2).unwrap()
             })
             .collect();
         let chain = Arc::new(RegistrationChain {
@@ -946,11 +950,11 @@ mod tests {
             let managed = manager.chain.as_ref().unwrap();
             (
                 managed.registration.address.into_array(),
-                managed.local_keys,
+                managed.local_keys.clone(),
             )
         };
         let registration =
-            load_or_create_local_registration(directory.path(), Epoch(2), address, keys, None)
+            load_or_create_local_registration(directory.path(), Epoch(2), address, &keys, None)
                 .unwrap();
 
         manager.notify_finalized(SeqNum(11));
@@ -969,58 +973,76 @@ mod tests {
     }
 
     impl DkgChain for RecordingChain {
-        fn read_recovery_state(
-            &self,
-            block: SeqNum,
-            _contract: Address,
-            _epoch: Epoch,
-            _party_count: usize,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
-            self.reads.lock().unwrap().push((true, block));
-            Ok(Some(Vec::new()))
-        }
-
-        fn read_finalized_events(
-            &self,
-            block: SeqNum,
-            _contract: Address,
-            _epoch: Epoch,
-            _party_count: usize,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
-            self.reads.lock().unwrap().push((false, block));
-            Ok(Some(Vec::new()))
-        }
-    }
-
-    struct RegistrationChain {
-        state: Vec<DkgRegistration>,
-    }
-
-    struct LocalRegistrationChain {
-        registration: Mutex<Option<Vec<u8>>>,
-        transactions: flume::Sender<alloy_consensus::TxEnvelope>,
-    }
-
-    impl DkgChain for LocalRegistrationChain {
-        fn read_local_registration(
+        fn read_registrations(
             &self,
             _block: SeqNum,
-            _contract: Address,
             _epoch: Epoch,
-            _party: Address,
-        ) -> Result<Option<crate::DkgLocalRegistrationState>, crate::DkgError> {
-            let state = crate::DkgLocalRegistrationState {
-                registration: self.registration.lock().unwrap().clone().map(Into::into),
-            };
-            Ok(Some(state))
+            _parties: &[Address],
+        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+            Ok(None)
+        }
+
+        fn read_events(
+            &self,
+            read: crate::chain::ChainRead,
+        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
+            self.reads.lock().unwrap().push((
+                matches!(read, crate::chain::ChainRead::Snapshot(_)),
+                read.block(),
+            ));
+            Ok(Some(Vec::new()))
         }
 
         fn transaction_context(
             &self,
             _block: SeqNum,
             _address: Address,
-        ) -> Result<crate::DkgTransactionContext, crate::DkgError> {
-            Ok(crate::DkgTransactionContext {
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            unreachable!()
+        }
+
+        fn submit_transaction(
+            &self,
+            _transaction: alloy_consensus::TxEnvelope,
+        ) -> Result<(), crate::DkgError> {
+            unreachable!()
+        }
+    }
+
+    struct RegistrationChain {
+        state: Vec<RegistrationCall>,
+    }
+
+    struct LocalRegistrationChain {
+        registration: Mutex<Option<RegistrationCall>>,
+        transactions: flume::Sender<alloy_consensus::TxEnvelope>,
+    }
+
+    impl DkgChain for LocalRegistrationChain {
+        fn read_registrations(
+            &self,
+            _block: SeqNum,
+            _epoch: Epoch,
+            _parties: &[Address],
+        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+            Ok(Some(
+                self.registration.lock().unwrap().iter().copied().collect(),
+            ))
+        }
+
+        fn read_events(
+            &self,
+            _read: crate::chain::ChainRead,
+        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
+            Ok(Some(Vec::new()))
+        }
+
+        fn transaction_context(
+            &self,
+            _block: SeqNum,
+            _address: Address,
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            Ok(crate::chain::DkgTransactionContext {
                 nonce: 0,
                 base_fee_per_gas: 0,
             })
@@ -1037,45 +1059,41 @@ mod tests {
     }
 
     impl DkgChain for RegistrationChain {
-        fn read_local_registration(
+        fn read_registrations(
             &self,
             _block: SeqNum,
-            _contract: Address,
             _epoch: Epoch,
-            _party: Address,
-        ) -> Result<Option<crate::DkgLocalRegistrationState>, crate::DkgError> {
-            Ok(Some(crate::DkgLocalRegistrationState {
-                registration: None,
-            }))
+            parties: &[Address],
+        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+            Ok(Some(
+                self.state
+                    .iter()
+                    .filter(|registration| parties.contains(&Address::from(registration.address.0)))
+                    .copied()
+                    .collect(),
+            ))
         }
 
-        fn read_registered_parties(
+        fn read_events(
             &self,
-            _block: SeqNum,
-            _contract: Address,
-            _epoch: Epoch,
-        ) -> Result<Option<Vec<DkgRegistration>>, crate::DkgError> {
-            Ok(Some(self.state.clone()))
-        }
-
-        fn read_recovery_state(
-            &self,
-            _block: SeqNum,
-            _contract: Address,
-            _epoch: Epoch,
-            _party_count: usize,
+            _read: crate::chain::ChainRead,
         ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
             Ok(Some(Vec::new()))
         }
 
-        fn read_finalized_events(
+        fn transaction_context(
             &self,
             _block: SeqNum,
-            _contract: Address,
-            _epoch: Epoch,
-            _party_count: usize,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
-            Ok(Some(Vec::new()))
+            _address: Address,
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            unreachable!()
+        }
+
+        fn submit_transaction(
+            &self,
+            _transaction: alloy_consensus::TxEnvelope,
+        ) -> Result<(), crate::DkgError> {
+            unreachable!()
         }
     }
 
