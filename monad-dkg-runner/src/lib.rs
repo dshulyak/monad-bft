@@ -3,6 +3,7 @@ mod error;
 mod manager;
 mod protocol;
 mod registration;
+mod reliable;
 mod session;
 mod storage;
 mod transport;

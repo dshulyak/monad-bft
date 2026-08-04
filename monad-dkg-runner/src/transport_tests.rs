@@ -15,31 +15,6 @@ fn node(byte: u8) -> NodeId<CertificateSignaturePubKey<TestSig>> {
     NodeId::new(NopPubKey::from_bytes(&[byte; 32]).expect("test pubkey is valid"))
 }
 
-fn key(value: u32) -> DkgMessageKey {
-    DkgMessageKey::Ladder {
-        sender: PartyId(value),
-        level: 1,
-    }
-}
-
-fn message_id(value: u32) -> DkgMessageId {
-    DkgMessageId::single(key(value))
-}
-
-fn send_command(
-    message_id: DkgMessageId,
-    to: NodeId<CertificateSignaturePubKey<TestSig>>,
-    payload: &'static [u8],
-    abort_group: Option<DeliveryAbortGroup>,
-) -> DkgSend<TestSig> {
-    DkgSend {
-        message_id,
-        to,
-        payload: Bytes::from_static(payload),
-        abort_group,
-    }
-}
-
 #[test]
 fn configured_validator_sender_is_delivered() {
     let epoch = Epoch(8);
@@ -53,7 +28,9 @@ fn configured_validator_sender_is_delivered() {
     let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
     let receiver_delivery =
         DeliveryEngine::<TestSig>::with_inbound_validators(epoch, vec![sender, receiver]);
-    let outbound = sender_delivery.send(send_command(id, receiver, b"pc-ack", None), now);
+    let outbound = sender_delivery
+        .send(id, [receiver], Bytes::from_static(b"pc-ack"), None, now)
+        .unwrap();
 
     let (_, payload) = unwrap_delivered(
         receiver_delivery
@@ -111,116 +88,17 @@ fn delivery_groups_use_typed_protocol_kind() {
 }
 
 #[test]
-fn one_message_id_reuses_one_outbox_message_for_multiple_peers() {
-    let epoch = Epoch(9);
-    let id = message_id(4);
-    let now = Instant::now();
-    let peers = [node(2), node(3), node(4)];
-    let mut delivery = DeliveryEngine::<TestSig>::new(epoch);
-    for peer in peers {
-        assert_eq!(
-            delivery
-                .send(send_command(id.clone(), peer, b"message", None), now)
-                .len(),
-            1
-        );
-    }
-    assert_eq!(delivery.outbox.len(), 1);
-    assert_eq!(delivery.outstanding_delivery_count(), 3);
-    assert!(delivery
-        .send(send_command(id.clone(), peers[0], b"message", None), now)
-        .is_empty());
-    assert_eq!(delivery.outstanding_delivery_count(), 3);
-}
-
-#[test]
-fn abort_groups_stop_only_matching_deliveries() {
-    let now = Instant::now();
-    let mut delivery = DeliveryEngine::<TestSig>::new(Epoch(10));
-    for (value, group) in [
-        (9, DeliveryAbortGroup::Extraction),
-        (10, DeliveryAbortGroup::BveQc(PartyId(1))),
-        (11, DeliveryAbortGroup::BveQc(PartyId(2))),
-    ] {
-        delivery.send(
-            send_command(
-                message_id(value),
-                node(value as u8),
-                b"message",
-                Some(group),
-            ),
-            now,
-        );
-    }
-    delivery.abort_group(DeliveryAbortGroup::BveQc(PartyId(1)));
-    assert_eq!(delivery.outbox.len(), 2);
-    delivery.abort_group(DeliveryAbortGroup::Extraction);
-    assert_eq!(delivery.outbox.len(), 1);
-}
-
-#[test]
-fn vss_abort_stops_all_qc_scoped_deliveries() {
-    let now = Instant::now();
-    let mut delivery = DeliveryEngine::<TestSig>::new(Epoch(11));
-    for (value, group) in [
-        (12, DeliveryAbortGroup::CommitmentQc(PartyId(0))),
-        (13, DeliveryAbortGroup::BveQc(PartyId(1))),
-        (14, DeliveryAbortGroup::Extraction),
-    ] {
-        delivery.send(
-            send_command(
-                message_id(value),
-                node(value as u8),
-                b"message",
-                Some(group),
-            ),
-            now,
-        );
-    }
-    delivery.abort_group(DeliveryAbortGroup::Vss);
-    assert_eq!(delivery.outbox.len(), 1);
-    assert_eq!(
-        delivery.outbox.values().next().unwrap().abort_group,
-        Some(DeliveryAbortGroup::Extraction)
-    );
-}
-
-#[test]
-fn retries_use_linear_backoff_capped_at_thirty_seconds() {
-    let now = Instant::now();
-    let mut delivery = DeliveryEngine::<TestSig>::new(Epoch(11));
-    delivery.send(
-        send_command(message_id(11), node(2), b"retry-me", None),
-        now,
-    );
-
-    let mut due = delivery.next_timer().expect("initial retry scheduled");
-    assert_delay_with_jitter(due.duration_since(now), DKG_RETRY_INITIAL);
-    assert_eq!(delivery.handle_timer(due).len(), 1);
-    let last_due = due;
-    due = delivery.next_timer().expect("second retry scheduled");
-    assert_delay_with_jitter(
-        due.duration_since(last_due),
-        DKG_RETRY_INITIAL + DKG_RETRY_STEP,
-    );
-
-    for _ in 0..80 {
-        let due = delivery.next_timer().expect("retry remains scheduled");
-        delivery.handle_timer(due);
-    }
-    let recipient = delivery
-        .outbox
-        .values()
-        .next()
-        .unwrap()
-        .recipients
-        .values()
-        .next()
-        .unwrap();
-    assert_eq!(recipient.retry_delay, DKG_RETRY_MAX);
-}
-
-fn assert_delay_with_jitter(delay: Duration, base: Duration) {
-    let max_jitter = (base / 5).min(Duration::from_millis(500));
-    assert!(delay >= base && delay <= base + max_jitter);
+fn vss_evidence_obsoletes_only_qc_scopes() {
+    assert!(DkgObsolescence::obsolete(
+        &DeliveryAbortGroup::CommitmentQc(PartyId(0)),
+        &DeliveryAbortGroup::Vss,
+    ));
+    assert!(DkgObsolescence::obsolete(
+        &DeliveryAbortGroup::BveQc(PartyId(1)),
+        &DeliveryAbortGroup::Vss,
+    ));
+    assert!(!DkgObsolescence::obsolete(
+        &DeliveryAbortGroup::Extraction,
+        &DeliveryAbortGroup::Vss,
+    ));
 }

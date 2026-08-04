@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::chain_event_kind,
+    reliable::EnqueueError,
     session::DkgRegisteredKeyMaterial,
     storage::{
         DkgMessageStore, EngineSeed, IncomingMessageRecord, IncomingStatus, MessageStoreError,
@@ -30,7 +31,7 @@ use crate::{
     },
     transport::{
         delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
-        DeliveryOutbound, DkgSend,
+        DeliveryOutbound,
     },
     DkgError,
 };
@@ -102,6 +103,8 @@ pub(crate) enum RunnerError {
     DurableIngressConflict,
     #[error("self-generated DKG message conflicts with recovery WAL")]
     SelfGeneratedMessageConflict,
+    #[error("conflicting DKG reliable delivery")]
+    ReliableDelivery(#[from] EnqueueError),
 }
 
 pub(crate) fn start<ST>(
@@ -336,7 +339,7 @@ where
         self.pending_inputs.extend(peer);
         self.drain_engine_inputs()?;
         let deferred_outgoing = mem::take(&mut self.deferred_outgoing);
-        self.replay_persisted_outgoing_messages(deferred_outgoing);
+        self.replay_persisted_outgoing_messages(deferred_outgoing)?;
         info!(
             phase = ?self.engine.phase(),
             "started DKG runner from synchronized chain state"
@@ -573,7 +576,10 @@ where
         Ok(())
     }
 
-    fn replay_persisted_outgoing_messages(&mut self, records: Vec<OutgoingMessageRecord>) {
+    fn replay_persisted_outgoing_messages(
+        &mut self,
+        records: Vec<OutgoingMessageRecord>,
+    ) -> Result<(), RunnerError> {
         for record in records {
             let message = match DkgMessage::decode(record.payload.clone()) {
                 Ok(message) => message,
@@ -583,14 +589,19 @@ where
                 }
             };
             for to in record.recipients {
+                if self.mapping.member_id(to).is_none() {
+                    warn!(?to, "skipping persisted DKG message to unknown party");
+                    continue;
+                }
                 self.queue_delivery_send(
                     record.message_id.clone(),
-                    to,
+                    [to],
                     record.payload.clone(),
                     delivery_abort_group_for_peer_payload(message.kind(), self.self_party, to),
-                );
+                )?;
             }
         }
+        Ok(())
     }
 
     fn handle_chain_call(&mut self, call: ChainCall) -> Result<(), RunnerError> {
@@ -631,32 +642,35 @@ where
         else {
             return Ok(());
         };
-        for recipient in recipients {
-            self.queue_delivery_send(message_id.clone(), recipient, payload.clone(), abort_group);
-        }
-        Ok(())
+        self.queue_delivery_send(message_id, recipients, payload, abort_group)
     }
 
     fn queue_delivery_send(
         &mut self,
         message_id: DkgMessageId,
-        to: PartyId,
+        recipients: impl IntoIterator<Item = PartyId>,
         payload: Bytes,
         abort_group: Option<DeliveryAbortGroup>,
-    ) {
-        let Some(to_monad) = self.mapping.member_id(to) else {
-            warn!(?to, "dropping DKG message to unknown party");
-            return;
-        };
+    ) -> Result<(), RunnerError> {
+        let recipients = recipients
+            .into_iter()
+            .map(|party| {
+                self.mapping
+                    .member_id(party)
+                    .ok_or(RunnerError::UnknownParty {
+                        action: "send to",
+                        party: party.0,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.delivery_outbound.extend(self.delivery.send(
-            DkgSend {
-                message_id,
-                to: to_monad,
-                payload,
-                abort_group,
-            },
+            message_id,
+            recipients,
+            payload,
+            abort_group,
             Instant::now(),
-        ));
+        )?);
+        Ok(())
     }
 
     fn log_phase_change(&mut self) {

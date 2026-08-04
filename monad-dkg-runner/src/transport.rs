@@ -1,7 +1,7 @@
 //! Retry scheduling for DKG messages until the protocol makes them obsolete.
 
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
+    collections::BTreeSet,
     time::{Duration, Instant},
 };
 
@@ -13,23 +13,23 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_types::{Epoch, NodeId};
-use rand::Rng;
 use tracing::warn;
+
+use crate::reliable::{
+    EnqueueError, ObsolescencePolicy, ReliableOutbox, ReliableSend, RetryConfig,
+};
 
 pub(crate) struct DeliveryInbound<ST: CertificateSignatureRecoverable> {
     pub(crate) sender: NodeId<CertificateSignaturePubKey<ST>>,
     pub(crate) payload: Bytes,
 }
 
-const DKG_RETRY_INITIAL: Duration = Duration::from_secs(2);
-const DKG_RETRY_STEP: Duration = Duration::from_secs(2);
-const DKG_RETRY_MAX: Duration = Duration::from_secs(30);
-pub(crate) struct DkgSend<ST: CertificateSignatureRecoverable> {
-    pub(crate) message_id: DkgMessageId,
-    pub(crate) to: NodeId<CertificateSignaturePubKey<ST>>,
-    pub(crate) payload: Bytes,
-    pub(crate) abort_group: Option<DeliveryAbortGroup>,
-}
+const DKG_RETRY: RetryConfig = RetryConfig::new(
+    Duration::from_secs(2),
+    Duration::from_secs(2),
+    Duration::from_secs(30),
+    Duration::from_millis(500),
+);
 
 pub struct DeliveryOutbound<ST: CertificateSignatureRecoverable> {
     pub to: NodeId<CertificateSignaturePubKey<ST>>,
@@ -52,11 +52,26 @@ impl DeliveryAbortGroup {
     }
 }
 
+struct DkgObsolescence;
+
+impl ObsolescencePolicy for DkgObsolescence {
+    type Scope = DeliveryAbortGroup;
+    type Evidence = DeliveryAbortGroup;
+
+    fn obsolete(scope: &Self::Scope, evidence: &Self::Evidence) -> bool {
+        scope.is_aborted_by(*evidence)
+    }
+}
+
 pub(crate) struct DeliveryEngine<ST: CertificateSignatureRecoverable> {
     epoch: Epoch,
     inbound_validators: Option<BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
-    outbox: HashMap<DkgMessageId, OutboxMessage<ST>>,
-    aborted_groups: BTreeSet<DeliveryAbortGroup>,
+    outbox: ReliableOutbox<
+        NodeId<CertificateSignaturePubKey<ST>>,
+        DkgMessageId,
+        Bytes,
+        DkgObsolescence,
+    >,
 }
 
 impl<ST> DeliveryEngine<ST>
@@ -67,8 +82,7 @@ where
         Self {
             epoch,
             inbound_validators: None,
-            outbox: HashMap::new(),
-            aborted_groups: BTreeSet::new(),
+            outbox: ReliableOutbox::new(DKG_RETRY),
         }
     }
 
@@ -82,11 +96,7 @@ where
     }
 
     pub(crate) fn next_timer(&self) -> Option<Instant> {
-        self.outbox
-            .values()
-            .flat_map(|message| message.recipients.values())
-            .map(|recipient| recipient.next_retry)
-            .min()
+        self.outbox.next_timer()
     }
 
     pub(crate) fn handle_network_message(
@@ -119,102 +129,44 @@ where
     }
 
     pub(crate) fn handle_timer(&mut self, now: Instant) -> Vec<DeliveryOutbound<ST>> {
-        let mut out = Vec::new();
-        for message in self.outbox.values_mut() {
-            for (&to, recipient) in &mut message.recipients {
-                if recipient.next_retry <= now {
-                    out.push(DeliveryOutbound {
-                        to,
-                        payload: message.wire_payload.clone(),
-                    });
-                    recipient.retry_delay = recipient
-                        .retry_delay
-                        .saturating_add(DKG_RETRY_STEP)
-                        .min(DKG_RETRY_MAX);
-                    recipient.next_retry =
-                        now + recipient.retry_delay + retry_jitter(recipient.retry_delay);
-                }
-            }
-        }
-        out
+        self.outbox
+            .retry_due(now)
+            .into_iter()
+            .map(delivery_outbound)
+            .collect()
     }
 
-    pub(crate) fn send(&mut self, send: DkgSend<ST>, now: Instant) -> Vec<DeliveryOutbound<ST>> {
-        if send.abort_group.is_some_and(|group| {
-            self.aborted_groups
-                .iter()
-                .any(|aborted| group.is_aborted_by(*aborted))
-        }) {
-            return Vec::new();
-        }
-
-        let message_id = send.message_id;
-        let to = send.to;
-        let next_retry = now + DKG_RETRY_INITIAL + retry_jitter(DKG_RETRY_INITIAL);
-        let recipient = OutboxRecipient {
-            next_retry,
-            retry_delay: DKG_RETRY_INITIAL,
-        };
-
-        let wire = encode_wire(self.epoch, send.payload);
-        match self.outbox.entry(message_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(OutboxMessage {
-                    wire_payload: wire.clone(),
-                    abort_group: send.abort_group,
-                    recipients: BTreeMap::from([(to, recipient)]),
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                let message = entry.get_mut();
-                if message.wire_payload != wire || message.abort_group != send.abort_group {
-                    warn!(message_id = ?message_id, "dropping inconsistent duplicate DKG message id");
-                    return Vec::new();
-                }
-                if message.recipients.contains_key(&to) {
-                    warn!(message_id = ?message_id, "dropping duplicate queued DKG message recipient");
-                    return Vec::new();
-                }
-                message.recipients.insert(to, recipient);
-            }
-        }
-
-        vec![DeliveryOutbound { to, payload: wire }]
+    pub(crate) fn send(
+        &mut self,
+        message_id: DkgMessageId,
+        recipients: impl IntoIterator<Item = NodeId<CertificateSignaturePubKey<ST>>>,
+        payload: Bytes,
+        abort_group: Option<DeliveryAbortGroup>,
+        now: Instant,
+    ) -> Result<Vec<DeliveryOutbound<ST>>, EnqueueError> {
+        self.outbox
+            .enqueue(
+                message_id,
+                recipients,
+                encode_wire(self.epoch, payload),
+                abort_group,
+                now,
+            )
+            .map(|sends| sends.into_iter().map(delivery_outbound).collect())
     }
 
     pub(crate) fn abort_group(&mut self, group: DeliveryAbortGroup) {
-        self.aborted_groups.insert(group);
-        self.outbox.retain(|_, message| {
-            !message
-                .abort_group
-                .is_some_and(|message_group| message_group.is_aborted_by(group))
-        });
-    }
-
-    #[cfg(test)]
-    fn outstanding_delivery_count(&self) -> usize {
-        self.outbox
-            .values()
-            .map(|message| message.recipients.len())
-            .sum()
+        self.outbox.observe(group);
     }
 }
 
-struct OutboxMessage<ST: CertificateSignatureRecoverable> {
-    wire_payload: Bytes,
-    abort_group: Option<DeliveryAbortGroup>,
-    recipients: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, OutboxRecipient>,
-}
-
-struct OutboxRecipient {
-    next_retry: Instant,
-    retry_delay: Duration,
-}
-
-fn retry_jitter(retry_delay: Duration) -> Duration {
-    let max_jitter = retry_delay / 5;
-    let max_jitter_ms = max_jitter.as_millis().min(500) as u64;
-    Duration::from_millis(rand::thread_rng().gen_range(0..=max_jitter_ms))
+fn delivery_outbound<ST: CertificateSignatureRecoverable>(
+    send: ReliableSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>,
+) -> DeliveryOutbound<ST> {
+    DeliveryOutbound {
+        to: send.to,
+        payload: send.payload,
+    }
 }
 
 pub(crate) fn delivery_abort_group_for_peer_payload(

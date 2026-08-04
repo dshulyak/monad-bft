@@ -98,14 +98,13 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     let mut sender_delivery = DeliveryEngine::<NopSignature>::new(epoch);
     let wire = sender_delivery
         .send(
-            DkgSend {
-                message_id,
-                to: self_id,
-                payload: invalid_ack.into(),
-                abort_group: None,
-            },
+            message_id,
+            [self_id],
+            invalid_ack.into(),
+            None,
             Instant::now(),
         )
+        .unwrap()
         .pop()
         .unwrap()
         .payload;
