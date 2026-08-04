@@ -8,15 +8,16 @@ use std::{
 };
 
 use bytes::Bytes;
+use dkg_core::PartyId;
 use dkg_protocol::DkgMessageId;
 use monad_types::Epoch;
 use thiserror::Error;
 
-use super::record::{
-    EngineSeed, IncomingMessageRecord, OutgoingMessageRecord, RecoveryRecord, WalCodecError,
-    ENGINE_SEED_BYTES,
+use super::record::{EngineSeed, RecoveryRecord, WalCodecError, ENGINE_SEED_BYTES};
+use crate::{
+    reliable::{IncomingRecord, MessageJournal, OutgoingRecord},
+    wal::{DurableWal, WalConfig, WalError, FRAME_HEADER_LEN},
 };
-use crate::wal::{DurableWal, WalConfig, WalError, FRAME_HEADER_LEN};
 
 const DEFAULT_MAX_EPOCHS: usize = 2;
 const PREALLOCATE_ENV: &str = "MONAD_DKG_RECOVERY_WAL_PREALLOCATE_BYTES";
@@ -114,12 +115,30 @@ impl RecoveryWal {
     }
 }
 
+impl MessageJournal<PartyId, DkgMessageId, Bytes> for RecoveryWal {
+    type Error = RecoveryWalError;
+
+    fn append_incoming(
+        &mut self,
+        record: &IncomingRecord<PartyId, DkgMessageId, Bytes>,
+    ) -> Result<(), Self::Error> {
+        self.append(&RecoveryRecord::Incoming(record.clone()))
+    }
+
+    fn append_outgoing(
+        &mut self,
+        record: &OutgoingRecord<PartyId, DkgMessageId, Bytes>,
+    ) -> Result<(), Self::Error> {
+        self.append(&RecoveryRecord::Outgoing(record.clone()))
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryState {
     pub(crate) engine_seed: Option<EngineSeed>,
     pub(crate) registration: Option<Bytes>,
-    pub(crate) outbox: BTreeMap<DkgMessageId, OutgoingMessageRecord>,
-    pub(crate) incoming: BTreeSet<IncomingMessageRecord>,
+    pub(crate) outbox: BTreeMap<DkgMessageId, OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
+    pub(crate) incoming: BTreeSet<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
 }
 
 impl RecoveryState {
@@ -206,7 +225,10 @@ impl RecoveryState {
         }
     }
 
-    fn insert_outbox(&mut self, record: OutgoingMessageRecord) -> Result<(), RecoveryWalError> {
+    fn insert_outbox(
+        &mut self,
+        record: OutgoingRecord<PartyId, DkgMessageId, Bytes>,
+    ) -> Result<(), RecoveryWalError> {
         let Some(existing) = self.outbox.get_mut(&record.message_id) else {
             self.outbox.insert(record.message_id.clone(), record);
             return Ok(());

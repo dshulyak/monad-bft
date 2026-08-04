@@ -9,8 +9,8 @@ fn message_id(value: u8) -> DkgMessageId {
     })
 }
 
-fn incoming(value: u8) -> IncomingMessageRecord {
-    IncomingMessageRecord {
+fn incoming(value: u8) -> IncomingRecord<PartyId, DkgMessageId, Bytes> {
+    IncomingRecord {
         source: PartyId(value.into()),
         message_id: message_id(value),
         payload: vec![value].into(),
@@ -136,7 +136,7 @@ fn wal_loads_outgoing_message_records() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = open_wal(dir.path(), 8);
 
-    let record = OutgoingMessageRecord {
+    let record = OutgoingRecord {
         message_id: message_id(42),
         recipients: [PartyId(2), PartyId(3)].into_iter().collect(),
         payload: vec![0xAA, 0xBB, 0xCC].into(),

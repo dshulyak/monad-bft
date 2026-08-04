@@ -1,11 +1,14 @@
+use bytes::Bytes;
+use dkg_core::PartyId;
 use dkg_protocol::{
-    DkgMessageId, DkgMessageKey, TAG_PC_ACK, TAG_PC_PROPOSAL, TAG_PC_RETRIEVAL_REQUEST,
+    DkgMessage, DkgMessageId, DkgMessageKey, TAG_PC_ACK, TAG_PC_PROPOSAL, TAG_PC_RETRIEVAL_REQUEST,
 };
 use monad_types::Epoch;
 
-use super::{
-    super::recovery::{RecoveryWal, RecoveryWalConfig},
-    *,
+use super::*;
+use crate::{
+    reliable::{IncomingRecord, IncomingStatus},
+    storage::{RecoveryState, RecoveryWal, RecoveryWalConfig},
 };
 
 #[test]
@@ -59,10 +62,10 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
         signer: PartyId(3),
     });
     for expected in [IncomingStatus::New, IncomingStatus::Conflict] {
-        let record = IncomingMessageRecord {
+        let record = IncomingRecord {
             source: PartyId(3),
             message_id: ack_id.clone(),
-            payload: ack.clone().into(),
+            payload: Bytes::from(ack.clone()),
         };
         let identity = store
             .classify(record.source, self_party, &record.payload)

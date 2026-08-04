@@ -1,7 +1,9 @@
-//! Generic at-least-once delivery until protocol evidence makes a message obsolete.
+//! Generic reliable-message storage and at-least-once delivery primitives.
 //!
-//! The caller owns durable persistence, wire framing, peer authentication, and
-//! inbound deduplication. Messages must be persisted before they are enqueued.
+//! [`MessageStore`] owns semantic deduplication and persistence ordering.
+//! [`ReliableOutbox`] schedules already-persisted messages until protocol
+//! evidence makes them obsolete. Wire framing and peer authentication remain
+//! protocol concerns.
 
 use std::{
     collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap},
@@ -12,6 +14,13 @@ use std::{
 
 use rand::Rng;
 use thiserror::Error;
+
+pub(crate) use message::{
+    IncomingRecord, IncomingStatus, MessageIdentity, MessageJournal, MessagePersistence,
+    MessageStore, MessageStoreError, OutgoingRecord,
+};
+
+mod message;
 
 pub(crate) trait ObsolescencePolicy {
     type Scope;

@@ -1,5 +1,7 @@
 //! Per-epoch DKG protocol runtime.
 
+mod message_store;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     mem,
@@ -11,7 +13,7 @@ use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, Sess
 use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
 use dkg_protocol::{
     ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase, DkgInput,
-    DkgMessage, DkgMessageId, DkgMessageIdentity, DkgMessageKind, DkgSetupContext, DkgSetupError,
+    DkgMessage, DkgMessageId, DkgMessageKey, DkgMessageKind, DkgSetupContext, DkgSetupError,
     DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
 };
 use monad_crypto::certificate_signature::{
@@ -23,18 +25,17 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::chain_event_kind,
-    reliable::EnqueueError,
+    reliable::{EnqueueError, IncomingRecord, IncomingStatus, MessageIdentity, OutgoingRecord},
     session::DkgRegisteredKeyMaterial,
-    storage::{
-        DkgMessageStore, EngineSeed, IncomingMessageRecord, IncomingStatus, MessageStoreError,
-        OutgoingMessageRecord, RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError,
-    },
+    storage::{EngineSeed, RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     transport::{
         delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
         DeliveryOutbound,
     },
     DkgError,
 };
+
+use self::message_store::{DkgMessageStore, MessageStoreError};
 
 struct DkgPeerMap<ST: CertificateSignatureRecoverable> {
     by_member: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, PartyId>,
@@ -181,7 +182,7 @@ where
     delivery_outbound: Vec<DeliveryOutbound<ST>>,
     chain_calls: Vec<ChainCall>,
     pending_inputs: VecDeque<PendingEngineInput>,
-    deferred_outgoing: Vec<OutgoingMessageRecord>,
+    deferred_outgoing: Vec<OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
     message_store: DkgMessageStore,
     last_phase: DkgEnginePhase,
     awaiting_chain_recovery: bool,
@@ -194,8 +195,8 @@ enum PendingEngineInput {
 
 struct PendingPeerInput {
     input: CoreInput<DkgMessage>,
-    identity: DkgMessageIdentity,
-    record: Option<IncomingMessageRecord>,
+    identity: MessageIdentity<DkgMessageId, DkgMessageKey>,
+    record: Option<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
 }
 
 impl<ST> Runner<ST>
@@ -370,8 +371,8 @@ where
                 return Ok(());
             }
         };
-        let message_id = identity.message_id();
-        let record = IncomingMessageRecord {
+        let message_id = identity.message_id.clone();
+        let record = IncomingRecord {
             source: from,
             message_id: message_id.clone(),
             payload: payload.clone(),
@@ -488,9 +489,9 @@ where
                             self.self_party,
                             &payload,
                         )?;
-                        let record = IncomingMessageRecord {
+                        let record = IncomingRecord {
                             source: self.self_party,
-                            message_id: identity.message_id(),
+                            message_id: identity.message_id.clone(),
                             payload: payload.clone().into_bytes(),
                         };
                         match self.message_store.incoming_status(&record, &identity) {
@@ -525,7 +526,10 @@ where
         Ok(())
     }
 
-    fn replay_persisted_incoming_messages(&mut self, records: Vec<IncomingMessageRecord>) {
+    fn replay_persisted_incoming_messages(
+        &mut self,
+        records: Vec<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
+    ) {
         for record in records {
             if self.mapping.member_id(record.source).is_none() {
                 warn!(
@@ -578,7 +582,7 @@ where
 
     fn replay_persisted_outgoing_messages(
         &mut self,
-        records: Vec<OutgoingMessageRecord>,
+        records: Vec<OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
     ) -> Result<(), RunnerError> {
         for record in records {
             let message = match DkgMessage::decode(record.payload.clone()) {

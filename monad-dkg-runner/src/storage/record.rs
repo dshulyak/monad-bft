@@ -6,31 +6,20 @@ use dkg_core::PartyId;
 use dkg_protocol::{DkgMessageCodecError, DkgMessageId};
 use thiserror::Error;
 
-use crate::wal::WalRecord;
+use crate::{
+    reliable::{IncomingRecord, OutgoingRecord},
+    wal::WalRecord,
+};
 
 pub(crate) const ENGINE_SEED_BYTES: usize = 32;
 pub(crate) type EngineSeed = [u8; ENGINE_SEED_BYTES];
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct OutgoingMessageRecord {
-    pub(crate) message_id: DkgMessageId,
-    pub(crate) recipients: BTreeSet<PartyId>,
-    pub(crate) payload: Bytes,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct IncomingMessageRecord {
-    pub(crate) source: PartyId,
-    pub(crate) message_id: DkgMessageId,
-    pub(crate) payload: Bytes,
-}
 
 #[derive(Debug)]
 pub(super) enum RecoveryRecord {
     Seed(EngineSeed),
     Registration(Bytes),
-    Outgoing(OutgoingMessageRecord),
-    Incoming(IncomingMessageRecord),
+    Outgoing(OutgoingRecord<PartyId, DkgMessageId, Bytes>),
+    Incoming(IncomingRecord<PartyId, DkgMessageId, Bytes>),
 }
 
 #[derive(Debug, Error)]
@@ -55,8 +44,24 @@ impl WalRecord for RecoveryRecord {
             Self::Seed(seed) => (1, Bytes::copy_from_slice(seed)),
             Self::Registration(bytes) if !bytes.is_empty() => (2, bytes.clone()),
             Self::Registration(_) => return Err(WalCodecError::Invalid("registration")),
-            Self::Outgoing(record) => (3, encode_outgoing(record)),
-            Self::Incoming(record) => (4, encode_incoming(record)),
+            Self::Outgoing(record) => (
+                3,
+                alloy_rlp::encode(OutgoingWire {
+                    message_id: record.message_id.encode(),
+                    recipients: record.recipients.iter().map(|party| party.0).collect(),
+                    payload: record.payload.clone(),
+                })
+                .into(),
+            ),
+            Self::Incoming(record) => (
+                4,
+                alloy_rlp::encode(IncomingWire {
+                    source: record.source.0,
+                    message_id: record.message_id.encode(),
+                    payload: record.payload.clone(),
+                })
+                .into(),
+            ),
         };
         output.put_u8(kind);
         output.put_slice(&payload);
@@ -76,8 +81,31 @@ impl WalRecord for RecoveryRecord {
             1 => return Err(WalCodecError::Invalid("engine seed")),
             2 if !payload.is_empty() => Self::Registration(payload),
             2 => return Err(WalCodecError::Invalid("registration")),
-            3 => Self::Outgoing(decode_outgoing(payload)?),
-            4 => Self::Incoming(decode_incoming(payload)?),
+            3 => {
+                let wire = alloy_rlp::decode_exact::<OutgoingWire>(&payload)?;
+                let recipient_count = wire.recipients.len();
+                let recipients = wire
+                    .recipients
+                    .into_iter()
+                    .map(PartyId)
+                    .collect::<BTreeSet<_>>();
+                if recipients.len() != recipient_count {
+                    return Err(WalCodecError::Invalid("outgoing message"));
+                }
+                Self::Outgoing(OutgoingRecord {
+                    message_id: DkgMessageId::decode(&wire.message_id)?,
+                    recipients,
+                    payload: wire.payload,
+                })
+            }
+            4 => {
+                let wire = alloy_rlp::decode_exact::<IncomingWire>(&payload)?;
+                Self::Incoming(IncomingRecord {
+                    source: PartyId(wire.source),
+                    message_id: DkgMessageId::decode(&wire.message_id)?,
+                    payload: wire.payload,
+                })
+            }
             kind => return Err(WalCodecError::UnknownRecordKind(kind)),
         })
     }
@@ -95,49 +123,4 @@ struct OutgoingWire {
     message_id: Bytes,
     recipients: Vec<u32>,
     payload: Bytes,
-}
-
-fn encode_incoming(record: &IncomingMessageRecord) -> Bytes {
-    alloy_rlp::encode(IncomingWire {
-        source: record.source.0,
-        message_id: record.message_id.encode(),
-        payload: record.payload.clone(),
-    })
-    .into()
-}
-
-fn encode_outgoing(record: &OutgoingMessageRecord) -> Bytes {
-    alloy_rlp::encode(OutgoingWire {
-        message_id: record.message_id.encode(),
-        recipients: record.recipients.iter().map(|party| party.0).collect(),
-        payload: record.payload.clone(),
-    })
-    .into()
-}
-
-fn decode_incoming(payload: Bytes) -> Result<IncomingMessageRecord, WalCodecError> {
-    let wire = alloy_rlp::decode_exact::<IncomingWire>(&payload)?;
-    Ok(IncomingMessageRecord {
-        source: PartyId(wire.source),
-        message_id: DkgMessageId::decode(&wire.message_id)?,
-        payload: wire.payload,
-    })
-}
-
-fn decode_outgoing(payload: Bytes) -> Result<OutgoingMessageRecord, WalCodecError> {
-    let wire = alloy_rlp::decode_exact::<OutgoingWire>(&payload)?;
-    let recipient_count = wire.recipients.len();
-    let recipients = wire
-        .recipients
-        .into_iter()
-        .map(PartyId)
-        .collect::<BTreeSet<_>>();
-    if recipients.len() != recipient_count {
-        return Err(WalCodecError::Invalid("outgoing message"));
-    }
-    Ok(OutgoingMessageRecord {
-        message_id: DkgMessageId::decode(&wire.message_id)?,
-        recipients,
-        payload: wire.payload,
-    })
 }
