@@ -35,7 +35,7 @@ use crate::{
     DkgError,
 };
 
-use self::message_store::{DkgMessageStore, MessageStoreError};
+use self::message_store::{DkgDurableStore, DkgDurableStoreError};
 
 struct DkgPeerMap<ST: CertificateSignatureRecoverable> {
     by_member: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, PartyId>,
@@ -92,7 +92,7 @@ pub(crate) enum RunnerError {
     #[error(transparent)]
     RecoveryWal(#[from] RecoveryWalError),
     #[error(transparent)]
-    MessageStore(#[from] MessageStoreError),
+    DurableStore(#[from] DkgDurableStoreError),
     #[error("research DKG engine {action} failed: {error:?}")]
     Engine {
         action: &'static str,
@@ -104,6 +104,8 @@ pub(crate) enum RunnerError {
     DurableIngressConflict,
     #[error("self-generated DKG message conflicts with recovery WAL")]
     SelfGeneratedMessageConflict,
+    #[error("DKG sync messages must be unicast")]
+    SyncMustBeUnicast,
     #[error("conflicting DKG reliable delivery")]
     ReliableDelivery(#[from] EnqueueError),
 }
@@ -177,13 +179,15 @@ where
     engine: DkgEngine<BlstBackend, K256SecpBackend>,
     epoch: Epoch,
     self_party: PartyId,
+    party_count: usize,
+    max_ladder_level: u64,
     mapping: DkgPeerMap<ST>,
     delivery: DeliveryEngine<ST>,
     delivery_outbound: Vec<DeliveryOutbound<ST>>,
     chain_calls: Vec<ChainCall>,
     pending_inputs: VecDeque<PendingEngineInput>,
     deferred_outgoing: Vec<OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
-    message_store: DkgMessageStore,
+    durable_store: DkgDurableStore,
     last_phase: DkgEnginePhase,
     awaiting_chain_recovery: bool,
 }
@@ -195,8 +199,12 @@ enum PendingEngineInput {
 
 struct PendingPeerInput {
     input: CoreInput<DkgMessage>,
+    durable: Option<PendingDurableInput>,
+}
+
+struct PendingDurableInput {
     identity: MessageIdentity<DkgMessageId, DkgMessageKey>,
-    record: Option<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
+    record: IncomingRecord<PartyId, DkgMessageId, Bytes>,
 }
 
 impl<ST> Runner<ST>
@@ -230,7 +238,7 @@ where
         )?;
         let max_ladder_level = output_count.trailing_zeros().into();
         let initial_phase = engine.phase();
-        let message_store = DkgMessageStore::load(
+        let durable_store = DkgDurableStore::load(
             init.self_party,
             party_count,
             max_ladder_level,
@@ -250,21 +258,23 @@ where
             engine,
             epoch: init.epoch,
             self_party: init.self_party,
+            party_count,
+            max_ladder_level,
             mapping: init.mapping,
             delivery,
             delivery_outbound: Vec::new(),
             chain_calls: Vec::new(),
             pending_inputs: VecDeque::new(),
             deferred_outgoing: Vec::new(),
-            message_store,
+            durable_store,
             last_phase: initial_phase,
             awaiting_chain_recovery: true,
         })
     }
 
     fn initialize(&mut self) -> Result<(), RunnerError> {
-        let startup_incoming_messages = self.message_store.incoming_records();
-        let startup_outgoing_messages = self.message_store.outgoing_records();
+        let startup_incoming_messages = self.durable_store.incoming_records();
+        let startup_outgoing_messages = self.durable_store.outgoing_records();
         self.replay_persisted_incoming_messages(startup_incoming_messages);
         self.deferred_outgoing = startup_outgoing_messages;
         info!(
@@ -360,7 +370,28 @@ where
                 return Ok(());
             }
         };
-        let identity = match self.message_store.identity(from, self.self_party, &message) {
+        if message.kind().is_sync() {
+            if let Err(err) = message.identity(
+                from,
+                self.self_party,
+                self.party_count,
+                self.max_ladder_level,
+            ) {
+                warn!(
+                    ?err,
+                    from_party = from.0,
+                    "rejected invalid DKG sync message identity"
+                );
+                return Ok(());
+            }
+            self.pending_inputs
+                .push_back(PendingEngineInput::Peer(PendingPeerInput {
+                    input: CoreInput::new(from, message),
+                    durable: None,
+                }));
+            return Ok(());
+        }
+        let identity = match self.durable_store.identity(from, self.self_party, &message) {
             Ok(identity) => identity,
             Err(err) => {
                 warn!(
@@ -377,7 +408,7 @@ where
             message_id: message_id.clone(),
             payload: payload.clone(),
         };
-        match self.message_store.incoming_status(&record, &identity) {
+        match self.durable_store.incoming_status(&record, &identity) {
             IncomingStatus::Duplicate => {
                 debug!(
                     from_party = from.0,
@@ -399,8 +430,7 @@ where
         self.pending_inputs
             .push_back(PendingEngineInput::Peer(PendingPeerInput {
                 input: CoreInput::new(from, message),
-                identity,
-                record: Some(record),
+                durable: Some(PendingDurableInput { identity, record }),
             }));
         Ok(())
     }
@@ -430,7 +460,9 @@ where
 
     fn process_peer_input(&mut self, peer: PendingPeerInput) -> Result<bool, RunnerError> {
         let source = peer.input.source;
-        let record = peer.record;
+        let completed_request =
+            request_completed_by_response(&peer.input.message, self.self_party, source);
+        let durable = peer.durable;
         let effects = match self.engine.handle_peer_event(peer.input) {
             Ok(effects) => effects,
             Err(DkgEngineError::PeerInput(reason)) => {
@@ -448,14 +480,17 @@ where
                 })
             }
         };
-        failpoint::failpoint!(
-            name = "dkg.peer.engine_applied",
-            description = "after the engine applies a peer input and before durable ingress",
-        );
-        if let Some(record) = record {
-            if self.message_store.accept_incoming(record, &peer.identity)?
-                == IncomingStatus::Conflict
-            {
+        if let Some(message_id) = completed_request {
+            // One accepted chunk makes this responder's request obsolete; other
+            // signers keep retrying until they contribute or extraction ends.
+            self.delivery.complete(&message_id);
+        }
+        if let Some(PendingDurableInput { identity, record }) = durable {
+            failpoint::failpoint!(
+                name = "dkg.peer.engine_applied",
+                description = "after the engine applies a peer input and before durable ingress",
+            );
+            if self.durable_store.accept_incoming(record, &identity)? == IncomingStatus::Conflict {
                 return Err(RunnerError::DurableIngressConflict);
             }
         }
@@ -470,21 +505,14 @@ where
         for effect in effects {
             match effect {
                 RuntimeCommand::Unicast { to, payload } => {
-                    let abort_group =
-                        delivery_abort_group_for_peer_payload(payload.kind(), self.self_party, to);
-                    self.send_data_to_recipients([to], payload, abort_group)?;
+                    self.send_data_to_recipients([to], payload)?;
                 }
                 RuntimeCommand::Multicast { payload } => {
-                    let abort_group = delivery_abort_group_for_peer_payload(
-                        payload.kind(),
-                        self.self_party,
-                        self.self_party,
-                    );
                     if matches!(
                         payload.kind(),
                         DkgMessageKind::LowerConversion | DkgMessageKind::OpenPower
                     ) {
-                        let identity = self.message_store.identity(
+                        let identity = self.durable_store.identity(
                             self.self_party,
                             self.self_party,
                             &payload,
@@ -494,13 +522,12 @@ where
                             message_id: identity.message_id.clone(),
                             payload: payload.clone().into_bytes(),
                         };
-                        match self.message_store.incoming_status(&record, &identity) {
+                        match self.durable_store.incoming_status(&record, &identity) {
                             IncomingStatus::New => {
                                 self.pending_inputs.push_back(PendingEngineInput::Peer(
                                     PendingPeerInput {
                                         input: CoreInput::new(self.self_party, payload.clone()),
-                                        identity,
-                                        record: Some(record),
+                                        durable: Some(PendingDurableInput { identity, record }),
                                     },
                                 ));
                             }
@@ -516,7 +543,7 @@ where
                         .parties()
                         .into_iter()
                         .filter(|party| *party != self_party);
-                    self.send_data_to_recipients(recipients, payload, abort_group)?;
+                    self.send_data_to_recipients(recipients, payload)?;
                 }
                 RuntimeCommand::PostToChain { call } => {
                     self.handle_chain_call(call)?;
@@ -546,17 +573,16 @@ where
                     continue;
                 }
             };
-            let Ok(identity) =
-                self.message_store
-                    .identity(record.source, self.self_party, &message)
+            let Ok(_) = self
+                .durable_store
+                .identity(record.source, self.self_party, &message)
             else {
                 continue;
             };
             self.pending_inputs
                 .push_back(PendingEngineInput::Peer(PendingPeerInput {
                     input: CoreInput::new(record.source, message),
-                    identity,
-                    record: None,
+                    durable: None,
                 }));
         }
     }
@@ -625,8 +651,8 @@ where
         &mut self,
         recipients: impl IntoIterator<Item = PartyId>,
         message: DkgMessage,
-        abort_group: Option<DeliveryAbortGroup>,
     ) -> Result<(), RunnerError> {
+        let kind = message.kind();
         let recipients = recipients.into_iter().collect::<BTreeSet<_>>();
         if recipients.is_empty() {
             return Ok(());
@@ -640,12 +666,51 @@ where
                 party: recipient.0,
             });
         }
+        if kind.is_sync() {
+            if recipients.len() != 1 {
+                return Err(RunnerError::SyncMustBeUnicast);
+            }
+            let recipient = *recipients.first().expect("checked one sync recipient");
+            let identity = message
+                .identity(
+                    self.self_party,
+                    recipient,
+                    self.party_count,
+                    self.max_ladder_level,
+                )
+                .map_err(DkgDurableStoreError::Classification)?;
+            let to = self
+                .mapping
+                .member_id(recipient)
+                .expect("recipient validated above");
+            if kind.is_sync_request() {
+                self.delivery_outbound
+                    .extend(self.delivery.schedule_reliable(
+                        identity.message_id(),
+                        [to],
+                        message.into_bytes(),
+                        Some(DeliveryAbortGroup::Extraction),
+                        Instant::now(),
+                    )?);
+                return Ok(());
+            }
+            // A lost response is recreated by the requester's next retry, so it
+            // must not acquire its own retry timer or sender-side dedup entry.
+            self.delivery_outbound
+                .push(self.delivery.schedule_once(to, message.into_bytes()));
+            return Ok(());
+        }
         let Some((message_id, payload)) = self
-            .message_store
+            .durable_store
             .accept_outgoing(recipients.clone(), message)?
         else {
             return Ok(());
         };
+        let abort_group = delivery_abort_group_for_peer_payload(
+            kind,
+            self.self_party,
+            *recipients.first().expect("checked recipients above"),
+        );
         self.queue_delivery_send(message_id, recipients, payload, abort_group)
     }
 
@@ -667,13 +732,14 @@ where
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.delivery_outbound.extend(self.delivery.send(
-            message_id,
-            recipients,
-            payload,
-            abort_group,
-            Instant::now(),
-        )?);
+        self.delivery_outbound
+            .extend(self.delivery.schedule_reliable(
+                message_id,
+                recipients,
+                payload,
+                abort_group,
+                Instant::now(),
+            )?);
         Ok(())
     }
 
@@ -694,7 +760,6 @@ where
         }
         if self.last_phase == DkgEnginePhase::Extraction && phase != DkgEnginePhase::Extraction {
             self.delivery.abort_group(DeliveryAbortGroup::Extraction);
-            self.message_store.clear_ephemeral();
         }
         info!(
             from_phase = ?self.last_phase,
@@ -703,6 +768,27 @@ where
         );
         self.last_phase = phase;
     }
+}
+
+fn request_completed_by_response(
+    message: &DkgMessage,
+    requester: PartyId,
+    responder: PartyId,
+) -> Option<DkgMessageId> {
+    let key = match message {
+        DkgMessage::BveRetrievalResponse { dealer, .. } => DkgMessageKey::BveRetrievalRequest {
+            dealer: *dealer,
+            requester,
+            responder,
+        },
+        DkgMessage::PcRetrievalResponse { dealer, .. } => DkgMessageKey::PcRetrievalRequest {
+            dealer: *dealer,
+            requester,
+            responder,
+        },
+        _ => return None,
+    };
+    Some(DkgMessageId::single(key))
 }
 
 fn build_engine(

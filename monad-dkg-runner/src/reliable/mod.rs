@@ -1,7 +1,7 @@
 //! Generic reliable-message storage and at-least-once delivery primitives.
 //!
-//! [`MessageStore`] owns semantic deduplication and persistence ordering.
-//! [`ReliableOutbox`] schedules already-persisted messages until protocol
+//! [`DurableMessageStore`] owns semantic deduplication and persistence ordering.
+//! [`RetryScheduler`] resends messages until protocol
 //! evidence makes them obsolete. Wire framing and peer authentication remain
 //! protocol concerns.
 
@@ -16,8 +16,8 @@ use rand::Rng;
 use thiserror::Error;
 
 pub(crate) use message::{
-    IncomingRecord, IncomingStatus, MessageIdentity, MessageJournal, MessagePersistence,
-    MessageStore, MessageStoreError, OutgoingRecord,
+    DurableMessageStore, DurableStoreError, IncomingRecord, IncomingStatus, MessageIdentity,
+    MessageJournal, OutgoingRecord,
 };
 
 mod message;
@@ -57,12 +57,23 @@ impl RetryConfig {
 #[error("message ID reused with different payload or obsolescence scope")]
 pub(crate) struct EnqueueError;
 
-pub(crate) struct ReliableSend<Peer, Payload> {
+pub(crate) struct ScheduledSend<Peer, Payload> {
     pub(crate) to: Peer,
     pub(crate) payload: Payload,
 }
 
-pub(crate) struct ReliableOutbox<Peer, MessageId, Payload, Policy>
+pub(crate) struct OnceScheduler;
+
+impl OnceScheduler {
+    pub(crate) fn schedule<Peer, Payload>(
+        to: Peer,
+        payload: Payload,
+    ) -> ScheduledSend<Peer, Payload> {
+        ScheduledSend { to, payload }
+    }
+}
+
+pub(crate) struct RetryScheduler<Peer, MessageId, Payload, Policy>
 where
     Policy: ObsolescencePolicy,
 {
@@ -73,7 +84,7 @@ where
     policy: PhantomData<Policy>,
 }
 
-impl<Peer, MessageId, Payload, Policy> ReliableOutbox<Peer, MessageId, Payload, Policy>
+impl<Peer, MessageId, Payload, Policy> RetryScheduler<Peer, MessageId, Payload, Policy>
 where
     Peer: Copy + Ord,
     MessageId: Clone + Hash + Ord,
@@ -95,7 +106,7 @@ where
         self.deadlines.first().map(|(deadline, _, _)| *deadline)
     }
 
-    pub(crate) fn retry_due(&mut self, now: Instant) -> Vec<ReliableSend<Peer, Payload>> {
+    pub(crate) fn retry_due(&mut self, now: Instant) -> Vec<ScheduledSend<Peer, Payload>> {
         let mut sends = Vec::new();
         while self
             .deadlines
@@ -122,7 +133,7 @@ where
             let next_deadline = now + retry_delay + retry_jitter(self.config, retry_delay);
             recipient.retry_delay = retry_delay;
             recipient.deadline = next_deadline;
-            sends.push(ReliableSend {
+            sends.push(ScheduledSend {
                 to,
                 payload: message.payload.clone(),
             });
@@ -138,7 +149,7 @@ where
         payload: Payload,
         scope: Option<Policy::Scope>,
         now: Instant,
-    ) -> Result<Vec<ReliableSend<Peer, Payload>>, EnqueueError> {
+    ) -> Result<Vec<ScheduledSend<Peer, Payload>>, EnqueueError> {
         if scope.as_ref().is_some_and(|scope| {
             self.evidence
                 .iter()
@@ -180,7 +191,7 @@ where
                 .recipients
                 .insert(to, PendingRecipient::new(self.config, deadline));
             self.deadlines.insert((deadline, message_id.clone(), to));
-            sends.push(ReliableSend {
+            sends.push(ScheduledSend {
                 to,
                 payload: payload.clone(),
             });
@@ -209,6 +220,16 @@ where
             self.deadlines.remove(&deadline);
         }
         self.evidence.insert(evidence);
+    }
+
+    pub(crate) fn complete(&mut self, message_id: &MessageId) {
+        let Some(message) = self.messages.remove(message_id) else {
+            return;
+        };
+        for (to, recipient) in message.recipients {
+            self.deadlines
+                .remove(&(recipient.deadline, message_id.clone(), to));
+        }
     }
 }
 

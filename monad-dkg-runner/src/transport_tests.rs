@@ -29,7 +29,7 @@ fn configured_validator_sender_is_delivered() {
     let receiver_delivery =
         DeliveryEngine::<TestSig>::with_inbound_validators(epoch, vec![sender, receiver]);
     let outbound = sender_delivery
-        .send(id, [receiver], Bytes::from_static(b"pc-ack"), None, now)
+        .schedule_reliable(id, [receiver], Bytes::from_static(b"pc-ack"), None, now)
         .unwrap();
 
     let (_, payload) = unwrap_delivered(
@@ -85,6 +85,26 @@ fn delivery_groups_use_typed_protocol_kind() {
         delivery_abort_group_for_peer_payload(DkgMessageKind::Ladder, dealer, peer),
         None
     );
+}
+
+#[test]
+fn send_once_does_not_schedule_a_retry() {
+    let epoch = Epoch(8);
+    let sender = node(1);
+    let receiver = node(2);
+    let sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
+    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch);
+
+    let outbound = sender_delivery.schedule_once(receiver, Bytes::from_static(b"response"));
+
+    assert_eq!(outbound.to, receiver);
+    assert!(sender_delivery.next_timer().is_none());
+    let (_, payload) = unwrap_delivered(
+        receiver_delivery
+            .handle_network_message(sender, outbound.payload)
+            .unwrap(),
+    );
+    assert_eq!(payload, Bytes::from_static(b"response"));
 }
 
 #[test]

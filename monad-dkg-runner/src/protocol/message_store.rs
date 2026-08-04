@@ -2,44 +2,40 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use dkg_core::PartyId;
-use dkg_protocol::{
-    DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessagePersistence,
-};
+use dkg_protocol::{DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey};
 use thiserror::Error;
 use tracing::warn;
 
 use crate::{
     reliable::{
-        IncomingRecord, IncomingStatus, MessageIdentity, MessagePersistence, MessageStore,
-        MessageStoreError as ReliableStoreError, OutgoingRecord,
+        DurableMessageStore, DurableStoreError as GenericStoreError, IncomingRecord,
+        IncomingStatus, MessageIdentity, OutgoingRecord,
     },
     storage::{RecoveryState, RecoveryWal, RecoveryWalError},
 };
 
 #[derive(Debug, Error)]
-pub(crate) enum MessageStoreError {
+pub(crate) enum DkgDurableStoreError {
     #[error("classify DKG message failed")]
     Classification(#[source] DkgMessageError),
     #[error("construct DKG message ID failed")]
     MessageId(#[source] DkgMessageError),
-    #[error("retrieval messages must be unicast")]
-    RetrievalMustBeUnicast,
-    #[error("DKG message has inconsistent persistence policy")]
-    InconsistentPersistence,
+    #[error("sync message cannot use durable message storage")]
+    SyncMessage,
     #[error("DKG message has no recipients")]
     NoRecipients,
     #[error(transparent)]
-    Reliable(#[from] ReliableStoreError<DkgMessageId, RecoveryWalError>),
+    Reliable(#[from] GenericStoreError<DkgMessageId, RecoveryWalError>),
 }
 
-pub(super) struct DkgMessageStore {
+pub(super) struct DkgDurableStore {
     self_party: PartyId,
     party_count: usize,
     max_ladder_level: u64,
-    store: MessageStore<PartyId, DkgMessageId, DkgMessageKey, Bytes, RecoveryWal>,
+    store: DurableMessageStore<PartyId, DkgMessageId, DkgMessageKey, Bytes, RecoveryWal>,
 }
 
-impl DkgMessageStore {
+impl DkgDurableStore {
     pub(super) fn load(
         self_party: PartyId,
         party_count: usize,
@@ -51,7 +47,7 @@ impl DkgMessageStore {
             self_party,
             party_count,
             max_ladder_level,
-            store: MessageStore::new(wal),
+            store: DurableMessageStore::new(wal),
         };
         for record in recovery.outbox.into_values() {
             let Ok(message) = DkgMessage::decode(record.payload.clone()) else {
@@ -90,9 +86,9 @@ impl DkgMessageStore {
         &mut self,
         record: IncomingRecord<PartyId, DkgMessageId, Bytes>,
         identity: &MessageIdentity<DkgMessageId, DkgMessageKey>,
-    ) -> Result<IncomingStatus, MessageStoreError> {
+    ) -> Result<IncomingStatus, DkgDurableStoreError> {
         let status = self.store.accept_incoming(record, identity)?;
-        if status == IncomingStatus::New && identity.persistence == MessagePersistence::Durable {
+        if status == IncomingStatus::New {
             failpoint::failpoint!(
                 name = "dkg.peer.input_persisted",
                 description =
@@ -114,13 +110,8 @@ impl DkgMessageStore {
         &mut self,
         recipients: BTreeSet<PartyId>,
         message: DkgMessage,
-    ) -> Result<Option<(DkgMessageId, Bytes)>, MessageStoreError> {
+    ) -> Result<Option<(DkgMessageId, Bytes)>, DkgDurableStoreError> {
         let identity = self.outgoing_identity(&recipients, &message)?;
-        if identity.persistence == MessagePersistence::Ephemeral
-            && (recipients.len() != 1 || identity.keys.len() != 1)
-        {
-            return Err(MessageStoreError::RetrievalMustBeUnicast);
-        }
         let message_id = identity.message_id.clone();
         let payload = message.into_bytes();
         let accepted = self.store.accept_outgoing(
@@ -131,17 +122,13 @@ impl DkgMessageStore {
             },
             &identity,
         )?;
-        if accepted && identity.persistence == MessagePersistence::Durable {
+        if accepted {
             failpoint::failpoint!(
                 name = "dkg.network.outgoing_persisted",
                 description = "after durable DKG output and before network delivery is queued",
             );
         }
         Ok(accepted.then_some((message_id, payload)))
-    }
-
-    pub(super) fn clear_ephemeral(&mut self) {
-        self.store.clear_ephemeral();
     }
 
     #[cfg(test)]
@@ -154,9 +141,9 @@ impl DkgMessageStore {
         source: PartyId,
         target: PartyId,
         payload: &[u8],
-    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, MessageStoreError> {
+    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, DkgDurableStoreError> {
         let message = DkgMessage::decode(Bytes::copy_from_slice(payload))
-            .map_err(MessageStoreError::Classification)?;
+            .map_err(DkgDurableStoreError::Classification)?;
         self.identity(source, target, &message)
     }
 
@@ -165,14 +152,16 @@ impl DkgMessageStore {
         source: PartyId,
         target: PartyId,
         message: &DkgMessage,
-    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, MessageStoreError> {
+    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, DkgDurableStoreError> {
+        if message.kind().is_sync() {
+            return Err(DkgDurableStoreError::SyncMessage);
+        }
         let identity = message
             .identity(source, target, self.party_count, self.max_ladder_level)
-            .map_err(MessageStoreError::Classification)?;
+            .map_err(DkgDurableStoreError::Classification)?;
         Ok(MessageIdentity {
             message_id: identity.message_id(),
             keys: identity.keys.into_iter().collect(),
-            persistence: persistence(identity.persistence),
         })
     }
 
@@ -180,40 +169,20 @@ impl DkgMessageStore {
         &self,
         recipients: &BTreeSet<PartyId>,
         message: &DkgMessage,
-    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, MessageStoreError> {
+    ) -> Result<MessageIdentity<DkgMessageId, DkgMessageKey>, DkgDurableStoreError> {
         if recipients.is_empty() {
-            return Err(MessageStoreError::NoRecipients);
+            return Err(DkgDurableStoreError::NoRecipients);
         }
         let mut keys = BTreeSet::new();
-        let mut message_persistence = None;
         for recipient in recipients {
-            let identity = message
-                .identity(
-                    self.self_party,
-                    *recipient,
-                    self.party_count,
-                    self.max_ladder_level,
-                )
-                .map_err(MessageStoreError::Classification)?;
-            if message_persistence.is_some_and(|value| value != identity.persistence) {
-                return Err(MessageStoreError::InconsistentPersistence);
-            }
-            message_persistence = Some(identity.persistence);
+            let identity = self.identity(self.self_party, *recipient, message)?;
             keys.extend(identity.keys);
         }
         Ok(MessageIdentity {
             message_id: DkgMessageId::new(keys.iter().copied())
-                .map_err(MessageStoreError::MessageId)?,
+                .map_err(DkgDurableStoreError::MessageId)?,
             keys,
-            persistence: persistence(message_persistence.unwrap()),
         })
-    }
-}
-
-fn persistence(value: DkgMessagePersistence) -> MessagePersistence {
-    match value {
-        DkgMessagePersistence::Durable => MessagePersistence::Durable,
-        DkgMessagePersistence::Ephemeral => MessagePersistence::Ephemeral,
     }
 }
 

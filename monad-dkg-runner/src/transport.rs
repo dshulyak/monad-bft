@@ -16,7 +16,7 @@ use monad_types::{Epoch, NodeId};
 use tracing::warn;
 
 use crate::reliable::{
-    EnqueueError, ObsolescencePolicy, ReliableOutbox, ReliableSend, RetryConfig,
+    EnqueueError, ObsolescencePolicy, OnceScheduler, RetryConfig, RetryScheduler, ScheduledSend,
 };
 
 pub(crate) struct DeliveryInbound<ST: CertificateSignatureRecoverable> {
@@ -66,7 +66,7 @@ impl ObsolescencePolicy for DkgObsolescence {
 pub(crate) struct DeliveryEngine<ST: CertificateSignatureRecoverable> {
     epoch: Epoch,
     inbound_validators: Option<BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
-    outbox: ReliableOutbox<
+    scheduler: RetryScheduler<
         NodeId<CertificateSignaturePubKey<ST>>,
         DkgMessageId,
         Bytes,
@@ -82,7 +82,7 @@ where
         Self {
             epoch,
             inbound_validators: None,
-            outbox: ReliableOutbox::new(DKG_RETRY),
+            scheduler: RetryScheduler::new(DKG_RETRY),
         }
     }
 
@@ -96,7 +96,7 @@ where
     }
 
     pub(crate) fn next_timer(&self) -> Option<Instant> {
-        self.outbox.next_timer()
+        self.scheduler.next_timer()
     }
 
     pub(crate) fn handle_network_message(
@@ -129,14 +129,14 @@ where
     }
 
     pub(crate) fn handle_timer(&mut self, now: Instant) -> Vec<DeliveryOutbound<ST>> {
-        self.outbox
+        self.scheduler
             .retry_due(now)
             .into_iter()
             .map(delivery_outbound)
             .collect()
     }
 
-    pub(crate) fn send(
+    pub(crate) fn schedule_reliable(
         &mut self,
         message_id: DkgMessageId,
         recipients: impl IntoIterator<Item = NodeId<CertificateSignaturePubKey<ST>>>,
@@ -144,7 +144,7 @@ where
         abort_group: Option<DeliveryAbortGroup>,
         now: Instant,
     ) -> Result<Vec<DeliveryOutbound<ST>>, EnqueueError> {
-        self.outbox
+        self.scheduler
             .enqueue(
                 message_id,
                 recipients,
@@ -155,13 +155,28 @@ where
             .map(|sends| sends.into_iter().map(delivery_outbound).collect())
     }
 
+    pub(crate) fn schedule_once(
+        &self,
+        to: NodeId<CertificateSignaturePubKey<ST>>,
+        payload: Bytes,
+    ) -> DeliveryOutbound<ST> {
+        delivery_outbound(OnceScheduler::schedule(
+            to,
+            encode_wire(self.epoch, payload),
+        ))
+    }
+
+    pub(crate) fn complete(&mut self, message_id: &DkgMessageId) {
+        self.scheduler.complete(message_id);
+    }
+
     pub(crate) fn abort_group(&mut self, group: DeliveryAbortGroup) {
-        self.outbox.observe(group);
+        self.scheduler.observe(group);
     }
 }
 
 fn delivery_outbound<ST: CertificateSignatureRecoverable>(
-    send: ReliableSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>,
+    send: ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>,
 ) -> DeliveryOutbound<ST> {
     DeliveryOutbound {
         to: send.to,
@@ -184,7 +199,6 @@ pub(crate) fn delivery_abort_group_for_peer_payload(
         DkgMessageKind::BveRetrievalRequest | DkgMessageKind::PcRetrievalRequest => {
             Some(DeliveryAbortGroup::Extraction)
         }
-        // A peer that finishes first must keep serving a late recovering peer.
         DkgMessageKind::BveRetrievalResponse
         | DkgMessageKind::PcRetrievalResponse
         | DkgMessageKind::Ladder

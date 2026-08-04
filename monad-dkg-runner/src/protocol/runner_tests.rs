@@ -12,6 +12,26 @@ use super::*;
 use crate::session::test_registered_key_material;
 
 #[test]
+fn retrieval_response_completes_its_request() {
+    let dealer = PartyId(2);
+    let requester = PartyId(0);
+    let responder = PartyId(1);
+    let response = DkgMessage::PcRetrievalResponse {
+        dealer,
+        bytes: Bytes::new(),
+    };
+
+    assert_eq!(
+        request_completed_by_response(&response, requester, responder),
+        Some(DkgMessageId::single(DkgMessageKey::PcRetrievalRequest {
+            dealer,
+            requester,
+            responder,
+        }))
+    );
+}
+
+#[test]
 fn runner_submits_chain_call_and_processes_finalized_event() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(11);
@@ -97,7 +117,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     invalid_ack.extend_from_slice(&[0; 96]);
     let mut sender_delivery = DeliveryEngine::<NopSignature>::new(epoch);
     let wire = sender_delivery
-        .send(
+        .schedule_reliable(
             message_id,
             [self_id],
             invalid_ack.into(),
@@ -113,7 +133,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
         runner.handle_network_message(sender, wire.clone()).unwrap();
     }
 
-    assert!(runner.message_store.incoming_records().is_empty());
+    assert!(runner.durable_store.incoming_records().is_empty());
     assert!(runner.delivery_outbound.is_empty());
     assert!(sender_delivery.next_timer().is_some());
 }

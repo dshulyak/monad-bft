@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[test]
-fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
+fn durable_store_rejects_sync_messages_and_recovers_semantic_slots() {
     let dir = tempfile::tempdir().unwrap();
     let epoch = Epoch(12);
     let self_party = PartyId(0);
@@ -27,7 +27,7 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
     .unwrap()
     .0;
     let path = wal.path().to_path_buf();
-    let mut store = DkgMessageStore::load(self_party, 4, 3, wal, RecoveryState::default());
+    let mut store = DkgDurableStore::load(self_party, 4, 3, wal, RecoveryState::default());
     let recipients = [PartyId(1), PartyId(2), PartyId(3)].into();
     let proposal = [TAG_PC_PROPOSAL, 0x11];
     assert!(store
@@ -42,18 +42,10 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
     request.extend_from_slice(&[0; 64]);
     request.extend_from_slice(&self_party.0.to_le_bytes());
     request.extend_from_slice(&[0; 32]);
-    for expected in [true, false] {
-        assert_eq!(
-            store
-                .accept_outgoing(
-                    [PartyId(3)].into(),
-                    DkgMessage::decode(request.clone()).unwrap(),
-                )
-                .unwrap()
-                .is_some(),
-            expected
-        );
-    }
+    assert!(matches!(
+        store.accept_outgoing([PartyId(3)].into(), DkgMessage::decode(request).unwrap(),),
+        Err(DkgDurableStoreError::SyncMessage)
+    ));
 
     let mut ack = vec![TAG_PC_ACK];
     ack.extend_from_slice(&[0x33; 96]);
@@ -89,7 +81,7 @@ fn restart_keeps_one_semantic_slot_and_skips_ephemeral_messages() {
     )
     .unwrap()
     .0;
-    let mut store = DkgMessageStore::load(self_party, 4, 3, wal, recovery);
+    let mut store = DkgDurableStore::load(self_party, 4, 3, wal, recovery);
     assert_eq!(store.outgoing_records()[0].payload.as_ref(), proposal);
     assert!(store
         .accept_outgoing(

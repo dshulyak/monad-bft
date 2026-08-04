@@ -32,8 +32,8 @@ fn config() -> RetryConfig {
     )
 }
 
-fn outbox() -> ReliableOutbox<u8, u8, &'static str, TestPolicy> {
-    ReliableOutbox::new(config())
+fn outbox() -> RetryScheduler<u8, u8, &'static str, TestPolicy> {
+    RetryScheduler::new(config())
 }
 
 #[test]
@@ -142,4 +142,19 @@ fn evidence_removes_matching_messages_and_rejects_late_replay() {
     assert!(!outbox.messages.contains_key(&2));
     assert!(outbox.messages.contains_key(&3));
     assert_eq!(outbox.deadlines.len(), 1);
+}
+
+#[test]
+fn completed_message_has_no_more_retries() {
+    let now = Instant::now();
+    let mut outbox = outbox();
+    outbox
+        .enqueue(1, [2, 3], "request", Some(Scope::Item(1)), now)
+        .unwrap();
+
+    outbox.complete(&1);
+
+    assert!(!outbox.messages.contains_key(&1));
+    assert!(outbox.deadlines.is_empty());
+    assert!(outbox.next_timer().is_none());
 }
