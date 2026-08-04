@@ -7,8 +7,8 @@ use monad_types::Epoch;
 
 use super::*;
 use crate::{
+    recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig},
     reliable::{IncomingRecord, IncomingStatus},
-    storage::{RecoveryState, RecoveryWal, RecoveryWalConfig},
 };
 
 #[test]

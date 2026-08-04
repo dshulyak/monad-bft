@@ -13,8 +13,8 @@ use monad_types::{Epoch, NodeId};
 use thiserror::Error;
 
 use crate::{
+    recovery::{RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     session::DkgRegisteredKeyMaterial,
-    storage::{RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     DkgLocalKeyMaterial, DkgValidator,
 };
 

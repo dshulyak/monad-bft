@@ -1,11 +1,12 @@
 mod chain;
 mod error;
 mod manager;
-mod protocol;
+mod record;
+mod recovery;
 mod registration;
 mod reliable;
+mod runner;
 mod session;
-mod storage;
 mod transport;
 mod wal;
 
@@ -21,7 +22,7 @@ pub use session::{DkgLocalKeyMaterial, DkgValidator};
 pub use transport::DeliveryOutbound;
 
 pub fn recovery_epochs(root: &std::path::Path) -> Result<Vec<monad_types::Epoch>, DkgError> {
-    storage::recovery_epochs(root)
+    recovery::recovery_epochs(root)
         .map_err(|err| DkgError::operation("list DKG recovery epochs", err))
 }
 

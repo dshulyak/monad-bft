@@ -7,11 +7,11 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::{
+    recovery::{RecoveryState, RecoveryWal, RecoveryWalError},
     reliable::{
         DurableMessageStore, DurableStoreError as GenericStoreError, IncomingRecord,
         IncomingStatus, MessageIdentity, OutgoingRecord,
     },
-    storage::{RecoveryState, RecoveryWal, RecoveryWalError},
 };
 
 #[derive(Debug, Error)]

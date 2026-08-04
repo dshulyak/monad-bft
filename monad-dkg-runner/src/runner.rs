@@ -25,9 +25,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::chain_event_kind,
+    record::EngineSeed,
+    recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     reliable::{EnqueueError, IncomingRecord, IncomingStatus, MessageIdentity, OutgoingRecord},
     session::DkgRegisteredKeyMaterial,
-    storage::{EngineSeed, RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     transport::{
         delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
         DeliveryOutbound,
@@ -864,5 +865,5 @@ fn delivery_abort_group_for_chain_event(event: &ChainEvent) -> DeliveryAbortGrou
 mod tests;
 
 #[cfg(test)]
-#[path = "recovery_tests.rs"]
+#[path = "runner_recovery_tests.rs"]
 mod recovery_tests;

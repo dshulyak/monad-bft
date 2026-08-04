@@ -10,8 +10,8 @@ use tracing::{debug, error, warn};
 
 use crate::{
     chain::{ChainEventBatch, ChainEventReader, ChainEventSession, DkgChain, TxSubmitter},
-    protocol::{start, Runner},
     registration::{assemble_registered_session, load_or_create_local_registration},
+    runner::{start, Runner},
     transport::delivery_epoch,
     DeliveryOutbound, DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
 };
