@@ -14,7 +14,7 @@ use crate::{
 const EPOCH: Epoch = Epoch(17);
 
 #[test]
-fn assembles_registered_parties_in_canonical_address_order() {
+fn assembles_registered_parties_in_validator_order() {
     let nodes = test_nodes(4);
     let keys = test_keys(4);
     let addresses = [[4; 20], [1; 20], [3; 20], [2; 20]];
@@ -44,29 +44,28 @@ fn assembles_registered_parties_in_canonical_address_order() {
             .map(|registration| registration.address)
             .collect::<Vec<_>>(),
         vec![
+            dkg_core::Address([4; 20]),
             dkg_core::Address([1; 20]),
-            dkg_core::Address([2; 20]),
             dkg_core::Address([3; 20]),
-            dkg_core::Address([4; 20])
+            dkg_core::Address([2; 20])
         ]
     );
-    assert_eq!(
-        session.validators,
-        vec![nodes[1], nodes[3], nodes[2], nodes[0]]
-    );
+    assert_eq!(session.validators, nodes);
 }
 
 #[test]
 fn intersects_registrations_with_finalized_validators() {
     let nodes = test_nodes(5);
     let keys = test_keys(5);
-    let validators = (0..4)
+    let order = [3usize, 0, 2, 1];
+    let validators = order
+        .into_iter()
         .map(|index| DkgValidator::<NopSignature> {
             node_id: nodes[index],
             address: [index as u8 + 1; 20],
         })
         .collect();
-    let registrations = [0usize, 1, 2, 4]
+    let registrations = [0usize, 1, 3, 4]
         .into_iter()
         .map(|index| registration([index as u8 + 1; 20], &keys[index]))
         .collect();
@@ -74,7 +73,7 @@ fn intersects_registrations_with_finalized_validators() {
     let session =
         assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], registrations).unwrap();
 
-    assert_eq!(session.validators, vec![nodes[0], nodes[1], nodes[2]]);
+    assert_eq!(session.validators, vec![nodes[3], nodes[0], nodes[1]]);
     assert_eq!(
         session
             .key_material
@@ -83,9 +82,9 @@ fn intersects_registrations_with_finalized_validators() {
             .map(|registration| registration.address)
             .collect::<Vec<_>>(),
         vec![
+            dkg_core::Address([4; 20]),
             dkg_core::Address([1; 20]),
-            dkg_core::Address([2; 20]),
-            dkg_core::Address([3; 20])
+            dkg_core::Address([2; 20])
         ]
     );
 }

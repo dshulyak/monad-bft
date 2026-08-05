@@ -162,16 +162,49 @@ contract DkgContractTest {
         dkg.register(EPOCH, registration(1));
     }
 
-    function testPartyIdsUseSortedEligibleAddresses() external {
+    function testPartyIdsUseValidatorSetOrder() external {
         Fixture memory fixture = deploySession();
         postPc(fixture, pcQc(2, 0x11, 1));
 
-        (address[4] memory sorted,) = sortedPartiesAndKeys(fixture);
         require(fixture.dkg.frozenPartyCount(EPOCH) == 4, "wrong frozen party count");
         for (uint32 i = 0; i < 4; i++) {
-            require(fixture.dkg.frozenParty(EPOCH, i) == sorted[i], "party order differs from runner");
-            (bool exists, uint32 partyId) = fixture.dkg.partyIdOf(EPOCH, sorted[i]);
+            require(
+                fixture.dkg.frozenParty(EPOCH, i) == fixture.validators[i], "party order differs from validator set"
+            );
+            (bool exists, uint32 partyId) = fixture.dkg.partyIdOf(EPOCH, fixture.validators[i]);
             require(exists && partyId == i, "wrong party id");
+        }
+
+        // A frozen party set must not depend on whichever staking snapshot is
+        // current when it is read later.
+        fixture.staking.setEpoch(99, false);
+        for (uint32 i = 0; i < 4; i++) {
+            require(fixture.dkg.frozenParty(EPOCH, i) == fixture.validators[i], "frozen order changed");
+        }
+    }
+
+    function testPartyIdsCompactMissingRegistrationsWithoutReordering() external {
+        TestValidatorLookup staking = new TestValidatorLookup();
+        DkgContract dkg = new DkgContract(address(staking));
+        address[5] memory validators;
+        for (uint256 i = 0; i < validators.length; i++) {
+            validators[i] = VM.addr(200 + i);
+            staking.addTarget(validators[i]);
+            if (i != 1) {
+                VM.prank(validators[i]);
+                dkg.register(EPOCH, registration(10));
+            }
+        }
+        staking.setEpoch(6, true);
+
+        VM.prank(validators[0]);
+        dkg.postPcQc(EPOCH, pcQc(1, 0x11, 1));
+
+        address[4] memory expected = [validators[0], validators[2], validators[3], validators[4]];
+        for (uint32 i = 0; i < expected.length; i++) {
+            require(dkg.frozenParty(EPOCH, i) == expected[i], "filtered validator order changed");
+            (bool exists, uint32 partyId) = dkg.partyIdOf(EPOCH, expected[i]);
+            require(exists && partyId == i, "filtered party id differs");
         }
     }
 
@@ -202,6 +235,7 @@ contract DkgContractTest {
         VM.prank(first);
         dkg.postPcQc(EPOCH, pcQc(1, 0x11, 1));
         require(dkg.frozenPartyCount(EPOCH) == 200, "maximum party set was not frozen");
+        require(dkg.frozenParty(EPOCH, 0) == first, "maximum party set order changed");
     }
 
     function testPcAndBveRecordsAreStoredAsTypedRecords() external {
@@ -242,10 +276,9 @@ contract DkgContractTest {
         DkgContract.PcQc memory pc = pcQc(2, 0x11, 1);
         DkgContract.BveQc memory bve = bveQc(3, 0x22, 1);
 
-        (address[4] memory sorted,) = sortedPartiesAndKeys(fixture);
         address[] memory frozen = new address[](4);
         for (uint256 i = 0; i < 4; i++) {
-            frozen[i] = sorted[i];
+            frozen[i] = fixture.validators[i];
         }
         VM.expectEmit(true, false, false, true, address(fixture.dkg));
         emit PartySetFrozen(EPOCH, 4, keccak256(abi.encode(frozen)));
@@ -446,33 +479,11 @@ contract DkgContractTest {
         for (uint256 i = 0; i < 6; i++) {
             result.g2x[i] = bytes32(uint256(pointByte) + i);
         }
-        (address[4] memory parties, uint256[4] memory keys) = sortedPartiesAndKeys(fixture);
-        bytes32 digest = doneQcDigest(EPOCH, result.g2x, parties, keys);
+        bytes32 digest = doneQcDigest(EPOCH, result.g2x, fixture.validators, fixture.qcKeys);
         result.signatures = new DkgContract.QcSignature[](3);
         for (uint32 i = 0; i < 3; i++) {
-            (, bytes32 r, bytes32 s) = VM.sign(keys[i], digest);
+            (, bytes32 r, bytes32 s) = VM.sign(fixture.qcKeys[i], digest);
             result.signatures[i] = DkgContract.QcSignature({signer: i, r: r, s: s});
-        }
-    }
-
-    function sortedPartiesAndKeys(Fixture memory fixture)
-        private
-        pure
-        returns (address[4] memory parties, uint256[4] memory keys)
-    {
-        parties = fixture.validators;
-        keys = fixture.qcKeys;
-        for (uint256 i = 1; i < 4; i++) {
-            address party = parties[i];
-            uint256 key = keys[i];
-            uint256 j = i;
-            while (j != 0 && uint160(parties[j - 1]) > uint160(party)) {
-                parties[j] = parties[j - 1];
-                keys[j] = keys[j - 1];
-                j--;
-            }
-            parties[j] = party;
-            keys[j] = key;
         }
     }
 

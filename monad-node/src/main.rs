@@ -799,6 +799,8 @@ fn schedule_dkg_session(
     dkg_events: &monad_dkg_runner::DkgRunnerHandle<SignatureType>,
     validator_set: &ValidatorSetDataWithEpoch<SignatureCollectionType>,
 ) {
+    // `ValidatorSetData` preserves the staking snapshot order. DKG stable-filters
+    // registrations through this vector, so changing it would change PartyIds.
     let validators = validator_set
         .validators
         .0

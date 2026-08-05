@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{HashMap, HashSet},
     path::Path,
 };
 
@@ -77,12 +77,9 @@ pub(crate) fn assemble_registered_session<ST>(
 where
     ST: CertificateSignatureRecoverable,
 {
-    let mut validators_by_address = BTreeMap::new();
-    for validator in validators {
-        if validators_by_address
-            .insert(validator.address, validator.node_id)
-            .is_some()
-        {
+    let mut validator_addresses = HashSet::with_capacity(validators.len());
+    for validator in &validators {
+        if !validator_addresses.insert(validator.address) {
             return Err(RegistrationError::DuplicateValidatorAddress {
                 address: Address::from(validator.address),
             });
@@ -101,12 +98,14 @@ where
         registrations_by_address.insert(address, registration);
     }
 
-    let eligible = validators_by_address
+    // Party IDs are compact ranks in the finalized validator-set order. Missing
+    // registrations are filtered without changing the relative validator order.
+    let eligible = validators
         .into_iter()
-        .filter_map(|(address, node_id)| {
+        .filter_map(|validator| {
             registrations_by_address
-                .remove(&address)
-                .map(|registration| (address, node_id, registration))
+                .remove(&validator.address)
+                .map(|registration| (validator.node_id, registration))
         })
         .collect::<Vec<_>>();
     if eligible.is_empty() {
@@ -114,7 +113,7 @@ where
     }
 
     let local = local_keys.decode().map_err(RegistrationError::LocalKeys)?;
-    if let Some((_, _, registration)) = eligible.iter().find(|(_, node_id, _)| *node_id == self_id)
+    if let Some((_, registration)) = eligible.iter().find(|(node_id, _)| *node_id == self_id)
     {
         if registration.receiver.public_key != local.receiver_public_key {
             return Err(RegistrationError::ReceiverKeyMismatch);
@@ -123,10 +122,10 @@ where
             return Err(RegistrationError::QcVerifierMismatch);
         }
     }
-    let validators = eligible.iter().map(|(_, node_id, _)| *node_id).collect();
+    let validators = eligible.iter().map(|(node_id, _)| *node_id).collect();
     let registrations = eligible
         .into_iter()
-        .map(|(_, _, registration)| registration)
+        .map(|(_, registration)| registration)
         .collect();
     Ok(RegisteredSession {
         validators,

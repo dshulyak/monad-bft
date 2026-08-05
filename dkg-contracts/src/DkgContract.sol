@@ -16,8 +16,8 @@ interface IMonadStaking {
 ///
 /// Party identity is frozen at the staking boundary, not supplied by the result
 /// submitter. The contract intersects the target epoch's locked validator set
-/// with registrations and sorts the resulting addresses ascending. This is the
-/// same ordering used by the runner, so PartyId is the address's array index.
+/// with registrations while preserving validator-set order. The runner uses the
+/// same stable filter, so PartyId is the address's compact array index.
 ///
 /// A DKG-DONE QC is accepted only if at least `2 * floor((N - 1) / 3) + 1`
 /// distinct PartyIds carry valid secp256k1 signatures over the engine's exact
@@ -121,10 +121,9 @@ contract DkgContract {
     mapping(uint64 epoch => DkgResult[] records) private resultsByEpoch;
     mapping(uint64 epoch => address[] parties) private registeredPartiesByEpoch;
     mapping(uint64 epoch => mapping(address party => Registration registration)) private registrations;
-    /// @dev Bit `i` says registration `i` belongs to the frozen target set.
-    /// Registrations close before freezing, so one word preserves membership;
-    /// canonical addresses are reconstructed and sorted when needed.
-    mapping(uint64 epoch => uint256 registrationBitmap) private frozenRegistrationsByEpoch;
+    /// @dev Registration indices in canonical validator-set order. One byte per
+    /// party is sufficient because registrations are bounded to 256.
+    mapping(uint64 epoch => bytes registrationOrder) private frozenRegistrationOrderByEpoch;
     mapping(uint64 epoch => mapping(bytes32 witnessHash => bool seen)) private seenPcQcs;
     mapping(uint64 epoch => mapping(address submitter => mapping(uint32 dealer => bool submitted))) private
         submittedBveQc;
@@ -346,7 +345,7 @@ contract DkgContract {
     /// frozen here the mapping remains reconstructible after staking rotates
     /// both sets.
     function _partySet(uint64 epoch) private returns (address[] memory) {
-        if (frozenRegistrationsByEpoch[epoch] == 0) {
+        if (frozenRegistrationOrderByEpoch[epoch].length == 0) {
             return _freezePartySet(epoch);
         }
         return _partySetView(epoch);
@@ -354,54 +353,57 @@ contract DkgContract {
 
     function _freezePartySet(uint64 epoch) private returns (address[] memory parties) {
         uint64[] memory validatorIds = _readValidatorSet(_validatorSetGetter(epoch));
-        _sortValidatorIds(validatorIds);
-
         address[] storage registered = registeredPartiesByEpoch[epoch];
         parties = new address[](registered.length);
-        uint256 bitmap;
-        uint256 count;
+        uint64[] memory registeredValidatorIds = new uint64[](registered.length);
         for (uint256 i = 0; i < registered.length; i++) {
-            address party = registered[i];
-            if (_containsValidatorId(validatorIds, _validatorId(party))) {
-                bitmap |= uint256(1) << i;
-                parties[count++] = party;
+            uint64 validatorId = _validatorId(registered[i]);
+            if (validatorId == 0) {
+                revert StakingLookupFailed();
+            }
+            registeredValidatorIds[i] = validatorId;
+        }
+
+        bytes memory registrationOrder = new bytes(registered.length);
+        uint256 selectedRegistrations;
+        uint256 count;
+        for (uint256 i = 0; i < validatorIds.length; i++) {
+            uint64 validatorId = validatorIds[i];
+            if (validatorId == 0) {
+                revert StakingLookupFailed();
+            }
+            for (uint256 j = 0; j < registered.length; j++) {
+                if (registeredValidatorIds[j] != validatorId) {
+                    continue;
+                }
+                uint256 registrationBit = uint256(1) << j;
+                if ((selectedRegistrations & registrationBit) != 0) {
+                    revert StakingLookupFailed();
+                }
+                selectedRegistrations |= registrationBit;
+                registrationOrder[count] = bytes1(uint8(j));
+                parties[count++] = registered[j];
+                break;
             }
         }
         if (count < 4 || count > MAX_PARTIES) {
             revert PartySetUnavailable(epoch);
         }
 
-        _sortAddresses(parties, count);
-        for (uint256 i = 0; i < count; i++) {
-            address party = parties[i];
-            if (party == address(0) || (i != 0 && party == parties[i - 1])) {
-                revert StakingLookupFailed();
-            }
-        }
-        frozenRegistrationsByEpoch[epoch] = bitmap;
-
         assembly ("memory-safe") {
             mstore(parties, count)
+            mstore(registrationOrder, count)
         }
+        frozenRegistrationOrderByEpoch[epoch] = registrationOrder;
         emit PartySetFrozen(epoch, count, keccak256(abi.encode(parties)));
     }
 
     function _partySetView(uint64 epoch) private view returns (address[] memory parties) {
-        uint256 bitmap = frozenRegistrationsByEpoch[epoch];
-        if (bitmap == 0) {
-            return new address[](0);
-        }
+        bytes storage registrationOrder = frozenRegistrationOrderByEpoch[epoch];
         address[] storage registered = registeredPartiesByEpoch[epoch];
-        parties = new address[](registered.length);
-        uint256 count;
-        for (uint256 i = 0; i < registered.length; i++) {
-            if ((bitmap & (uint256(1) << i)) != 0) {
-                parties[count++] = registered[i];
-            }
-        }
-        _sortAddresses(parties, count);
-        assembly ("memory-safe") {
-            mstore(parties, count)
+        parties = new address[](registrationOrder.length);
+        for (uint256 i = 0; i < registrationOrder.length; i++) {
+            parties[i] = registered[uint8(registrationOrder[i])];
         }
     }
 
@@ -472,83 +474,6 @@ contract DkgContract {
         if (!success) {
             revert StakingLookupFailed();
         }
-    }
-
-    /// @dev In-place ascending heap sort. Its O(N log N) upper bound keeps the
-    /// staking maximum cheap even if validator addresses arrive in reverse order.
-    function _sortAddresses(address[] memory parties, uint256 count) private pure {
-        if (count < 2) {
-            return;
-        }
-        for (uint256 start = count / 2; start != 0; start--) {
-            _siftDown(parties, start - 1, count);
-        }
-        for (uint256 end = count - 1; end != 0; end--) {
-            (parties[0], parties[end]) = (parties[end], parties[0]);
-            _siftDown(parties, 0, end);
-        }
-    }
-
-    function _siftDown(address[] memory parties, uint256 root, uint256 end) private pure {
-        while (true) {
-            uint256 child = root * 2 + 1;
-            if (child >= end) {
-                return;
-            }
-            if (child + 1 < end && uint160(parties[child]) < uint160(parties[child + 1])) {
-                child++;
-            }
-            if (uint160(parties[root]) >= uint160(parties[child])) {
-                return;
-            }
-            (parties[root], parties[child]) = (parties[child], parties[root]);
-            root = child;
-        }
-    }
-
-    function _sortValidatorIds(uint64[] memory validatorIds) private pure {
-        uint256 count = validatorIds.length;
-        if (count < 2) {
-            return;
-        }
-        for (uint256 start = count / 2; start != 0; start--) {
-            _siftDownValidatorIds(validatorIds, start - 1, count);
-        }
-        for (uint256 end = count - 1; end != 0; end--) {
-            (validatorIds[0], validatorIds[end]) = (validatorIds[end], validatorIds[0]);
-            _siftDownValidatorIds(validatorIds, 0, end);
-        }
-    }
-
-    function _siftDownValidatorIds(uint64[] memory validatorIds, uint256 root, uint256 end) private pure {
-        while (true) {
-            uint256 child = root * 2 + 1;
-            if (child >= end) {
-                return;
-            }
-            if (child + 1 < end && validatorIds[child] < validatorIds[child + 1]) {
-                child++;
-            }
-            if (validatorIds[root] >= validatorIds[child]) {
-                return;
-            }
-            (validatorIds[root], validatorIds[child]) = (validatorIds[child], validatorIds[root]);
-            root = child;
-        }
-    }
-
-    function _containsValidatorId(uint64[] memory validatorIds, uint64 validatorId) private pure returns (bool) {
-        uint256 low;
-        uint256 high = validatorIds.length;
-        while (low < high) {
-            uint256 middle = (low + high) / 2;
-            if (validatorIds[middle] < validatorId) {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        return low != validatorIds.length && validatorIds[low] == validatorId;
     }
 
     function _validateDkgResult(uint64 epoch, DkgResult calldata result, address[] memory parties) private view {
@@ -738,20 +663,11 @@ contract DkgContract {
     }
 
     function _partyId(address[] memory parties, address party) private pure returns (uint256) {
-        uint256 low;
-        uint256 high = parties.length;
-        while (low < high) {
-            uint256 middle = (low + high) / 2;
-            address candidate = parties[middle];
-            if (uint160(candidate) < uint160(party)) {
-                low = middle + 1;
-            } else {
-                high = middle;
+        for (uint256 i = 0; i < parties.length; i++) {
+            if (parties[i] == party) {
+                return i;
             }
         }
-        if (low == parties.length || parties[low] != party) {
-            return type(uint256).max;
-        }
-        return low;
+        return type(uint256).max;
     }
 }
