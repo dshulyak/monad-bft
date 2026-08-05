@@ -1,47 +1,36 @@
-use dkg_protocol::{DkgMessageId, DkgMessageKey, DkgMessageKind};
-use monad_crypto::{certificate_signature::PubKey, NopPubKey, NopSignature};
+use dkg_protocol::DkgMessageKind;
+use monad_crypto::{NopPubKey, NopSignature, certificate_signature::PubKey};
 
 use super::*;
 
 type TestSig = NopSignature;
-
-fn unwrap_delivered(
-    inbound: DeliveryInbound<TestSig>,
-) -> (NodeId<CertificateSignaturePubKey<TestSig>>, Bytes) {
-    (inbound.sender, inbound.payload)
-}
 
 fn node(byte: u8) -> NodeId<CertificateSignaturePubKey<TestSig>> {
     NodeId::new(NopPubKey::from_bytes(&[byte; 32]).expect("test pubkey is valid"))
 }
 
 #[test]
-fn configured_validator_sender_is_delivered() {
-    let epoch = Epoch(8);
-    let now = Instant::now();
+fn peer_map_authenticates_configured_validators() {
     let sender = node(1);
     let receiver = node(2);
-    let id = DkgMessageId::single(DkgMessageKey::PcAck {
-        dealer: PartyId(2),
-        signer: PartyId(1),
-    });
-    let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch, []);
-    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch, [sender, receiver]);
-    let outbound = sender_delivery
-        .schedule_reliable(id, [receiver], Bytes::from_static(b"pc-ack"), None, now)
-        .unwrap();
+    let peers = DkgPeerMap::<TestSig>::new_ordered(vec![sender, receiver]).unwrap();
 
-    let (_, payload) = unwrap_delivered(
-        receiver_delivery
-            .handle_network_message(sender, outbound[0].payload.clone())
-            .expect("payload delivered from configured validator"),
-    );
-    assert_eq!(payload, Bytes::from_static(b"pc-ack"));
+    assert_eq!(peers.party_id(&sender), Some(PartyId(0)));
+    assert_eq!(peers.party_id(&receiver), Some(PartyId(1)));
+    assert_eq!(peers.party_id(&node(3)), None);
+}
 
-    let rejected = DeliveryEngine::<TestSig>::new(epoch, [receiver]);
-    assert!(rejected
-        .handle_network_message(sender, outbound[0].payload.clone())
-        .is_none());
+#[test]
+fn delivery_envelope_round_trips() {
+    let encoded: Bytes = DeliveryEnvelope {
+        epoch: 8,
+        payload: Bytes::from_static(b"message"),
+    }
+    .into();
+
+    let decoded: DeliveryEnvelope = encoded.as_ref().try_into().unwrap();
+    assert_eq!(decoded.epoch, 8);
+    assert_eq!(decoded.payload, Bytes::from_static(b"message"));
 }
 
 #[test]
@@ -84,26 +73,6 @@ fn delivery_groups_use_typed_protocol_kind() {
         delivery_abort_group_for_peer_payload(DkgMessageKind::Ladder, dealer, peer),
         None
     );
-}
-
-#[test]
-fn send_once_does_not_schedule_a_retry() {
-    let epoch = Epoch(8);
-    let sender = node(1);
-    let receiver = node(2);
-    let sender_delivery = DeliveryEngine::<TestSig>::new(epoch, []);
-    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch, [sender]);
-
-    let outbound = sender_delivery.schedule_once(receiver, Bytes::from_static(b"response"));
-
-    assert_eq!(outbound.to, receiver);
-    assert!(sender_delivery.next_timer().is_none());
-    let (_, payload) = unwrap_delivered(
-        receiver_delivery
-            .handle_network_message(sender, outbound.payload)
-            .unwrap(),
-    );
-    assert_eq!(payload, Bytes::from_static(b"response"));
 }
 
 #[test]

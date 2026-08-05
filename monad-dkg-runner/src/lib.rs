@@ -19,13 +19,12 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod chain;
-mod manager;
 mod record;
 mod recovery;
 mod registration;
 mod reliable;
 mod runner;
-mod transport;
+mod session;
 mod wal;
 
 const MAX_RETAINED_DKG_SESSIONS: usize = 2;
@@ -35,9 +34,8 @@ const QC_KEY_DERIVATION: &str = "monad/dkg/qc-signing-key";
 #[cfg(test)]
 mod registration_tests;
 
-pub use chain::{new_triedb_manager, DkgChainConfig};
-pub use manager::{DkgManager, DkgManagerHandle, DkgManagerInbox};
-pub use transport::DeliveryOutbound;
+pub use chain::{new_triedb_runner, DkgChainConfig};
+pub use runner::{DeliveryOutbound, DkgRunner, DkgRunnerHandle, DkgRunnerInbox};
 
 #[derive(Debug, Error)]
 pub enum DkgError {

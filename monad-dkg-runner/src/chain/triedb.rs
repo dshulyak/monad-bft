@@ -15,7 +15,7 @@ use monad_types::{Epoch, NodeId, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use thiserror::Error;
 
-use crate::{DkgChainConfig, DkgError, DkgManager};
+use crate::{DkgChainConfig, DkgError, DkgRunner};
 
 use super::{
     triedb_state::TriedbDkgStateReader, BveQcPosted, ChainRead, ContractCodecError, DkgChain,
@@ -24,13 +24,13 @@ use super::{
 #[cfg(test)]
 use super::{ContractBveQc, ContractDkgResult, ContractPcQc};
 
-pub fn new_triedb_manager<ST, SCT>(
+pub fn new_triedb_runner<ST, SCT>(
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
     storage_root: PathBuf,
     chain_config: DkgChainConfig,
     state_read: ExecutionStateReadThreadClient<ST, SCT>,
     execution_delay: SeqNum,
-) -> Result<(DkgManager<ST>, flume::Receiver<TxEnvelope>), DkgError>
+) -> Result<(DkgRunner<ST>, flume::Receiver<TxEnvelope>), DkgError>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Send + Sync + 'static,
@@ -44,8 +44,8 @@ where
         contract: chain_config.contract,
         transactions,
     });
-    let manager = DkgManager::new(self_id, storage_root, chain_config, chain)?;
-    Ok((manager, transaction_rx))
+    let runner = DkgRunner::new(self_id, storage_root, chain_config, chain)?;
+    Ok((runner, transaction_rx))
 }
 
 struct TriedbDkgChain<ST, SCT>

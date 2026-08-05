@@ -24,7 +24,7 @@ mod submitter;
 mod triedb;
 mod triedb_state;
 
-pub use triedb::new_triedb_manager;
+pub use triedb::new_triedb_runner;
 
 pub(crate) use submitter::TxSubmitter;
 
@@ -387,9 +387,9 @@ pub(crate) struct DkgTransactionContext {
     pub base_fee_per_gas: u64,
 }
 
-/// The only boundary between the DKG manager and chain-specific I/O.
+/// The only boundary between the DKG runner and chain-specific I/O.
 ///
-/// The manager owns recovery timing, retry, ordering, and delivery into the
+/// The runner owns recovery timing, retry, ordering, and delivery into the
 /// protocol engine. Implementations only read a requested chain boundary or
 /// finalized block and submit transactions through the host node.
 pub(crate) trait DkgChain: Send + Sync + 'static {

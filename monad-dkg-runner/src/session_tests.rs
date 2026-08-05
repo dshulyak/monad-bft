@@ -1,10 +1,10 @@
 use dkg_core::{PartyId, RecordId, SessionId};
-use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
+use dkg_crypto::{BLS_G2_SERIALIZED_BYTES, BlsG2SerializedBytes};
 use dkg_protocol::{
     BveQc, ChainCall, ChainEvent, DkgDoneQc, DkgMessageId, DkgMessageKey, QcSignature,
     QcSignatureBytes, TAG_PC_ACK,
 };
-use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSignature};
+use monad_crypto::{NopKeyPair, NopSignature, certificate_signature::CertificateKeyPair};
 use monad_types::{Epoch, NodeId};
 use tempfile::TempDir;
 
@@ -32,21 +32,21 @@ fn retrieval_response_completes_its_request() {
 }
 
 #[test]
-fn runner_submits_chain_call_and_processes_finalized_event() {
+fn session_submits_chain_call_and_processes_finalized_event() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(11);
-    let (mut runner, wal_path) = test_runner(temp.path(), epoch);
+    let (mut session, wal_path) = test_session(temp.path(), epoch);
 
     let qc = DkgDoneQc {
         epoch: SessionId(epoch.0),
         g2x: BlsG2SerializedBytes([0x44; BLS_G2_SERIALIZED_BYTES]),
         signatures: vec![sig(0), sig(1), sig(2)],
     };
-    runner
+    session
         .handle_chain_call(ChainCall::PostDkgResult { qc: qc.clone() })
         .unwrap();
     assert_eq!(
-        runner.take_chain_calls(),
+        session.take_chain_calls(),
         vec![ChainCall::PostDkgResult { qc: qc.clone() }]
     );
     let wal_len = std::fs::metadata(&wal_path).unwrap().len();
@@ -55,13 +55,13 @@ fn runner_submits_chain_call_and_processes_finalized_event() {
         record_id: RecordId(77),
         qc,
     };
-    runner.handle_chain_event(event.clone()).unwrap();
+    session.handle_chain_event(event.clone()).unwrap();
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
-    assert!(runner.pending_inputs.is_empty());
+    assert!(session.pending_inputs.is_empty());
 
-    let pending_before = runner.pending_inputs.len();
+    let pending_before = session.pending_inputs.len();
     for dealer in 0..3 {
-        runner
+        session
             .pending_inputs
             .push_back(PendingEngineInput::Chain(ChainEvent::BveQcFinalized {
                 record_id: RecordId(100 + u64::from(dealer)),
@@ -73,11 +73,11 @@ fn runner_submits_chain_call_and_processes_finalized_event() {
                 },
             }));
     }
-    assert_eq!(runner.pending_inputs.len(), pending_before + 3);
+    assert_eq!(session.pending_inputs.len(), pending_before + 3);
 }
 
 #[test]
-fn runner_refuses_one_and_two_validator_sets() {
+fn session_refuses_one_and_two_validator_sets() {
     for count in [1, 2] {
         let temp = TempDir::new().unwrap();
         let validators = test_validators(count);
@@ -105,42 +105,26 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(19);
     let validators = test_validators(4);
-    let (mut runner, wal_path) = test_runner(temp.path(), epoch);
+    let (mut session, wal_path) = test_session(temp.path(), epoch);
     let sender = validators[1];
-    let self_id = validators[0];
-    let self_party = runner.self_party;
-    let sender_party = runner.mapping.party_id(&sender).unwrap();
-
-    let message_id = DkgMessageId::single(DkgMessageKey::PcAck {
-        dealer: self_party,
-        signer: sender_party,
-    });
     let mut invalid_ack = vec![TAG_PC_ACK];
     invalid_ack.extend_from_slice(&[0; 96]);
-    let mut sender_delivery = DeliveryEngine::<NopSignature>::new(epoch, []);
-    let wire = sender_delivery
-        .schedule_reliable(
-            message_id,
-            [self_id],
-            invalid_ack.into(),
-            None,
-            Instant::now(),
-        )
-        .unwrap()
-        .pop()
-        .unwrap()
-        .payload;
+    let payload = Bytes::from(invalid_ack);
 
     for _ in 0..2 {
-        runner.handle_network_message(sender, wire.clone()).unwrap();
+        session
+            .handle_network_message(sender, payload.clone())
+            .unwrap();
     }
 
     assert!(RecoveryState::load(&wal_path).unwrap().incoming.is_empty());
-    assert!(runner.delivery_outbound.is_empty());
-    assert!(sender_delivery.next_timer().is_some());
+    assert!(session.delivery_outbound.is_empty());
 }
 
-fn test_runner(root: &std::path::Path, epoch: Epoch) -> (Runner<NopSignature>, std::path::PathBuf) {
+fn test_session(
+    root: &std::path::Path,
+    epoch: Epoch,
+) -> (DkgSession<NopSignature>, std::path::PathBuf) {
     let validators = test_validators(4);
     let mapping = DkgPeerMap::<NopSignature>::new_ordered(validators.clone()).unwrap();
     let self_party = mapping.party_id(&validators[0]).unwrap();
@@ -156,7 +140,7 @@ fn test_runner(root: &std::path::Path, epoch: Epoch) -> (Runner<NopSignature>, s
     let wal_path = wal.path().to_path_buf();
     let mut recovery = RecoveryState::default();
     let engine_seed = recovery.load_or_create_engine_seed(&mut wal).unwrap();
-    let mut runner = Runner::new(RunnerInit {
+    let mut session = DkgSession::new(SessionInit {
         epoch,
         self_party,
         mapping,
@@ -166,10 +150,10 @@ fn test_runner(root: &std::path::Path, epoch: Epoch) -> (Runner<NopSignature>, s
         recovery_state: recovery,
     })
     .unwrap();
-    runner.finish_chain_recovery().unwrap();
-    runner.take_chain_calls();
-    runner.take_delivery_outbound();
-    (runner, wal_path)
+    session.finish_chain_recovery().unwrap();
+    session.take_chain_calls();
+    session.take_delivery_outbound();
+    (session, wal_path)
 }
 
 fn test_validators(count: u8) -> Vec<NodeId<CertificateSignaturePubKey<NopSignature>>> {

@@ -15,21 +15,19 @@ flowchart LR
     B[Finalized chain]
 
     subgraph A[Single DKG actor task]
-        M[DKG manager]
-        D[Protocol runner]
-        N[Delivery engine]
+        M[DKG runner]
+        D[Epoch session]
+        N[Retry scheduler]
         C[Chain coordinator]
         W[(Epoch WAL)]
-        M --> D
-        M --> N
-        M --> C
+        M <--> D
+        M <--> C
         D <--> N
         D <--> W
     end
 
-    H --> M
+    H <--> M
     P --> H
-    N --> H
     H --> P
     C --> T
     C <--> B
@@ -37,17 +35,17 @@ flowchart LR
 
 | Component | Responsibility | Implementation |
 | --- | --- | --- |
-| DKG manager | Owns all mutable DKG state and serializes host events, chain I/O completions, protocol effects, and retry timers in one task. It does not spawn helper tasks or threads. | [`manager.rs`](monad-dkg-runner/src/manager.rs) |
-| Protocol runner | Adapts registered parties to the research engine, validates peer input, translates typed effects, and reports the final secret share and public result. | [`runner.rs`](monad-dkg-runner/src/protocol/runner.rs), [`engine.rs`](monad-dkg-runner/src/protocol/engine.rs) |
-| Delivery engine | Retries per recipient with jittered linear backoff. Application responses stop delivery when available; `TransportAck` is used only for one-way messages. | [`transport.rs`](monad-dkg-runner/src/transport.rs), [`message.rs`](../../category-research-internal/etx-dkg/crates/dkg-protocol/src/message.rs) |
+| DKG runner | Owns all mutable DKG state, routes epoch-framed peer messages, and serializes host events, chain I/O, session effects, and retry timers in one task. It does not spawn helper tasks or threads. | [`runner.rs`](monad-dkg-runner/src/runner.rs) |
+| Epoch session | Adapts registered parties to the research engine, authenticates peer input, translates typed effects, owns retry state, and reports chain calls. | [`session.rs`](monad-dkg-runner/src/session.rs) |
+| Retry scheduler | Retries each recipient with jittered linear backoff until a matching response or protocol evidence makes the message obsolete. | [`reliable/mod.rs`](monad-dkg-runner/src/reliable/mod.rs), [`session.rs`](monad-dkg-runner/src/session.rs) |
 | Chain coordinator | Reads finalized registration and protocol state, orders contract records, and retries one signed transaction at a time until matching finalized state appears. | [`chain`](monad-dkg-runner/src/chain/mod.rs), [`recovery.rs`](monad-dkg-runner/src/chain/recovery.rs), [`submitter.rs`](monad-dkg-runner/src/chain/submitter.rs) |
-| Recovery storage | Owns one epoch WAL containing the deterministic seed, exact registration, accepted durable ingress, exact durable egress, and recipient completions. | [`message_store.rs`](monad-dkg-runner/src/storage/message_store.rs), [`record.rs`](monad-dkg-runner/src/storage/record.rs), [`wal.rs`](monad-dkg-runner/src/storage/wal.rs) |
+| Recovery storage | Owns one epoch WAL containing the deterministic seed, exact registration, accepted durable ingress, and exact durable egress. | [`recovery.rs`](monad-dkg-runner/src/recovery.rs), [`record.rs`](monad-dkg-runner/src/record.rs), [`wal.rs`](monad-dkg-runner/src/wal.rs) |
 | Production chain adapter | Implements `DkgChain` with local Triedb state reads, bloom-filtered receipt reads, finalized nonces, and a local transaction channel. | [`triedb.rs`](monad-dkg-runner/src/chain/triedb.rs), [`triedb_state.rs`](monad-dkg-runner/src/chain/triedb_state.rs) |
 
 The `DkgChain` trait is the only chain-specific boundary. Chain calls execute
-synchronously on the DKG manager task. See
+synchronously on the DKG runner task. See
 [`chain/mod.rs`](monad-dkg-runner/src/chain/mod.rs) and
-[`manager.rs`](monad-dkg-runner/src/manager.rs).
+[`runner.rs`](monad-dkg-runner/src/runner.rs).
 
 ## Normal Flow
 
@@ -89,14 +87,14 @@ sequenceDiagram
 Details:
 
 - `monad-node` forwards finalized blocks, validator sets, sync completion, and
-  authenticated peer messages through `DkgManagerHandle`. It receives only
+  authenticated peer messages through `DkgRunnerHandle`. It receives only
   network output and locally signed transactions. See
-  [`manager.rs`](monad-dkg-runner/src/manager.rs) and
+  [`runner.rs`](monad-dkg-runner/src/runner.rs) and
   [`main.rs`](monad-node/src/main.rs).
 - Registration starts during the epoch before the target validator set is
-  locked. At the boundary, the manager reads all contract registrations and
+  locked. At the boundary, the runner reads all contract registrations and
   intersects them with the finalized validator set. See
-  [`manager.rs`](monad-dkg-runner/src/manager.rs) and
+  [`runner.rs`](monad-dkg-runner/src/runner.rs) and
   [`registration.rs`](monad-dkg-runner/src/registration.rs).
 - Validator sets still come from the existing staking-state updater. See
   [`triedb_val_set.rs`](monad-updaters/src/triedb_val_set.rs) and
@@ -124,24 +122,21 @@ Details:
 ```mermaid
 sequenceDiagram
     participant E as Research engine
-    participant R as DKG runner
+    participant S as Epoch session
     participant W as Epoch WAL
     participant P as Peer
 
-    E->>R: Emit typed message
-    R->>W: Persist exact durable bytes
+    E->>S: Emit typed message
+    S->>W: Persist exact durable bytes
     loop Completion evidence absent
-        R->>P: Send with authenticated transport
+        S->>P: Send through authenticated peer channel
     end
-    alt Protocol response exists
-        P-->>R: Signed response or retrieval response
-        R->>E: Validate response
-        R->>W: Persist recipient completion
-    else One way message
-        P-->>R: TransportAck
-        R->>W: Persist recipient completion
-    else Phase finalized
-        R->>R: Abort obsolete delivery group
+    alt Matching retrieval response is accepted
+        P-->>S: Retrieval response
+        S->>E: Validate and consume response
+        S->>S: Complete request retry
+    else Protocol or finalized chain evidence arrives
+        S->>S: Abort obsolete delivery group
     end
 ```
 
@@ -150,15 +145,17 @@ Details:
 - The research crate returns typed `DkgMessage` values backed by `Bytes` and
   derives and encodes semantic `DkgMessageId` values from protocol fields. See
   [`message.rs`](../../category-research-internal/etx-dkg/crates/dkg-protocol/src/message.rs).
-- Incoming data is decoded and validated by the runner before it is persisted
-  or acknowledged. Rejected input produces neither a WAL record nor an ACK. See
-  [`runner.rs`](monad-dkg-runner/src/protocol/runner.rs).
-- A semantic message occupies one store slot. Restart reuses persisted bytes;
-  conflicting regenerated bytes are logged and suppressed. Retrieval requests
-  are ephemeral and can be regenerated. See
-  [`message_store.rs`](monad-dkg-runner/src/storage/message_store.rs).
-- Retry delay grows linearly from 2 to 30 seconds and adds randomness from
-  `rand`. See [`transport.rs`](monad-dkg-runner/src/transport.rs).
+- Incoming data is decoded and accepted by the engine before it is persisted.
+  Duplicate or rejected input produces no WAL record. See
+  [`session.rs`](monad-dkg-runner/src/session.rs).
+- A semantic message occupies one scheduler slot, and conflicting reuse of its
+  ID is rejected. Durable protocol output is restored from the WAL. Retrieval
+  requests are regenerated after a crash, while responses are sent once and
+  recreated by the requester's next retry. See
+  [`session.rs`](monad-dkg-runner/src/session.rs) and
+  [`recovery.rs`](monad-dkg-runner/src/recovery.rs).
+- Retry delay grows linearly from 2 to 30 seconds with bounded jitter. See
+  [`reliable/mod.rs`](monad-dkg-runner/src/reliable/mod.rs).
 
 ## Chain And Txpool
 
@@ -234,13 +231,13 @@ Details:
 
 - Chain events and scan cursors are not persisted. Finalized contract state is
   read once at the sync watermark, then each later finalized block is scanned
-  exactly once by the manager cursor. See
+  exactly once by the runner cursor. See
   [`recovery.rs`](monad-dkg-runner/src/chain/recovery.rs).
 - The WAL is `dkg-recovery-<epoch>.wal`. It uses checksummed typed records,
   Linux `fallocate`, flush-before-send ordering, and torn-tail truncation. It is
-  owned only by `DkgMessageStore`; there is no separate completed-output file.
-  See [`record.rs`](monad-dkg-runner/src/storage/record.rs) and
-  [`wal.rs`](monad-dkg-runner/src/storage/wal.rs).
+  owned only by `RecoveryWal`; there is no separate completed-output file.
+  See [`record.rs`](monad-dkg-runner/src/record.rs) and
+  [`wal.rs`](monad-dkg-runner/src/wal.rs).
 - The chain restores public QCs and final result. The WAL restores the local
   deterministic transcript required to reconstruct the private share. See
-  [`runner.rs`](monad-dkg-runner/src/protocol/runner.rs).
+  [`session.rs`](monad-dkg-runner/src/session.rs).

@@ -6,16 +6,16 @@ use std::{
 };
 
 use dkg_core::{Record, RecordId};
-use dkg_protocol::{chain::adapter, ChainCall, ChainEvent, DkgEnginePhase};
+use dkg_protocol::{ChainCall, ChainEvent, DkgEnginePhase, chain::adapter};
 use monad_crypto::{
-    certificate_signature::{CertificateKeyPair, CertificateSignaturePubKey},
     NopKeyPair, NopSignature,
+    certificate_signature::{CertificateKeyPair, CertificateSignaturePubKey},
 };
 use monad_types::{Epoch, NodeId};
 use proptest::prelude::*;
 
 use super::*;
-use crate::{test_registered_key_material, DeliveryOutbound};
+use crate::{DeliveryOutbound, test_registered_key_material};
 
 const NODE_COUNT: usize = 4;
 const TEST_EPOCH: Epoch = Epoch(12);
@@ -45,7 +45,7 @@ enum ChainInput {
 }
 
 struct NodeRuntime {
-    runner: Runner<NopSignature>,
+    session: DkgSession<NopSignature>,
 }
 
 struct ModelNode {
@@ -82,7 +82,7 @@ impl ContractModel {
             bytes,
         };
         let event = adapter::decode_record(&record, NODE_COUNT)
-            .expect("runner emitted a decodable contract record");
+            .expect("session emitted a decodable contract record");
         self.events.push(event.clone());
         Some(event)
     }
@@ -179,12 +179,12 @@ impl FourNodeRecoveryModel {
             };
             self.network.extend(
                 runtime
-                    .runner
+                    .session
                     .take_delivery_outbound()
                     .into_iter()
                     .map(|outbound| NetworkMessage { source, outbound }),
             );
-            for call in runtime.runner.take_chain_calls() {
+            for call in runtime.session.take_chain_calls() {
                 let Some(event) = self.chain.post(call) else {
                     continue;
                 };
@@ -202,7 +202,7 @@ impl FourNodeRecoveryModel {
             let Some(runtime) = &mut node.runtime else {
                 continue;
             };
-            runtime.runner.handle_timer(self.now).unwrap();
+            runtime.session.handle_timer(self.now).unwrap();
         }
     }
 
@@ -212,9 +212,10 @@ impl FourNodeRecoveryModel {
             let Some(runtime) = &mut self.nodes[target].runtime else {
                 continue;
             };
+            let envelope: DeliveryEnvelope = message.outbound.payload.as_ref().try_into().unwrap();
             runtime
-                .runner
-                .handle_network_message(self.validators[message.source], message.outbound.payload)
+                .session
+                .handle_network_message(self.validators[message.source], envelope.payload)
                 .unwrap();
         }
     }
@@ -225,8 +226,8 @@ impl FourNodeRecoveryModel {
                 continue;
             };
             match message.input {
-                ChainInput::Event(event) => runtime.runner.handle_chain_event(*event).unwrap(),
-                ChainInput::RecoveryComplete => runtime.runner.finish_chain_recovery().unwrap(),
+                ChainInput::Event(event) => runtime.session.handle_chain_event(*event).unwrap(),
+                ChainInput::RecoveryComplete => runtime.session.finish_chain_recovery().unwrap(),
             }
         }
     }
@@ -274,7 +275,7 @@ impl FourNodeRecoveryModel {
             .map(|node| {
                 node.runtime
                     .as_ref()
-                    .map(|runtime| runtime.runner.engine.phase())
+                    .map(|runtime| runtime.session.engine.phase())
             })
             .collect::<Vec<_>>();
         panic!(
@@ -302,7 +303,7 @@ impl FourNodeRecoveryModel {
         self.chain.has_result()
             && self.nodes.iter().all(|node| {
                 node.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.runner.engine.phase() == DkgEnginePhase::Complete
+                    runtime.session.engine.phase() == DkgEnginePhase::Complete
                 })
             })
     }
@@ -380,7 +381,7 @@ fn fourth_node_recovers_after_other_nodes_finish() {
         if model.chain.has_result()
             && model.nodes[1..].iter().all(|node| {
                 node.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.runner.engine.phase() == DkgEnginePhase::Complete
+                    runtime.session.engine.phase() == DkgEnginePhase::Complete
                 })
             })
         {
@@ -426,7 +427,7 @@ fn start_runtime(
     let engine_seed = recovery_state
         .load_or_create_engine_seed(&mut recovery_wal)
         .unwrap();
-    let runner = Runner::new(RunnerInit {
+    let session = DkgSession::new(SessionInit {
         epoch: TEST_EPOCH,
         self_party,
         mapping,
@@ -436,7 +437,7 @@ fn start_runtime(
         recovery_state,
     })
     .unwrap();
-    NodeRuntime { runner }
+    NodeRuntime { session }
 }
 
 fn test_validators(count: u8) -> Vec<NodeId<CertificateSignaturePubKey<NopSignature>>> {

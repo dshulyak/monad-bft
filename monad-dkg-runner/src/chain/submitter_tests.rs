@@ -304,8 +304,7 @@ fn overlapping_session_accepts_late_calls_from_previous_epoch() {
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let expected = service
-        .reliable
-        .strategy()
+        .submission
         .config
         .calldata(Epoch(2), &previous, service.signer_address())
         .unwrap();
@@ -327,8 +326,7 @@ fn third_session_evicts_oldest_epoch_and_rejects_its_late_calls() {
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let expected = service
-        .reliable
-        .strategy()
+        .submission
         .config
         .calldata(Epoch(4), &current, service.signer_address())
         .unwrap();

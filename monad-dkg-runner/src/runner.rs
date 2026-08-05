@@ -1,831 +1,1123 @@
-//! Per-epoch DKG protocol runtime.
+use std::{collections::BTreeMap, mem, path::PathBuf, sync::Arc, time::Instant};
 
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    mem,
-    time::Instant,
-};
-
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
-use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, SessionId};
-use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
-use dkg_protocol::{
-    ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase, DkgInput,
-    DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessageKind, DkgSetupContext,
-    DkgSetupError, DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
-};
+use dkg_protocol::RegistrationCall;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_types::{Epoch, NodeId};
-use thiserror::Error;
-use tracing::{debug, info, warn};
+use monad_types::{Epoch, NodeId, SeqNum};
+use tracing::{debug, error, warn};
 
 use crate::{
-    chain::chain_event_kind,
-    record::{EngineSeed, IncomingRecord, OutgoingRecord, RecoveryRecord},
-    recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
-    reliable::EnqueueError,
-    transport::{
-        delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
-        DeliveryOutbound,
-    },
-    DkgError, DkgRegisteredKeyMaterial,
+    DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
+    chain::{ChainEventBatch, ChainEventReader, ChainEventSession, DkgChain, TxSubmitter},
+    registration::{assemble_registered_session, load_or_create_local_registration},
+    reliable::ScheduledSend,
+    session::{DkgSession, start},
 };
 
-struct DkgPeerMap<ST: CertificateSignatureRecoverable> {
-    by_member: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, PartyId>,
-    members: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+pub struct DeliveryOutbound<ST: CertificateSignatureRecoverable> {
+    pub to: NodeId<CertificateSignaturePubKey<ST>>,
+    pub payload: Bytes,
 }
 
-impl<ST: CertificateSignatureRecoverable> DkgPeerMap<ST> {
-    fn new_ordered(
-        members: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
-    ) -> Result<Self, NodeId<CertificateSignaturePubKey<ST>>> {
-        let mut by_member = BTreeMap::new();
-        for (index, member) in members.iter().copied().enumerate() {
-            let party = PartyId(u32::try_from(index).expect("validator count fits in u32"));
-            if by_member.insert(member, party).is_some() {
-                return Err(member);
-            }
-        }
-        Ok(Self { by_member, members })
-    }
-
-    fn party_id(&self, member: &NodeId<CertificateSignaturePubKey<ST>>) -> Option<PartyId> {
-        self.by_member.get(member).copied()
-    }
-
-    fn member_id(&self, party: PartyId) -> Option<NodeId<CertificateSignaturePubKey<ST>>> {
-        self.members.get(party.0 as usize).copied()
-    }
-
-    fn parties(&self) -> Vec<PartyId> {
-        (0..self.members.len())
-            .map(|party| PartyId(party as u32))
-            .collect()
-    }
-
-    fn len(&self) -> usize {
-        self.members.len()
-    }
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum RunnerError {
-    #[error("derive DKG thresholds failed: {0}")]
-    Threshold(#[source] DkgThresholdError),
-    #[error("build DKG party set failed: {0}")]
-    PartySet(#[source] PartySetError),
-    #[error("build DKG topology failed: {0}")]
-    Topology(#[source] VirtualTopologyError),
-    #[error("assemble DKG setup failed: {0}")]
-    Setup(#[source] DkgSetupError),
-    #[error("initialize research DKG engine failed: {0:?}")]
-    EngineInitialization(DkgEngineError),
-    #[error("shape DKG receiver public matrix failed: {0}")]
-    ReceiverMatrix(#[source] MatrixShapeError),
-    #[error(transparent)]
-    RecoveryWal(#[from] RecoveryWalError),
-    #[error("classify DKG message failed: {0}")]
-    Message(#[from] DkgMessageError),
-    #[error("research DKG engine {action} failed: {error:?}")]
-    Engine {
-        action: &'static str,
-        error: DkgEngineError,
-    },
-    #[error("cannot {action} DKG delivery for unknown party {party}")]
-    UnknownParty { action: &'static str, party: u32 },
-    #[error("DKG sync messages must be unicast")]
-    SyncMustBeUnicast,
-    #[error("conflicting DKG reliable delivery")]
-    ReliableDelivery(#[from] EnqueueError),
-}
-
-pub(crate) fn start<ST>(
-    epoch: Epoch,
-    self_id: NodeId<CertificateSignaturePubKey<ST>>,
-    validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
-    storage_root: &std::path::Path,
-    key_material: DkgRegisteredKeyMaterial,
-) -> Result<Option<Runner<ST>>, DkgError>
-where
-    ST: CertificateSignatureRecoverable + Send + Sync + 'static,
+impl<ST: CertificateSignatureRecoverable>
+    From<ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>> for DeliveryOutbound<ST>
 {
-    let mapping =
-        DkgPeerMap::<ST>::new_ordered(validators).map_err(|_| DkgError::DuplicateValidator)?;
-    let Some(self_party) = mapping.party_id(&self_id) else {
-        info!(?self_id, "not starting DKG runner for non-validator node");
-        return Ok(None);
-    };
+    fn from(send: ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>) -> Self {
+        Self {
+            to: send.to,
+            payload: send.payload,
+        }
+    }
+}
 
-    if mapping.len() < 4 {
-        return Err(DkgError::InsufficientValidators {
-            actual: mapping.len(),
-            minimum: 4,
+#[derive(RlpEncodable, RlpDecodable)]
+pub(crate) struct DeliveryEnvelope {
+    pub(crate) epoch: u64,
+    pub(crate) payload: Bytes,
+}
+
+impl From<DeliveryEnvelope> for Bytes {
+    fn from(wire: DeliveryEnvelope) -> Self {
+        alloy_rlp::encode(wire).into()
+    }
+}
+
+impl TryFrom<&[u8]> for DeliveryEnvelope {
+    type Error = alloy_rlp::Error;
+
+    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        alloy_rlp::decode_exact(data)
+    }
+}
+
+struct ManagedChain {
+    io: Arc<dyn DkgChain>,
+    local_keys: DkgLocalKeyMaterial,
+    submitter: TxSubmitter,
+    event_reader: ChainEventReader,
+    registration: LocalRegistration,
+}
+
+struct LocalRegistration {
+    address: alloy_primitives::Address,
+    epoch: Option<Epoch>,
+    unavailable_block: Option<SeqNum>,
+    phase: LocalRegistrationPhase,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocalRegistrationPhase {
+    Open,
+    Submitted,
+    Done,
+}
+
+impl LocalRegistration {
+    fn new(address: alloy_primitives::Address) -> Self {
+        Self {
+            address,
+            epoch: None,
+            unavailable_block: None,
+            phase: LocalRegistrationPhase::Done,
+        }
+    }
+
+    fn start_epoch(&mut self, epoch: Epoch) {
+        self.epoch = Some(epoch);
+        self.unavailable_block = None;
+        self.phase = LocalRegistrationPhase::Open;
+    }
+}
+
+struct PendingRegisteredSession<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    validators: Vec<DkgValidator<ST>>,
+    registration_block: Option<SeqNum>,
+}
+
+enum DkgRunnerEvent<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    ChainProgress {
+        block: SeqNum,
+        next_epoch: Epoch,
+        sync_complete: bool,
+    },
+    StartSession {
+        epoch: Epoch,
+        validators: Vec<DkgValidator<ST>>,
+    },
+    Network {
+        sender: NodeId<CertificateSignaturePubKey<ST>>,
+        message: Bytes,
+    },
+}
+
+pub struct DkgRunnerInbox<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    events: flume::Receiver<DkgRunnerEvent<ST>>,
+}
+
+#[derive(Clone)]
+pub struct DkgRunnerHandle<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    events: Option<flume::Sender<DkgRunnerEvent<ST>>>,
+}
+
+impl<ST> DkgRunnerHandle<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    pub fn channel() -> (Self, DkgRunnerInbox<ST>) {
+        let (events, receiver) = flume::unbounded();
+        (
+            Self {
+                events: Some(events),
+            },
+            DkgRunnerInbox { events: receiver },
+        )
+    }
+
+    pub fn disabled() -> Self {
+        Self { events: None }
+    }
+
+    fn send(&self, event: DkgRunnerEvent<ST>) {
+        if self
+            .events
+            .as_ref()
+            .is_some_and(|events| events.send(event).is_err())
+        {
+            warn!("DKG runner input channel closed");
+        }
+    }
+
+    pub fn finalized(&self, block: SeqNum, epoch_length: SeqNum) {
+        self.chain_progress(block, epoch_length, false);
+    }
+
+    pub fn sync_complete(&self, block: SeqNum, epoch_length: SeqNum) {
+        self.chain_progress(block, epoch_length, true);
+    }
+
+    fn chain_progress(&self, block: SeqNum, epoch_length: SeqNum, sync_complete: bool) {
+        self.send(DkgRunnerEvent::ChainProgress {
+            block,
+            next_epoch: block.to_epoch(epoch_length) + Epoch(1),
+            sync_complete,
         });
     }
-    let (mut recovery_wal, mut recovery_state) =
-        RecoveryWal::open(storage_root, epoch, RecoveryWalConfig::default())
-            .map_err(|err| DkgError::operation("open DKG recovery WAL", err))?;
-    let engine_seed = recovery_state
-        .load_or_create_engine_seed(&mut recovery_wal)
-        .map_err(|err| DkgError::operation("persist DKG engine seed", err))?;
-    failpoint::failpoint!(
-        name = "dkg.session.seed_persisted",
-        description = "after the DKG engine seed is durable and before runner construction",
-    );
-    let runner = Runner::new(RunnerInit {
-        epoch,
-        self_party,
-        mapping,
-        engine_seed,
-        key_material,
-        recovery_wal,
-        recovery_state,
-    })
-    .map_err(|err| DkgError::operation("initialize DKG runner", err))?;
-    Ok(Some(runner))
+
+    pub fn start_session(&self, epoch: Epoch, validators: Vec<DkgValidator<ST>>) {
+        self.send(DkgRunnerEvent::StartSession { epoch, validators });
+    }
+
+    pub fn network(&self, sender: NodeId<CertificateSignaturePubKey<ST>>, message: Bytes) {
+        self.send(DkgRunnerEvent::Network { sender, message });
+    }
 }
 
-struct RunnerInit<ST>
-where
-    ST: CertificateSignatureRecoverable,
-{
-    epoch: Epoch,
-    self_party: PartyId,
-    mapping: DkgPeerMap<ST>,
-    engine_seed: EngineSeed,
-    key_material: DkgRegisteredKeyMaterial,
-    recovery_wal: RecoveryWal,
-    recovery_state: RecoveryState,
-}
-
-pub(crate) struct Runner<ST>
-where
-    ST: CertificateSignatureRecoverable,
-{
-    engine: DkgEngine<BlstBackend, K256SecpBackend>,
-    epoch: Epoch,
-    self_party: PartyId,
-    party_count: usize,
-    max_ladder_level: u64,
-    mapping: DkgPeerMap<ST>,
-    delivery: DeliveryEngine<ST>,
-    delivery_outbound: Vec<DeliveryOutbound<ST>>,
-    chain_calls: Vec<ChainCall>,
-    pending_inputs: VecDeque<PendingEngineInput>,
-    recovery_wal: RecoveryWal,
-    recovered_outgoing: Vec<OutgoingRecord>,
-    last_phase: DkgEnginePhase,
-    awaiting_chain_recovery: bool,
-}
-
-enum PendingEngineInput {
-    Peer(PendingPeerInput),
-    Chain(ChainEvent),
-}
-
-struct PendingPeerInput {
-    input: CoreInput<DkgMessage>,
-    durable: Option<IncomingRecord>,
-}
-
-impl<ST> Runner<ST>
+pub struct DkgRunner<ST>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
-    pub(crate) fn next_timer(&self) -> Option<Instant> {
-        self.delivery.next_timer()
+    self_id: NodeId<CertificateSignaturePubKey<ST>>,
+    storage_root: PathBuf,
+    pending_outbound: Vec<DeliveryOutbound<ST>>,
+    sessions: BTreeMap<Epoch, DkgSession<ST>>,
+    latest_started_epoch: Option<Epoch>,
+    pending_registered_session: Option<(Epoch, PendingRegisteredSession<ST>)>,
+    chain_session: Option<(Epoch, usize)>,
+    sync_block: Option<SeqNum>,
+    latest_finalized: Option<SeqNum>,
+    chain: ManagedChain,
+}
+
+impl<ST> DkgRunner<ST>
+where
+    ST: CertificateSignatureRecoverable + Send + Sync + 'static,
+{
+    pub(crate) fn new(
+        self_id: NodeId<CertificateSignaturePubKey<ST>>,
+        storage_root: PathBuf,
+        config: DkgChainConfig,
+        chain: Arc<dyn DkgChain>,
+    ) -> Result<Self, DkgError> {
+        let submitter = TxSubmitter::new(&config, Arc::clone(&chain))?;
+        let registration = LocalRegistration::new(submitter.signer_address());
+        Ok(Self {
+            self_id,
+            storage_root,
+            pending_outbound: Vec::new(),
+            sessions: BTreeMap::new(),
+            latest_started_epoch: None,
+            pending_registered_session: None,
+            chain_session: None,
+            sync_block: None,
+            latest_finalized: None,
+            chain: ManagedChain {
+                io: chain,
+                local_keys: config.local_keys.clone(),
+                submitter,
+                event_reader: ChainEventReader::default(),
+                registration,
+            },
+        })
     }
 
-    pub(crate) fn take_delivery_outbound(&mut self) -> Vec<DeliveryOutbound<ST>> {
-        mem::take(&mut self.delivery_outbound)
+    pub async fn run(
+        mut self,
+        inbox: DkgRunnerInbox<ST>,
+        outbound: flume::Sender<DeliveryOutbound<ST>>,
+    ) -> Result<(), DkgError> {
+        let events = inbox.events;
+        loop {
+            let timer = self.next_timer();
+            tokio::select! {
+                event = events.recv_async() => match event {
+                    Ok(DkgRunnerEvent::ChainProgress { block, next_epoch, sync_complete }) => {
+                        self.prepare_registration(next_epoch);
+                        if sync_complete {
+                            self.notify_sync_complete(block);
+                        } else {
+                            self.notify_finalized(block);
+                        }
+                    }
+                    Ok(DkgRunnerEvent::StartSession { epoch, validators }) => {
+                        if let Err(err) = self.start_chain_registered_session(epoch, validators) {
+                            warn!(?err, epoch = epoch.0, "failed to start DKG session");
+                        }
+                    }
+                    Ok(DkgRunnerEvent::Network { sender, message }) => {
+                        self.handle_network_message(sender, message)
+                    }
+                    Err(_) => return Ok(()),
+                },
+                () = wait_for_timer(timer) => self.handle_timer(Instant::now()),
+            }
+            for message in self.take_outbound() {
+                outbound
+                    .send_async(message)
+                    .await
+                    .map_err(|_| DkgError::ChannelClosed("sending DKG network output"))?;
+            }
+        }
     }
 
-    pub(crate) fn take_chain_calls(&mut self) -> Vec<ChainCall> {
-        mem::take(&mut self.chain_calls)
+    /// Opens local registration for the next validator epoch.
+    ///
+    /// Calls are monotone and idempotent. Advancing the target abandons any
+    /// unfinalized registration transaction for the older epoch.
+    pub fn prepare_registration(&mut self, epoch: Epoch) {
+        if self
+            .chain
+            .registration
+            .epoch
+            .is_some_and(|current| current >= epoch)
+        {
+            return;
+        }
+        if let Some(previous) = self.chain.registration.epoch {
+            self.chain.submitter.cancel_registration(previous);
+        }
+        self.chain.registration.start_epoch(epoch);
+        self.schedule_local_registration_read();
     }
 
-    fn new(init: RunnerInit<ST>) -> Result<Self, RunnerError> {
-        let party_count = init.mapping.len();
-        let delivery = DeliveryEngine::new(init.epoch, init.mapping.members.iter().copied());
-        let params = DkgEngineParams::default();
-        let output_count = params.output_count;
-        let engine = build_engine(
-            init.epoch,
-            init.self_party,
-            init.key_material,
-            params,
-            init.engine_seed,
-        )?;
-        let max_ladder_level = output_count.trailing_zeros().into();
-        let initial_phase = engine.phase();
-        let RecoveryState {
-            outgoing: recovered_outgoing,
-            incoming: recovered_incoming,
-            ..
-        } = init.recovery_state;
-        info!(
-            epoch = init.epoch.0,
-            party = init.self_party.0,
-            party_count = init.mapping.len(),
-            output_count,
-            phase = ?initial_phase,
-            "initialized DKG runner"
-        );
+    /// Makes one more finalized block available to the active chain cursor.
+    /// This never establishes or changes the recovery snapshot boundary.
+    pub fn notify_finalized(&mut self, block: SeqNum) {
+        if self.record_finalized_head(block) {
+            self.schedule_pending_registration_reads();
+            self.schedule_local_registration_read();
+        }
+        self.chain.event_reader.notify_finalized(block);
+        self.schedule_chain_read();
+    }
 
-        let mut runner = Self {
-            engine,
-            epoch: init.epoch,
-            self_party: init.self_party,
-            party_count,
-            max_ladder_level,
-            mapping: init.mapping,
-            delivery,
-            delivery_outbound: Vec::new(),
-            chain_calls: Vec::new(),
-            pending_inputs: VecDeque::new(),
-            recovery_wal: init.recovery_wal,
-            recovered_outgoing,
-            last_phase: initial_phase,
-            awaiting_chain_recovery: true,
+    /// Establishes the exact chain-state boundary used for DKG recovery.
+    ///
+    /// Once a DKG session is known, the runner reads a snapshot at `block`
+    /// and then scans every subsequently finalized block in order.
+    pub fn notify_sync_complete(&mut self, block: SeqNum) {
+        if self.sync_block.is_some_and(|current| current >= block) {
+            return;
+        }
+        self.sync_block = Some(block);
+        self.record_finalized_head(block);
+        self.chain.event_reader.notify_finalized(block);
+        if let Some((epoch, party_count)) = self.chain_session {
+            self.chain.submitter.start_session(epoch);
+            self.chain.event_reader.start_session(ChainEventSession {
+                epoch,
+                party_count,
+                recovery_block: block,
+            });
+        }
+        self.schedule_chain_read();
+        self.schedule_pending_registration_reads();
+        self.schedule_local_registration_read();
+    }
+
+    fn record_finalized_head(&mut self, block: SeqNum) -> bool {
+        if self.latest_finalized.is_some_and(|latest| block <= latest) {
+            return false;
+        }
+        self.latest_finalized = Some(block);
+        if let Some((_, pending)) = self.pending_registered_session.as_mut() {
+            if pending.registration_block.is_none() {
+                pending.registration_block = Some(block);
+            }
+        }
+        true
+    }
+
+    /// Begins a production DKG session whose public key material is loaded from
+    /// the finalized registration contract before the engine is constructed.
+    pub fn start_chain_registered_session(
+        &mut self,
+        epoch: Epoch,
+        validators: Vec<DkgValidator<ST>>,
+    ) -> Result<(), DkgError> {
+        self.close_registration_window(epoch);
+        if self
+            .latest_started_epoch
+            .is_some_and(|started| started >= epoch)
+            || self
+                .pending_registered_session
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending >= epoch)
+        {
+            return Ok(());
+        }
+        self.pending_registered_session = Some((
+            epoch,
+            PendingRegisteredSession {
+                validators,
+                registration_block: self.latest_finalized,
+            },
+        ));
+        self.schedule_pending_registration_reads();
+        Ok(())
+    }
+
+    fn close_registration_window(&mut self, epoch: Epoch) {
+        if self.chain.registration.epoch == Some(epoch) {
+            self.chain.submitter.cancel_registration(epoch);
+            self.chain.registration.phase = LocalRegistrationPhase::Done;
+        }
+    }
+
+    fn schedule_local_registration_read(&mut self) {
+        if self.sync_block.is_none() {
+            return;
+        }
+        loop {
+            let Some(latest) = self.latest_finalized else {
+                return;
+            };
+            let registration = &self.chain.registration;
+            let Some(epoch) = registration.epoch else {
+                return;
+            };
+            if registration.phase == LocalRegistrationPhase::Done {
+                return;
+            }
+            let block = registration.unavailable_block.unwrap_or(latest);
+            let result =
+                self.chain
+                    .io
+                    .read_registrations(block, epoch, &[self.chain.registration.address]);
+            match result {
+                Ok(mut registrations) => {
+                    self.chain.registration.unavailable_block = None;
+                    debug_assert!(registrations.len() <= 1);
+                    if let Err(err) =
+                        self.accept_local_registration_read(epoch, block, registrations.pop())
+                    {
+                        error!(
+                            ?err,
+                            epoch = epoch.0,
+                            block = block.0,
+                            "failed to process local DKG registration state"
+                        );
+                        return;
+                    }
+                    if block >= latest {
+                        return;
+                    }
+                }
+                Err(DkgError::ChainDataUnavailable { .. }) => {
+                    self.chain.registration.unavailable_block = Some(block);
+                    return;
+                }
+                Err(err) => {
+                    let registration = &mut self.chain.registration;
+                    registration.unavailable_block = Some(block);
+                    debug!(?err, epoch = epoch.0, block = block.0, party = %registration.address, "failed to read local DKG registration from finalized state");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn accept_local_registration_read(
+        &mut self,
+        epoch: Epoch,
+        block: SeqNum,
+        observed: Option<RegistrationCall>,
+    ) -> Result<(), DkgError> {
+        let storage_root = self.storage_root.clone();
+        if self.chain.registration.epoch != Some(epoch) {
+            return Ok(());
+        }
+        let local_bytes = match load_or_create_local_registration(
+            &storage_root,
+            epoch,
+            self.chain.registration.address.into_array(),
+            &self.chain.local_keys,
+            observed.as_ref(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.chain.registration.phase = LocalRegistrationPhase::Done;
+                return Err(DkgError::operation("load local DKG registration", err));
+            }
         };
-        runner.replay_persisted_incoming_messages(recovered_incoming);
-        info!(
-            pending_inputs = runner.pending_inputs.len(),
-            recovered_outgoing = runner.recovered_outgoing.len(),
-            "waiting for DKG chain recovery before starting engine"
+        failpoint::failpoint!(
+            name = "dkg.registration.loaded",
+            description =
+                "after durable local registration is loaded and before chain reconciliation",
         );
-        Ok(runner)
+
+        if let Some(bytes) = observed {
+            self.chain.registration.phase = LocalRegistrationPhase::Done;
+            if bytes != local_bytes {
+                return Err(DkgError::FinalizedRegistrationConflict {
+                    address: self.chain.registration.address,
+                });
+            }
+            self.chain
+                .submitter
+                .confirm_registration(epoch, &local_bytes);
+        } else {
+            match self.chain.registration.phase {
+                LocalRegistrationPhase::Submitted => {
+                    self.chain.submitter.retry_registration(epoch, block);
+                }
+                LocalRegistrationPhase::Open => {
+                    self.chain
+                        .submitter
+                        .submit_registration(epoch, block, local_bytes);
+                    self.chain.registration.phase = LocalRegistrationPhase::Submitted;
+                }
+                LocalRegistrationPhase::Done => {}
+            }
+        }
+
+        self.schedule_pending_registration_reads();
+        Ok(())
     }
 
-    pub(crate) fn handle_network_message(
+    fn schedule_pending_registration_reads(&mut self) {
+        if self.sync_block.is_none() {
+            return;
+        }
+        let io = Arc::clone(&self.chain.io);
+        let Some((epoch, block, parties)) =
+            self.pending_registered_session
+                .as_ref()
+                .and_then(|(epoch, pending)| {
+                    pending.registration_block.map(|block| {
+                        let parties = pending
+                            .validators
+                            .iter()
+                            .map(|validator| alloy_primitives::Address::from(validator.address))
+                            .collect::<Vec<_>>();
+                        (*epoch, block, parties)
+                    })
+                })
+        else {
+            return;
+        };
+        match io.read_registrations(block, epoch, &parties) {
+            Ok(state) => {
+                if let Err(err) = self.accept_registration_snapshot(epoch, state) {
+                    error!(
+                        ?err,
+                        epoch = epoch.0,
+                        block = block.0,
+                        "failed to start registered DKG session"
+                    );
+                }
+            }
+            Err(DkgError::ChainDataUnavailable { .. }) => {}
+            Err(err) => warn!(
+                ?err,
+                epoch = epoch.0,
+                block = block.0,
+                "failed to read finalized DKG registrations"
+            ),
+        }
+    }
+
+    fn accept_registration_snapshot(
+        &mut self,
+        epoch: Epoch,
+        registrations: Vec<RegistrationCall>,
+    ) -> Result<(), DkgError> {
+        let Some((_, pending)) = self
+            .pending_registered_session
+            .take_if(|(pending_epoch, _)| *pending_epoch == epoch)
+        else {
+            return Ok(());
+        };
+        let recovery_block = pending
+            .registration_block
+            .expect("registration read has a finalized block");
+        let local_keys = &self.chain.local_keys;
+        let registered = assemble_registered_session(
+            epoch,
+            self.self_id,
+            pending.validators,
+            local_keys,
+            registrations,
+        )
+        .map_err(|err| DkgError::operation("assemble registered DKG session", err))?;
+        self.start_session_at(
+            epoch,
+            registered.validators,
+            registered.key_material,
+            Some(recovery_block),
+        )
+    }
+
+    fn start_session_at(
+        &mut self,
+        epoch: Epoch,
+        validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+        key_material: crate::DkgRegisteredKeyMaterial,
+        recovery_block: Option<SeqNum>,
+    ) -> Result<(), DkgError> {
+        let party_count = validators.len();
+        if self
+            .latest_started_epoch
+            .is_some_and(|started| started >= epoch)
+        {
+            return Ok(());
+        }
+        let Some(session) = start(
+            epoch,
+            self.self_id,
+            validators,
+            &self.storage_root,
+            key_material,
+        )?
+        else {
+            self.latest_started_epoch = Some(epoch);
+            return Ok(());
+        };
+        self.latest_started_epoch = Some(epoch);
+        self.sessions.insert(epoch, session);
+        self.start_chain_session(epoch, party_count, recovery_block);
+        self.retire_old_sessions();
+        Ok(())
+    }
+
+    fn start_chain_session(
+        &mut self,
+        epoch: Epoch,
+        party_count: usize,
+        recovery_block: Option<SeqNum>,
+    ) {
+        self.chain_session = Some((epoch, party_count));
+        self.chain.submitter.start_session(epoch);
+        if let Some(recovery_block) = recovery_block {
+            self.chain.event_reader.start_session(ChainEventSession {
+                epoch,
+                party_count,
+                recovery_block,
+            });
+        }
+        self.schedule_chain_read();
+    }
+
+    pub fn handle_timer(&mut self, now: Instant) {
+        let epochs = self.sessions.keys().copied().collect::<Vec<_>>();
+        for epoch in epochs {
+            if self.sessions[&epoch]
+                .next_timer()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                if let Err(err) = self.sessions.get_mut(&epoch).unwrap().handle_timer(now) {
+                    error!(?err, "failed to process DKG retry timer");
+                }
+                self.collect_session_effects(epoch);
+            }
+        }
+    }
+
+    pub fn handle_network_message(
         &mut self,
         sender: NodeId<CertificateSignaturePubKey<ST>>,
         message: Bytes,
-    ) -> Result<(), RunnerError> {
-        let Some(inbound) = self.delivery.handle_network_message(sender, message) else {
-            return Ok(());
-        };
-        self.accept_delivery(inbound)?;
-        self.settle()?;
-        Ok(())
-    }
-
-    pub(crate) fn handle_timer(&mut self, now: Instant) -> Result<(), RunnerError> {
-        self.delivery_outbound
-            .extend(self.delivery.handle_timer(now));
-        self.settle()
-    }
-
-    pub(crate) fn handle_chain_event(&mut self, event: ChainEvent) -> Result<(), RunnerError> {
-        self.accept_chain_event(event)?;
-        self.settle()
-    }
-
-    pub(crate) fn finish_chain_recovery(&mut self) -> Result<(), RunnerError> {
-        self.complete_chain_recovery()?;
-        self.settle()
-    }
-
-    fn settle(&mut self) -> Result<(), RunnerError> {
-        if self.awaiting_chain_recovery {
-            return Ok(());
-        }
-        self.drain_engine_inputs()
-    }
-
-    fn accept_delivery(&mut self, inbound: DeliveryInbound<ST>) -> Result<(), RunnerError> {
-        let from = self
-            .mapping
-            .party_id(&inbound.sender)
-            .expect("delivery engine validated DKG sender");
-        self.handle_data_payload(from, inbound.payload)
-    }
-
-    fn complete_chain_recovery(&mut self) -> Result<(), RunnerError> {
-        if !self.awaiting_chain_recovery {
-            return Ok(());
-        }
-
-        let (chain, peer) = mem::take(&mut self.pending_inputs)
-            .into_iter()
-            .partition(|input| matches!(input, PendingEngineInput::Chain(_)));
-        self.pending_inputs = chain;
-        self.drain_engine_inputs()?;
-        // Chain evidence is applied before recovery so the scheduler discards
-        // obsolete WAL entries as they are restored.
-        let recovered_outgoing = mem::take(&mut self.recovered_outgoing);
-        self.restore_persisted_outgoing_messages(recovered_outgoing)?;
-        let effects = self.engine.start().map_err(|error| RunnerError::Engine {
-            action: "start",
-            error,
-        })?;
-        // Once start succeeds, recovery must not start the same engine twice if
-        // dispatching one of its initial effects fails.
-        self.awaiting_chain_recovery = false;
-        // Recovered inputs must precede start effects that loop back locally.
-        // Otherwise every restart would persist the regenerated local message
-        // once more before the replay taught the engine that it is a duplicate.
-        self.pending_inputs.extend(peer);
-        self.dispatch_effects(effects)?;
-        self.drain_engine_inputs()?;
-        info!(
-            phase = ?self.engine.phase(),
-            "started DKG runner from synchronized chain state"
-        );
-        Ok(())
-    }
-
-    fn handle_data_payload(&mut self, from: PartyId, payload: Bytes) -> Result<(), RunnerError> {
-        let message = match DkgMessage::decode(payload.clone()) {
-            Ok(message) => message,
+    ) {
+        let wire: DeliveryEnvelope = match message.as_ref().try_into() {
+            Ok(wire) => wire,
             Err(err) => {
-                warn!(
-                    ?err,
-                    from_party = from.0,
-                    "rejected malformed typed DKG message"
-                );
-                return Ok(());
+                warn!(?err, ?sender, "dropping malformed DKG delivery message");
+                return;
             }
         };
-        if message.kind().is_sync() {
-            if let Err(err) = message.identity(
-                from,
-                self.self_party,
-                self.party_count,
-                self.max_ladder_level,
-            ) {
-                warn!(
-                    ?err,
-                    from_party = from.0,
-                    "rejected invalid DKG sync message identity"
-                );
-                return Ok(());
-            }
-            self.pending_inputs
-                .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                    input: CoreInput::new(from, message),
-                    durable: None,
-                }));
-            return Ok(());
-        }
-        let record = IncomingRecord {
-            source: from,
-            payload: payload.clone(),
-        };
-        self.pending_inputs
-            .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                input: CoreInput::new(from, message),
-                durable: Some(record),
-            }));
-        Ok(())
-    }
-
-    fn drain_engine_inputs(&mut self) -> Result<(), RunnerError> {
-        while let Some(input) = self.pending_inputs.pop_front() {
-            let processed = match input {
-                PendingEngineInput::Peer(peer) => self.process_peer_input(peer)?,
-                PendingEngineInput::Chain(event) => {
-                    let effects =
-                        self.engine
-                            .handle_event(DkgInput::Chain(event))
-                            .map_err(|error| RunnerError::Engine {
-                                action: "handle chain input",
-                                error,
-                            })?;
-                    self.dispatch_effects(effects)?;
-                    true
-                }
-            };
-            if processed {
-                self.log_phase_change();
-            }
-        }
-        Ok(())
-    }
-
-    fn process_peer_input(&mut self, peer: PendingPeerInput) -> Result<bool, RunnerError> {
-        let source = peer.input.source;
-        let completed_request =
-            request_completed_by_response(&peer.input.message, self.self_party, source);
-        let durable = peer.durable;
-        let effects = match self.engine.handle_peer_event(peer.input) {
-            Ok(effects) => effects,
-            Err(DkgEngineError::Duplicate) => {
-                debug!(source = source.0, "ignored duplicate DKG peer input");
-                return Ok(false);
-            }
-            Err(DkgEngineError::PeerInput(reason)) => {
-                debug!(
-                    ?reason,
-                    source = source.0,
-                    "DKG protocol rejected peer input"
-                );
-                return Ok(false);
-            }
-            Err(error) => {
-                return Err(RunnerError::Engine {
-                    action: "handle peer input",
-                    error,
-                })
-            }
-        };
-        if let Some(message_id) = completed_request {
-            // One accepted chunk makes this responder's request obsolete; other
-            // signers keep retrying until they contribute or extraction ends.
-            self.delivery.complete(&message_id);
-        }
-        if let Some(record) = durable {
-            failpoint::failpoint!(
-                name = "dkg.peer.engine_applied",
-                description = "after the engine applies a peer input and before durable ingress",
-            );
-            self.recovery_wal
-                .append(&RecoveryRecord::Incoming(record))?;
-            failpoint::failpoint!(
-                name = "dkg.peer.input_persisted",
-                description = "after an accepted DKG peer input is durable and before effects",
-            );
-        }
-        self.dispatch_effects(effects)?;
-        Ok(true)
-    }
-
-    fn dispatch_effects(
-        &mut self,
-        effects: Vec<dkg_protocol::DkgEffect>,
-    ) -> Result<(), RunnerError> {
-        for effect in effects {
-            match effect {
-                RuntimeCommand::Unicast { to, payload } => {
-                    self.send_data_to_recipients([to], payload)?;
-                }
-                RuntimeCommand::Multicast { payload } => {
-                    if matches!(
-                        payload.kind(),
-                        DkgMessageKind::LowerConversion | DkgMessageKind::OpenPower
-                    ) {
-                        let record = IncomingRecord {
-                            source: self.self_party,
-                            payload: payload.clone().into_bytes(),
-                        };
-                        self.pending_inputs
-                            .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                                input: CoreInput::new(self.self_party, payload.clone()),
-                                durable: Some(record),
-                            }));
-                    }
-                    let self_party = self.self_party;
-                    let recipients = self
-                        .mapping
-                        .parties()
-                        .into_iter()
-                        .filter(|party| *party != self_party);
-                    self.send_data_to_recipients(recipients, payload)?;
-                }
-                RuntimeCommand::PostToChain { call } => {
-                    self.handle_chain_call(call)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn replay_persisted_incoming_messages(&mut self, records: Vec<IncomingRecord>) {
-        for record in records {
-            if self.mapping.member_id(record.source).is_none() {
-                warn!(
-                    source_party = record.source.0,
-                    "skipping persisted incoming DKG message from unknown party"
-                );
-                continue;
-            }
-            let message = match DkgMessage::decode(record.payload.clone()) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!(?err, "skipping malformed persisted DKG message");
-                    continue;
-                }
-            };
-            self.pending_inputs
-                .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                    input: CoreInput::new(record.source, message),
-                    durable: None,
-                }));
-        }
-    }
-
-    fn accept_chain_event(&mut self, event: ChainEvent) -> Result<(), RunnerError> {
-        let event_kind = chain_event_kind(&event);
-        let record_id = event.record_id();
-        self.delivery
-            .abort_group(delivery_abort_group_for_chain_event(&event));
-        self.pending_inputs
-            .push_back(PendingEngineInput::Chain(event));
-        failpoint::failpoint!(
-            name = "dkg.chain.event_buffered",
-            description = "after a finalized chain event is buffered and before engine application",
-        );
-        info!(
-            epoch = self.epoch.0,
-            event_kind,
-            record_id = record_id.0,
-            "accepted finalized DKG chain event"
-        );
-        Ok(())
-    }
-
-    fn restore_persisted_outgoing_messages(
-        &mut self,
-        records: Vec<OutgoingRecord>,
-    ) -> Result<(), RunnerError> {
-        for record in records {
-            let message = match DkgMessage::decode(record.payload.clone()) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!(?err, "skipping malformed persisted outgoing DKG message");
-                    continue;
-                }
-            };
-            let Some(first_recipient) = record.recipients.first().copied() else {
-                warn!("skipping persisted DKG message without recipients");
-                continue;
-            };
-            let message_id = self.message_id_for_recipients(&record.recipients, &message)?;
-            let recipients = record
-                .recipients
-                .iter()
-                .map(|party| {
-                    self.mapping
-                        .member_id(*party)
-                        .ok_or(RunnerError::UnknownParty {
-                            action: "restore delivery to",
-                            party: party.0,
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.delivery_outbound
-                .extend(self.delivery.schedule_reliable(
-                    message_id,
-                    recipients,
-                    record.payload,
-                    delivery_abort_group_for_peer_payload(
-                        message.kind(),
-                        self.self_party,
-                        first_recipient,
-                    ),
-                    Instant::now(),
-                )?);
-        }
-        Ok(())
-    }
-
-    fn handle_chain_call(&mut self, call: ChainCall) -> Result<(), RunnerError> {
-        if let Some(group) = delivery_abort_group_for_chain_call(&call) {
-            self.delivery.abort_group(group);
-        }
-        self.chain_calls.push(call);
-        Ok(())
-    }
-
-    fn send_data_to_recipients(
-        &mut self,
-        recipients: impl IntoIterator<Item = PartyId>,
-        message: DkgMessage,
-    ) -> Result<(), RunnerError> {
-        let kind = message.kind();
-        let recipients = recipients.into_iter().collect::<BTreeSet<_>>();
-        if recipients.is_empty() {
-            return Ok(());
-        }
-        if let Some(recipient) = recipients
-            .iter()
-            .find(|recipient| self.mapping.member_id(**recipient).is_none())
-        {
-            return Err(RunnerError::UnknownParty {
-                action: "send to",
-                party: recipient.0,
-            });
-        }
-        if kind.is_sync() {
-            if recipients.len() != 1 {
-                return Err(RunnerError::SyncMustBeUnicast);
-            }
-            let recipient = *recipients.first().expect("checked one sync recipient");
-            let identity = message.identity(
-                self.self_party,
-                recipient,
-                self.party_count,
-                self.max_ladder_level,
-            )?;
-            let to = self
-                .mapping
-                .member_id(recipient)
-                .expect("recipient validated above");
-            if kind.is_sync_request() {
-                self.delivery_outbound
-                    .extend(self.delivery.schedule_reliable(
-                        identity.message_id(),
-                        [to],
-                        message.into_bytes(),
-                        Some(DeliveryAbortGroup::Extraction),
-                        Instant::now(),
-                    )?);
-                return Ok(());
-            }
-            // A lost response is recreated by the requester's next retry, so it
-            // must not acquire its own retry timer or sender-side dedup entry.
-            self.delivery_outbound
-                .push(self.delivery.schedule_once(to, message.into_bytes()));
-            return Ok(());
-        }
-        let message_id = self.message_id_for_recipients(&recipients, &message)?;
-        let payload = message.into_bytes();
-        let abort_group = delivery_abort_group_for_peer_payload(
-            kind,
-            self.self_party,
-            *recipients.first().expect("checked recipients above"),
-        );
-        let delivery_recipients = recipients
-            .iter()
-            .map(|party| {
-                self.mapping
-                    .member_id(*party)
-                    .ok_or(RunnerError::UnknownParty {
-                        action: "send to",
-                        party: party.0,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let sends = self.delivery.schedule_reliable(
-            message_id.clone(),
-            delivery_recipients,
-            payload.clone(),
-            abort_group,
-            Instant::now(),
-        )?;
-        if sends.is_empty() {
-            return Ok(());
-        }
-        // The scheduler is mutated first, but its sends remain private until
-        // the WAL succeeds. A WAL failure terminates the runner without
-        // exposing an output that recovery could not reconstruct.
-        self.recovery_wal
-            .append(&RecoveryRecord::Outgoing(OutgoingRecord {
-                recipients,
-                payload,
-            }))?;
-        failpoint::failpoint!(
-            name = "dkg.network.outgoing_persisted",
-            description = "after durable DKG output and before network delivery is exposed",
-        );
-        self.delivery_outbound.extend(sends);
-        Ok(())
-    }
-
-    fn message_id_for_recipients(
-        &self,
-        recipients: &BTreeSet<PartyId>,
-        message: &DkgMessage,
-    ) -> Result<DkgMessageId, DkgMessageError> {
-        let mut keys = BTreeSet::new();
-        for recipient in recipients {
-            keys.extend(
-                message
-                    .identity(
-                        self.self_party,
-                        *recipient,
-                        self.party_count,
-                        self.max_ladder_level,
-                    )?
-                    .keys,
-            );
-        }
-        DkgMessageId::new(keys)
-    }
-
-    fn log_phase_change(&mut self) {
-        let phase = self.engine.phase();
-        if phase == self.last_phase {
+        let epoch = Epoch(wire.epoch);
+        let Some(session) = self.sessions.get_mut(&epoch) else {
             return;
+        };
+        if let Err(err) = session.handle_network_message(sender, wire.payload) {
+            error!(?err, ?sender, "failed to process DKG network message");
         }
-        if phase == DkgEnginePhase::Complete {
-            info!(
-                epoch = self.epoch.0,
-                party = self.self_party.0,
-                "DKG runner completed"
+        self.collect_session_effects(epoch);
+    }
+
+    pub fn next_timer(&self) -> Option<Instant> {
+        self.sessions
+            .values()
+            .filter_map(DkgSession::next_timer)
+            .min()
+    }
+
+    /// Drains network output produced by direct runner operations.
+    pub fn take_outbound(&mut self) -> Vec<DeliveryOutbound<ST>> {
+        mem::take(&mut self.pending_outbound)
+    }
+
+    fn collect_session_effects(&mut self, epoch: Epoch) {
+        let calls = self.take_session_effects(epoch);
+        self.submit_chain_calls(epoch, calls);
+    }
+
+    fn take_session_effects(&mut self, epoch: Epoch) -> Vec<dkg_protocol::ChainCall> {
+        let Some(session) = self.sessions.get_mut(&epoch) else {
+            return Vec::new();
+        };
+        self.pending_outbound
+            .extend(session.take_delivery_outbound());
+        session.take_chain_calls()
+    }
+
+    fn submit_chain_calls(&mut self, epoch: Epoch, calls: Vec<dkg_protocol::ChainCall>) {
+        for call in calls {
+            failpoint::failpoint!(
+                name = "dkg.chain.call_buffered",
+                description =
+                    "after a DKG chain call is buffered and before transaction submission",
             );
+            self.chain.submitter.submit(epoch, call);
         }
-        if self.last_phase == DkgEnginePhase::Vss && phase != DkgEnginePhase::Vss {
-            self.delivery.abort_group(DeliveryAbortGroup::Vss);
+    }
+
+    fn schedule_chain_read(&mut self) {
+        loop {
+            let Some(read) = self.chain.event_reader.next_read() else {
+                return;
+            };
+            let events = match self.chain.io.read_events(read) {
+                Ok(events) => events,
+                Err(DkgError::ChainDataUnavailable { .. }) => return,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        epoch = read.session().epoch.0,
+                        block = read.block().0,
+                        "failed to read DKG chain state"
+                    );
+                    return;
+                }
+            };
+            let batch = self.chain.event_reader.complete(read, events);
+            if let Err(err) = self.accept_chain_batch(batch) {
+                error!(
+                    ?err,
+                    epoch = read.session().epoch.0,
+                    block = read.block().0,
+                    "failed to process DKG chain read"
+                );
+            }
         }
-        if self.last_phase == DkgEnginePhase::Extraction && phase != DkgEnginePhase::Extraction {
-            self.delivery.abort_group(DeliveryAbortGroup::Extraction);
+    }
+
+    fn accept_chain_batch(&mut self, batch: ChainEventBatch) -> Result<(), DkgError> {
+        let epoch = batch.session.epoch;
+        let session = self
+            .sessions
+            .get_mut(&epoch)
+            .ok_or(DkgError::NoActiveSession { epoch: epoch.0 })?;
+        for event in batch.events.iter().cloned() {
+            session
+                .handle_chain_event(event)
+                .map_err(|err| DkgError::operation("handle DKG chain event", err))?;
         }
-        info!(
-            from_phase = ?self.last_phase,
-            to_phase = ?phase,
-            "DKG phase changed"
+        if batch.recovery_complete_after {
+            session
+                .finish_chain_recovery()
+                .map_err(|err| DkgError::operation("finish DKG chain recovery", err))?;
+        }
+        let calls = self.take_session_effects(epoch);
+        // Apply the observed events before their engine-generated calls so
+        // recovery cannot resubmit an effect that this same batch finalized.
+        self.chain.submitter.finalized_block(
+            epoch,
+            batch.block,
+            batch.events,
+            batch.recovery_complete_after,
         );
-        self.last_phase = phase;
+        self.submit_chain_calls(epoch, calls);
+        Ok(())
+    }
+
+    fn retire_old_sessions(&mut self) {
+        while self.sessions.len() > crate::MAX_RETAINED_DKG_SESSIONS {
+            self.sessions.pop_first().expect("excess DKG session");
+        }
     }
 }
 
-fn request_completed_by_response(
-    message: &DkgMessage,
-    requester: PartyId,
-    responder: PartyId,
-) -> Option<DkgMessageId> {
-    let key = match message {
-        DkgMessage::BveRetrievalResponse { dealer, .. } => DkgMessageKey::BveRetrievalRequest {
-            dealer: *dealer,
-            requester,
-            responder,
-        },
-        DkgMessage::PcRetrievalResponse { dealer, .. } => DkgMessageKey::PcRetrievalRequest {
-            dealer: *dealer,
-            requester,
-            responder,
-        },
-        _ => return None,
-    };
-    Some(DkgMessageId::single(key))
-}
-
-fn build_engine(
-    epoch: Epoch,
-    self_party: PartyId,
-    key_material: DkgRegisteredKeyMaterial,
-    params: DkgEngineParams,
-    seed: [u8; 32],
-) -> Result<DkgEngine<BlstBackend, K256SecpBackend>, RunnerError> {
-    let DkgRegisteredKeyMaterial {
-        local_keys,
-        registrations,
-    } = key_material;
-    let party_count = registrations.len();
-    let receiver_publics = Matrix::from_vec(
-        party_count,
-        1,
-        registrations
-            .iter()
-            .map(|registration| registration.receiver.public_key)
-            .collect(),
-    )
-    .map_err(RunnerError::ReceiverMatrix)?;
-    let thresholds =
-        DkgThresholds::derive(party_count, params.output_count).map_err(RunnerError::Threshold)?;
-    let party_set = PartySet::new(
-        (0..party_count)
-            .map(|party| PartyId(u32::try_from(party).expect("party count fits u32")))
-            .collect(),
-    )
-    .map_err(RunnerError::PartySet)?;
-    let topology =
-        VirtualTopology::new(party_set, vec![1; party_count]).map_err(RunnerError::Topology)?;
-    let setup = DkgSetupContext::assemble(
-        self_party,
-        SessionId(epoch.0),
-        topology,
-        thresholds,
-        registrations
-            .iter()
-            .map(|registration| registration.qc_verifying_key)
-            .collect(),
-        receiver_publics,
-        registrations
-            .iter()
-            .map(|registration| registration.address)
-            .collect(),
-    )
-    .map_err(RunnerError::Setup)?;
-    DkgEngine::from_setup(setup, params, local_keys, seed)
-        .map_err(RunnerError::EngineInitialization)
-}
-
-fn delivery_abort_group_for_chain_call(call: &ChainCall) -> Option<DeliveryAbortGroup> {
-    match call {
-        ChainCall::PostPCQc { qc } => Some(DeliveryAbortGroup::CommitmentQc(qc.dealer)),
-        ChainCall::PostBveQc { qc } => Some(DeliveryAbortGroup::BveQc(qc.dealer)),
-        ChainCall::PostDkgResult { .. } => Some(DeliveryAbortGroup::DoneQc),
-        ChainCall::PostRegistration { .. } => None,
-    }
-}
-
-fn delivery_abort_group_for_chain_event(event: &ChainEvent) -> DeliveryAbortGroup {
-    match event {
-        ChainEvent::PCQc { qc, .. } => DeliveryAbortGroup::CommitmentQc(qc.dealer),
-        ChainEvent::BveQcFinalized { qc, .. } => DeliveryAbortGroup::BveQc(qc.dealer),
-        ChainEvent::DkgResultRecorded { .. } => DeliveryAbortGroup::DoneQc,
+async fn wait_for_timer(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
     }
 }
 
 #[cfg(test)]
-#[path = "runner_tests.rs"]
-mod tests;
+mod tests {
+    use std::{sync::Mutex, time::Duration};
 
-#[cfg(test)]
-#[path = "runner_recovery_tests.rs"]
-mod recovery_tests;
+    use alloy_primitives::Address;
+    use monad_crypto::{NopKeyPair, NopSignature, certificate_signature::CertificateKeyPair};
+
+    use super::*;
+
+    #[test]
+    fn execution_sync_is_explicit_and_monotone() {
+        let self_id = test_nodes(1).pop().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
+        let mut runner = DkgRunner::<NopSignature>::new(
+            self_id,
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([1; 32], Address::ZERO, 1),
+            chain,
+        )
+        .unwrap();
+
+        runner.notify_finalized(SeqNum(10));
+        assert_eq!(runner.sync_block, None);
+
+        runner.notify_sync_complete(SeqNum(10));
+        runner.notify_sync_complete(SeqNum(9));
+        runner.notify_sync_complete(SeqNum(10));
+        assert_eq!(runner.sync_block, Some(SeqNum(10)));
+
+        runner.notify_finalized(SeqNum(12));
+        runner.notify_finalized(SeqNum(11));
+        assert_eq!(runner.sync_block, Some(SeqNum(10)));
+
+        runner.notify_sync_complete(SeqNum(11));
+        assert_eq!(runner.sync_block, Some(SeqNum(11)));
+    }
+
+    #[test]
+    fn execution_sync_anchors_epoch_scoped_registration_snapshot() {
+        let nodes = test_nodes(4);
+        let directory = tempfile::tempdir().unwrap();
+        let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
+        let mut runner = DkgRunner::<NopSignature>::new(
+            nodes[0],
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([1; 32], Address::ZERO, 1),
+            chain,
+        )
+        .unwrap();
+        let validators = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| DkgValidator::<NopSignature> {
+                node_id: *node_id,
+                address: [index as u8 + 1; 20],
+            })
+            .collect();
+
+        runner
+            .start_chain_registered_session(Epoch(2), validators)
+            .unwrap();
+        assert_eq!(
+            runner
+                .pending_registered_session
+                .as_ref()
+                .unwrap()
+                .1
+                .registration_block,
+            None
+        );
+
+        runner.notify_sync_complete(SeqNum(100));
+        let (_, pending) = runner.pending_registered_session.as_ref().unwrap();
+        assert_eq!(pending.registration_block, Some(SeqNum(100)));
+    }
+
+    #[test]
+    fn newer_session_discards_stale_pending_registration_read() {
+        let nodes = test_nodes(1);
+        let directory = tempfile::tempdir().unwrap();
+        let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
+        let mut runner = DkgRunner::<NopSignature>::new(
+            nodes[0],
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([1; 32], Address::ZERO, 1),
+            chain,
+        )
+        .unwrap();
+        let validators = || {
+            vec![DkgValidator::<NopSignature> {
+                node_id: nodes[0],
+                address: [1; 20],
+            }]
+        };
+
+        runner
+            .start_chain_registered_session(Epoch(1), validators())
+            .unwrap();
+        runner
+            .start_chain_registered_session(Epoch(2), validators())
+            .unwrap();
+
+        assert_eq!(
+            runner
+                .pending_registered_session
+                .as_ref()
+                .map(|(epoch, _)| *epoch),
+            Some(Epoch(2))
+        );
+    }
+
+    #[test]
+    fn boundary_waits_for_sync_then_reads_through_finalized_head() {
+        let self_id = test_nodes(1).pop().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chain = Arc::new(RecordingChain::default());
+        let chain_adapter: Arc<dyn DkgChain> = chain.clone();
+        let mut runner = DkgRunner::<NopSignature>::new(
+            self_id,
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([1; 32], Address::ZERO, 1),
+            chain_adapter,
+        )
+        .unwrap();
+        runner.notify_finalized(SeqNum(12));
+        runner.start_chain_session(Epoch(2), 4, None);
+        assert!(chain.reads.lock().unwrap().is_empty());
+
+        runner.notify_sync_complete(SeqNum(10));
+
+        assert_eq!(
+            *chain.reads.lock().unwrap(),
+            vec![(true, SeqNum(10)), (false, SeqNum(11)), (false, SeqNum(12))]
+        );
+    }
+
+    #[test]
+    fn registered_session_waits_for_chain_snapshot_and_execution_sync() {
+        let nodes = test_nodes(4);
+        let signing_key = [9; 32];
+        let chain_config = DkgChainConfig::new(signing_key, Address::ZERO, 1);
+        let addresses = [[4; 20], [1; 20], [3; 20], [2; 20]];
+        let registrations = addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                let keys = if index == 0 {
+                    chain_config.local_keys.clone()
+                } else {
+                    DkgLocalKeyMaterial::derive([index as u8 + 20; 32])
+                };
+                keys.registration(*address, 2).unwrap()
+            })
+            .collect();
+        let chain = Arc::new(RegistrationChain {
+            state: registrations,
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = DkgRunner::<NopSignature>::new(
+            nodes[0],
+            directory.path().to_path_buf(),
+            chain_config,
+            chain,
+        )
+        .unwrap();
+        let validators = nodes
+            .iter()
+            .zip(addresses)
+            .map(|(node_id, address)| DkgValidator::<NopSignature> {
+                node_id: *node_id,
+                address,
+            })
+            .collect();
+
+        runner.notify_finalized(SeqNum(100));
+        runner
+            .start_chain_registered_session(Epoch(2), validators)
+            .unwrap();
+        assert!(runner.sessions.is_empty());
+        runner.notify_sync_complete(SeqNum(90));
+
+        assert_eq!(runner.latest_started_epoch, Some(Epoch(2)));
+        assert!(runner.sessions.contains_key(&Epoch(2)));
+    }
+
+    #[test]
+    fn local_registration_retries_until_finalized_state_confirms_it() {
+        let nodes = test_nodes(1);
+        let (transactions, transaction_rx) = flume::unbounded();
+        let chain = Arc::new(LocalRegistrationChain {
+            registration: Mutex::new(None),
+            transactions,
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = DkgRunner::<NopSignature>::new(
+            nodes[0],
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([9; 32], Address::ZERO, 1),
+            chain.clone(),
+        )
+        .unwrap();
+        runner.prepare_registration(Epoch(2));
+        runner.notify_sync_complete(SeqNum(10));
+        let first = transaction_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (address, keys) = {
+            let managed = &runner.chain;
+            (
+                managed.registration.address.into_array(),
+                managed.local_keys.clone(),
+            )
+        };
+        let registration =
+            load_or_create_local_registration(directory.path(), Epoch(2), address, &keys, None)
+                .unwrap();
+
+        runner.notify_finalized(SeqNum(11));
+        let retry = transaction_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(retry, first);
+
+        *chain.registration.lock().unwrap() = Some(registration);
+        runner.notify_finalized(SeqNum(12));
+        runner.notify_finalized(SeqNum(13));
+        assert!(transaction_rx.try_recv().is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingChain {
+        reads: Mutex<Vec<(bool, SeqNum)>>,
+    }
+
+    impl DkgChain for RecordingChain {
+        fn read_registrations(
+            &self,
+            block: SeqNum,
+            _epoch: Epoch,
+            _parties: &[Address],
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Err(crate::DkgError::ChainDataUnavailable { block })
+        }
+
+        fn read_events(
+            &self,
+            read: crate::chain::ChainRead,
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
+            self.reads.lock().unwrap().push((
+                matches!(read, crate::chain::ChainRead::Snapshot(_)),
+                read.block(),
+            ));
+            Ok(Vec::new())
+        }
+
+        fn transaction_context(
+            &self,
+            _block: SeqNum,
+            _address: Address,
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            unreachable!()
+        }
+
+        fn submit_transaction(
+            &self,
+            _transaction: alloy_consensus::TxEnvelope,
+        ) -> Result<(), crate::DkgError> {
+            unreachable!()
+        }
+    }
+
+    struct RegistrationChain {
+        state: Vec<RegistrationCall>,
+    }
+
+    struct LocalRegistrationChain {
+        registration: Mutex<Option<RegistrationCall>>,
+        transactions: flume::Sender<alloy_consensus::TxEnvelope>,
+    }
+
+    impl DkgChain for LocalRegistrationChain {
+        fn read_registrations(
+            &self,
+            _block: SeqNum,
+            _epoch: Epoch,
+            _parties: &[Address],
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Ok(self.registration.lock().unwrap().iter().copied().collect())
+        }
+
+        fn read_events(
+            &self,
+            _read: crate::chain::ChainRead,
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
+            Ok(Vec::new())
+        }
+
+        fn transaction_context(
+            &self,
+            _block: SeqNum,
+            _address: Address,
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            Ok(crate::chain::DkgTransactionContext {
+                nonce: 0,
+                base_fee_per_gas: 0,
+            })
+        }
+
+        fn submit_transaction(
+            &self,
+            transaction: alloy_consensus::TxEnvelope,
+        ) -> Result<(), crate::DkgError> {
+            self.transactions
+                .send(transaction)
+                .map_err(|_| crate::DkgError::ChannelClosed("recording a test DKG transaction"))
+        }
+    }
+
+    impl DkgChain for RegistrationChain {
+        fn read_registrations(
+            &self,
+            _block: SeqNum,
+            _epoch: Epoch,
+            parties: &[Address],
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Ok(self
+                .state
+                .iter()
+                .filter(|registration| parties.contains(&Address::from(registration.address.0)))
+                .copied()
+                .collect())
+        }
+
+        fn read_events(
+            &self,
+            _read: crate::chain::ChainRead,
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
+            Ok(Vec::new())
+        }
+
+        fn transaction_context(
+            &self,
+            _block: SeqNum,
+            _address: Address,
+        ) -> Result<crate::chain::DkgTransactionContext, crate::DkgError> {
+            unreachable!()
+        }
+
+        fn submit_transaction(
+            &self,
+            _transaction: alloy_consensus::TxEnvelope,
+        ) -> Result<(), crate::DkgError> {
+            unreachable!()
+        }
+    }
+
+    fn test_nodes(count: u8) -> Vec<NodeId<CertificateSignaturePubKey<NopSignature>>> {
+        (0..count)
+            .map(|seed| {
+                let mut bytes = [seed.saturating_add(1); 32];
+                NodeId::new(NopKeyPair::from_bytes(&mut bytes).unwrap().pubkey())
+            })
+            .collect()
+    }
+}

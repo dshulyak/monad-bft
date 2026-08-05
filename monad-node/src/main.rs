@@ -85,7 +85,7 @@ use tracing::{error, event, info, warn, Instrument, Level};
 
 use self::{
     cli::Cli,
-    dkg::{build_manager, build_state_reader},
+    dkg::{build_runner, build_state_reader},
     error::NodeSetupError,
     metrics::{
         default_prometheus_labels, start_metrics_server, MetricsServerState, NodePrometheusMetrics,
@@ -245,7 +245,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         Err(err) => warn!(?err, "failed to discover retained DKG sessions"),
     }
     let state_read = build_state_reader(&node_state, SeqNum(EXECUTION_DELAY));
-    let dkg_manager = build_manager(
+    let dkg_runner = build_runner(
         &node_state,
         self_router_node_id,
         &dkg_storage_root,
@@ -253,22 +253,22 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         SeqNum(EXECUTION_DELAY),
     )
     .unwrap_or_else(|err| {
-        error!(?err, "failed to configure DKG manager chain integration");
+        error!(?err, "failed to configure DKG runner chain integration");
         None
     });
-    let (dkg_events, dkg_outbound_rx, dkg_local_tx_rx) = match dkg_manager {
-        Some((manager, local_tx_rx)) => {
-            let (events, event_rx) = monad_dkg_runner::DkgManagerHandle::channel();
+    let (dkg_events, dkg_outbound_rx, dkg_local_tx_rx) = match dkg_runner {
+        Some((runner, local_tx_rx)) => {
+            let (events, event_rx) = monad_dkg_runner::DkgRunnerHandle::channel();
             let (outbound_tx, outbound_rx) = flume::unbounded();
             tokio::spawn(async move {
-                if let Err(err) = manager.run(event_rx, outbound_tx).await {
-                    error!(?err, "DKG manager task stopped");
+                if let Err(err) = runner.run(event_rx, outbound_tx).await {
+                    error!(?err, "DKG runner task stopped");
                 }
             });
             (events, Some(outbound_rx), Some(local_tx_rx))
         }
         None => (
-            monad_dkg_runner::DkgManagerHandle::<SignatureType>::disabled(),
+            monad_dkg_runner::DkgRunnerHandle::<SignatureType>::disabled(),
             None,
             None,
         ),
@@ -664,7 +664,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                             message: VerifiedMonadMessage::DkgMessage(output.payload),
                         }
                     )]),
-                    Err(err) => warn!(?err, "DKG manager output channel closed"),
+                    Err(err) => warn!(?err, "DKG runner output channel closed"),
                 }
             }
             event = executor.next().instrument(ledger_span.clone()) => {
@@ -776,7 +776,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 }
 
 fn sync_dkg_from_execution_state(
-    dkg_events: &monad_dkg_runner::DkgManagerHandle<SignatureType>,
+    dkg_events: &monad_dkg_runner::DkgRunnerHandle<SignatureType>,
     state_read: &ExecutionStateReadThreadClient<SignatureType, SignatureCollectionType>,
     validator_sets: &[ValidatorSetDataWithEpoch<SignatureCollectionType>],
     epoch_length: SeqNum,
@@ -796,7 +796,7 @@ fn sync_dkg_from_execution_state(
 }
 
 fn schedule_dkg_session(
-    dkg_events: &monad_dkg_runner::DkgManagerHandle<SignatureType>,
+    dkg_events: &monad_dkg_runner::DkgRunnerHandle<SignatureType>,
     validator_set: &ValidatorSetDataWithEpoch<SignatureCollectionType>,
 ) {
     let validators = validator_set

@@ -3,7 +3,7 @@ use std::path::Path;
 use alloy_consensus::TxEnvelope;
 use monad_chain_config::ChainConfig;
 use monad_crypto::certificate_signature::CertificateSignaturePubKey;
-use monad_dkg_runner::{new_triedb_manager, DkgChainConfig, DkgError, DkgManager};
+use monad_dkg_runner::{new_triedb_runner, DkgChainConfig, DkgError, DkgRunner};
 use monad_ethcall::ffi::PoolConfig;
 use monad_execution_state_read::ExecutionStateReadThreadClient;
 use monad_execution_state_read_cache::ExecutionStateReadCache;
@@ -47,13 +47,13 @@ pub fn build_state_reader(
     })
 }
 
-pub fn build_manager(
+pub fn build_runner(
     node: &NodeState,
     self_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
     storage_root: &Path,
     state_read: ExecutionStateReadThreadClient<SignatureType, SignatureCollectionType>,
     execution_delay: SeqNum,
-) -> Result<Option<(DkgManager<SignatureType>, flume::Receiver<TxEnvelope>)>, DkgError> {
+) -> Result<Option<(DkgRunner<SignatureType>, flume::Receiver<TxEnvelope>)>, DkgError> {
     if !node.node_config.dkg.enabled {
         return Ok(None);
     }
@@ -67,7 +67,7 @@ pub fn build_manager(
     chain_config.gas_limit = config.tx_gas_limit;
     chain_config.max_priority_fee_per_gas = config.tx_max_priority_fee_per_gas;
 
-    new_triedb_manager(
+    new_triedb_runner(
         self_id,
         storage_root.to_path_buf(),
         chain_config,
