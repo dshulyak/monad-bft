@@ -1,8 +1,7 @@
-//! Generic reliable-message storage and at-least-once delivery primitives.
+//! Generic at-least-once delivery scheduling.
 //!
-//! [`DurableMessageStore`] owns semantic deduplication and persistence ordering.
-//! [`RetryScheduler`] resends messages until protocol
-//! evidence makes them obsolete. Wire framing and peer authentication remain
+//! [`RetryScheduler`] resends messages until protocol evidence makes them
+//! obsolete. Persistence, wire framing, and peer authentication remain
 //! protocol concerns.
 
 use std::{
@@ -14,13 +13,6 @@ use std::{
 
 use rand::Rng;
 use thiserror::Error;
-
-pub(crate) use message::{
-    DurableMessageStore, DurableStoreError, IncomingRecord, IncomingStatus, MessageIdentity,
-    MessageJournal, OutgoingRecord,
-};
-
-mod message;
 
 pub(crate) trait ObsolescencePolicy {
     type Scope;

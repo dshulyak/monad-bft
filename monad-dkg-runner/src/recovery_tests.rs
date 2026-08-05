@@ -1,18 +1,10 @@
 use dkg_core::PartyId;
-use dkg_protocol::{DkgMessageId, DkgMessageKey};
 
 use super::*;
-fn message_id(value: u8) -> DkgMessageId {
-    DkgMessageId::single(DkgMessageKey::Ladder {
-        sender: PartyId(value.into()),
-        level: 1,
-    })
-}
 
-fn incoming(value: u8) -> IncomingRecord<PartyId, DkgMessageId, Bytes> {
+fn incoming(value: u8) -> IncomingRecord {
     IncomingRecord {
         source: PartyId(value.into()),
-        message_id: message_id(value),
         payload: vec![value].into(),
     }
 }
@@ -137,7 +129,6 @@ fn wal_loads_outgoing_message_records() {
     let mut wal = open_wal(dir.path(), 8);
 
     let record = OutgoingRecord {
-        message_id: message_id(42),
         recipients: [PartyId(2), PartyId(3)].into_iter().collect(),
         payload: vec![0xAA, 0xBB, 0xCC].into(),
     };
@@ -145,8 +136,7 @@ fn wal_loads_outgoing_message_records() {
         .unwrap();
 
     let loaded = RecoveryState::load(wal.path()).unwrap();
-    assert_eq!(loaded.outbox.len(), 1);
-    assert_eq!(loaded.outbox.get(&message_id(42)), Some(&record));
+    assert_eq!(loaded.outgoing, vec![record]);
 }
 
 #[test]

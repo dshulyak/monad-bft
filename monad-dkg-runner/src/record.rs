@@ -3,23 +3,31 @@ use std::collections::BTreeSet;
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::{Buf, BufMut, Bytes};
 use dkg_core::PartyId;
-use dkg_protocol::{DkgMessageCodecError, DkgMessageId};
 use thiserror::Error;
 
-use crate::{
-    reliable::{IncomingRecord, OutgoingRecord},
-    wal::WalRecord,
-};
+use crate::wal::WalRecord;
 
 pub(crate) const ENGINE_SEED_BYTES: usize = 32;
 pub(crate) type EngineSeed = [u8; ENGINE_SEED_BYTES];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IncomingRecord {
+    pub(crate) source: PartyId,
+    pub(crate) payload: Bytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutgoingRecord {
+    pub(crate) recipients: BTreeSet<PartyId>,
+    pub(crate) payload: Bytes,
+}
 
 #[derive(Debug)]
 pub(super) enum RecoveryRecord {
     Seed(EngineSeed),
     Registration(Bytes),
-    Outgoing(OutgoingRecord<PartyId, DkgMessageId, Bytes>),
-    Incoming(IncomingRecord<PartyId, DkgMessageId, Bytes>),
+    Outgoing(OutgoingRecord),
+    Incoming(IncomingRecord),
 }
 
 #[derive(Debug, Error)]
@@ -28,8 +36,6 @@ pub(crate) enum WalCodecError {
     Invalid(&'static str),
     #[error("unknown record kind {0}")]
     UnknownRecordKind(u8),
-    #[error("invalid DKG message key: {0}")]
-    MessageKey(#[from] DkgMessageCodecError),
     #[error("invalid RLP: {0}")]
     Rlp(#[from] alloy_rlp::Error),
 }
@@ -47,7 +53,6 @@ impl WalRecord for RecoveryRecord {
             Self::Outgoing(record) => (
                 3,
                 alloy_rlp::encode(OutgoingWire {
-                    message_id: record.message_id.encode(),
                     recipients: record.recipients.iter().map(|party| party.0).collect(),
                     payload: record.payload.clone(),
                 })
@@ -57,7 +62,6 @@ impl WalRecord for RecoveryRecord {
                 4,
                 alloy_rlp::encode(IncomingWire {
                     source: record.source.0,
-                    message_id: record.message_id.encode(),
                     payload: record.payload.clone(),
                 })
                 .into(),
@@ -93,7 +97,6 @@ impl WalRecord for RecoveryRecord {
                     return Err(WalCodecError::Invalid("outgoing message"));
                 }
                 Self::Outgoing(OutgoingRecord {
-                    message_id: DkgMessageId::decode(&wire.message_id)?,
                     recipients,
                     payload: wire.payload,
                 })
@@ -102,7 +105,6 @@ impl WalRecord for RecoveryRecord {
                 let wire = alloy_rlp::decode_exact::<IncomingWire>(&payload)?;
                 Self::Incoming(IncomingRecord {
                     source: PartyId(wire.source),
-                    message_id: DkgMessageId::decode(&wire.message_id)?,
                     payload: wire.payload,
                 })
             }
@@ -114,13 +116,11 @@ impl WalRecord for RecoveryRecord {
 #[derive(RlpEncodable, RlpDecodable)]
 struct IncomingWire {
     source: u32,
-    message_id: Bytes,
     payload: Bytes,
 }
 
 #[derive(RlpEncodable, RlpDecodable)]
 struct OutgoingWire {
-    message_id: Bytes,
     recipients: Vec<u32>,
     payload: Bytes,
 }

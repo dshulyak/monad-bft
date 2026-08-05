@@ -426,7 +426,7 @@ fn start_runtime(
     let engine_seed = recovery_state
         .load_or_create_engine_seed(&mut recovery_wal)
         .unwrap();
-    let mut runner = Runner::new(RunnerInit {
+    let runner = Runner::new(RunnerInit {
         epoch: TEST_EPOCH,
         self_party,
         mapping,
@@ -436,7 +436,6 @@ fn start_runtime(
         recovery_state,
     })
     .unwrap();
-    runner.initialize().unwrap();
     NodeRuntime { runner }
 }
 

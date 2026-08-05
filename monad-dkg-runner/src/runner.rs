@@ -1,7 +1,5 @@
 //! Per-epoch DKG protocol runtime.
 
-mod message_store;
-
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     mem,
@@ -13,8 +11,8 @@ use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, Sess
 use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
 use dkg_protocol::{
     ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase, DkgInput,
-    DkgMessage, DkgMessageId, DkgMessageKey, DkgMessageKind, DkgSetupContext, DkgSetupError,
-    DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
+    DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessageKind, DkgSetupContext,
+    DkgSetupError, DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -25,17 +23,15 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::chain_event_kind,
-    record::EngineSeed,
+    record::{EngineSeed, IncomingRecord, OutgoingRecord, RecoveryRecord},
     recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
-    reliable::{EnqueueError, IncomingRecord, IncomingStatus, MessageIdentity, OutgoingRecord},
+    reliable::EnqueueError,
     transport::{
         delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
         DeliveryOutbound,
     },
     DkgError, DkgRegisteredKeyMaterial,
 };
-
-use self::message_store::{DkgDurableStore, DkgDurableStoreError};
 
 struct DkgPeerMap<ST: CertificateSignatureRecoverable> {
     by_member: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, PartyId>,
@@ -91,8 +87,8 @@ pub(crate) enum RunnerError {
     ReceiverMatrix(#[source] MatrixShapeError),
     #[error(transparent)]
     RecoveryWal(#[from] RecoveryWalError),
-    #[error(transparent)]
-    DurableStore(#[from] DkgDurableStoreError),
+    #[error("classify DKG message failed: {0}")]
+    Message(#[from] DkgMessageError),
     #[error("research DKG engine {action} failed: {error:?}")]
     Engine {
         action: &'static str,
@@ -100,10 +96,6 @@ pub(crate) enum RunnerError {
     },
     #[error("cannot {action} DKG delivery for unknown party {party}")]
     UnknownParty { action: &'static str, party: u32 },
-    #[error("accepted DKG input conflicts with durable ingress")]
-    DurableIngressConflict,
-    #[error("self-generated DKG message conflicts with recovery WAL")]
-    SelfGeneratedMessageConflict,
     #[error("DKG sync messages must be unicast")]
     SyncMustBeUnicast,
     #[error("conflicting DKG reliable delivery")]
@@ -143,7 +135,7 @@ where
         name = "dkg.session.seed_persisted",
         description = "after the DKG engine seed is durable and before runner construction",
     );
-    let mut runner = Runner::new(RunnerInit {
+    let runner = Runner::new(RunnerInit {
         epoch,
         self_party,
         mapping,
@@ -153,9 +145,6 @@ where
         recovery_state,
     })
     .map_err(|err| DkgError::operation("initialize DKG runner", err))?;
-    runner
-        .initialize()
-        .map_err(|err| DkgError::operation("start DKG runner", err))?;
     Ok(Some(runner))
 }
 
@@ -186,8 +175,8 @@ where
     delivery_outbound: Vec<DeliveryOutbound<ST>>,
     chain_calls: Vec<ChainCall>,
     pending_inputs: VecDeque<PendingEngineInput>,
-    deferred_outgoing: Vec<OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
-    durable_store: DkgDurableStore,
+    recovery_wal: RecoveryWal,
+    recovered_outgoing: Vec<OutgoingRecord>,
     last_phase: DkgEnginePhase,
     awaiting_chain_recovery: bool,
 }
@@ -199,12 +188,7 @@ enum PendingEngineInput {
 
 struct PendingPeerInput {
     input: CoreInput<DkgMessage>,
-    durable: Option<PendingDurableInput>,
-}
-
-struct PendingDurableInput {
-    identity: MessageIdentity<DkgMessageId, DkgMessageKey>,
-    record: IncomingRecord<PartyId, DkgMessageId, Bytes>,
+    durable: Option<IncomingRecord>,
 }
 
 impl<ST> Runner<ST>
@@ -237,13 +221,11 @@ where
         )?;
         let max_ladder_level = output_count.trailing_zeros().into();
         let initial_phase = engine.phase();
-        let durable_store = DkgDurableStore::load(
-            init.self_party,
-            party_count,
-            max_ladder_level,
-            init.recovery_wal,
-            init.recovery_state,
-        );
+        let RecoveryState {
+            outgoing: recovered_outgoing,
+            incoming: recovered_incoming,
+            ..
+        } = init.recovery_state;
         info!(
             epoch = init.epoch.0,
             party = init.self_party.0,
@@ -253,7 +235,7 @@ where
             "initialized DKG runner"
         );
 
-        Ok(Self {
+        let mut runner = Self {
             engine,
             epoch: init.epoch,
             self_party: init.self_party,
@@ -264,24 +246,18 @@ where
             delivery_outbound: Vec::new(),
             chain_calls: Vec::new(),
             pending_inputs: VecDeque::new(),
-            deferred_outgoing: Vec::new(),
-            durable_store,
+            recovery_wal: init.recovery_wal,
+            recovered_outgoing,
             last_phase: initial_phase,
             awaiting_chain_recovery: true,
-        })
-    }
-
-    fn initialize(&mut self) -> Result<(), RunnerError> {
-        let startup_incoming_messages = self.durable_store.incoming_records();
-        let startup_outgoing_messages = self.durable_store.outgoing_records();
-        self.replay_persisted_incoming_messages(startup_incoming_messages);
-        self.deferred_outgoing = startup_outgoing_messages;
+        };
+        runner.replay_persisted_incoming_messages(recovered_incoming);
         info!(
-            pending_inputs = self.pending_inputs.len(),
-            deferred_outgoing = self.deferred_outgoing.len(),
+            pending_inputs = runner.pending_inputs.len(),
+            recovered_outgoing = runner.recovered_outgoing.len(),
             "waiting for DKG chain recovery before starting engine"
         );
-        Ok(())
+        Ok(runner)
     }
 
     pub(crate) fn handle_network_message(
@@ -338,6 +314,10 @@ where
             .partition(|input| matches!(input, PendingEngineInput::Chain(_)));
         self.pending_inputs = chain;
         self.drain_engine_inputs()?;
+        // Chain evidence is applied before recovery so the scheduler discards
+        // obsolete WAL entries as they are restored.
+        let recovered_outgoing = mem::take(&mut self.recovered_outgoing);
+        self.restore_persisted_outgoing_messages(recovered_outgoing)?;
         let effects = self.engine.start().map_err(|error| RunnerError::Engine {
             action: "start",
             error,
@@ -345,11 +325,12 @@ where
         // Once start succeeds, recovery must not start the same engine twice if
         // dispatching one of its initial effects fails.
         self.awaiting_chain_recovery = false;
-        self.dispatch_effects(effects)?;
+        // Recovered inputs must precede start effects that loop back locally.
+        // Otherwise every restart would persist the regenerated local message
+        // once more before the replay taught the engine that it is a duplicate.
         self.pending_inputs.extend(peer);
+        self.dispatch_effects(effects)?;
         self.drain_engine_inputs()?;
-        let deferred_outgoing = mem::take(&mut self.deferred_outgoing);
-        self.replay_persisted_outgoing_messages(deferred_outgoing)?;
         info!(
             phase = ?self.engine.phase(),
             "started DKG runner from synchronized chain state"
@@ -390,46 +371,14 @@ where
                 }));
             return Ok(());
         }
-        let identity = match self.durable_store.identity(from, self.self_party, &message) {
-            Ok(identity) => identity,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    from_party = from.0,
-                    "rejected invalid typed DKG message identity"
-                );
-                return Ok(());
-            }
-        };
-        let message_id = identity.message_id.clone();
         let record = IncomingRecord {
             source: from,
-            message_id: message_id.clone(),
             payload: payload.clone(),
         };
-        match self.durable_store.incoming_status(&record, &identity) {
-            IncomingStatus::Duplicate => {
-                debug!(
-                    from_party = from.0,
-                    message_id = ?message_id,
-                    "finished previously accepted duplicate DKG inbound message"
-                );
-                return Ok(());
-            }
-            IncomingStatus::Conflict => {
-                warn!(
-                    from_party = from.0,
-                    message_id = ?message_id,
-                    "rejected conflicting DKG inbound message"
-                );
-                return Ok(());
-            }
-            IncomingStatus::New => {}
-        }
         self.pending_inputs
             .push_back(PendingEngineInput::Peer(PendingPeerInput {
                 input: CoreInput::new(from, message),
-                durable: Some(PendingDurableInput { identity, record }),
+                durable: Some(record),
             }));
         Ok(())
     }
@@ -464,6 +413,10 @@ where
         let durable = peer.durable;
         let effects = match self.engine.handle_peer_event(peer.input) {
             Ok(effects) => effects,
+            Err(DkgEngineError::Duplicate) => {
+                debug!(source = source.0, "ignored duplicate DKG peer input");
+                return Ok(false);
+            }
             Err(DkgEngineError::PeerInput(reason)) => {
                 debug!(
                     ?reason,
@@ -484,14 +437,17 @@ where
             // signers keep retrying until they contribute or extraction ends.
             self.delivery.complete(&message_id);
         }
-        if let Some(PendingDurableInput { identity, record }) = durable {
+        if let Some(record) = durable {
             failpoint::failpoint!(
                 name = "dkg.peer.engine_applied",
                 description = "after the engine applies a peer input and before durable ingress",
             );
-            if self.durable_store.accept_incoming(record, &identity)? == IncomingStatus::Conflict {
-                return Err(RunnerError::DurableIngressConflict);
-            }
+            self.recovery_wal
+                .append(&RecoveryRecord::Incoming(record))?;
+            failpoint::failpoint!(
+                name = "dkg.peer.input_persisted",
+                description = "after an accepted DKG peer input is durable and before effects",
+            );
         }
         self.dispatch_effects(effects)?;
         Ok(true)
@@ -511,30 +467,15 @@ where
                         payload.kind(),
                         DkgMessageKind::LowerConversion | DkgMessageKind::OpenPower
                     ) {
-                        let identity = self.durable_store.identity(
-                            self.self_party,
-                            self.self_party,
-                            &payload,
-                        )?;
                         let record = IncomingRecord {
                             source: self.self_party,
-                            message_id: identity.message_id.clone(),
                             payload: payload.clone().into_bytes(),
                         };
-                        match self.durable_store.incoming_status(&record, &identity) {
-                            IncomingStatus::New => {
-                                self.pending_inputs.push_back(PendingEngineInput::Peer(
-                                    PendingPeerInput {
-                                        input: CoreInput::new(self.self_party, payload.clone()),
-                                        durable: Some(PendingDurableInput { identity, record }),
-                                    },
-                                ));
-                            }
-                            IncomingStatus::Duplicate => {}
-                            IncomingStatus::Conflict => {
-                                return Err(RunnerError::SelfGeneratedMessageConflict);
-                            }
-                        }
+                        self.pending_inputs
+                            .push_back(PendingEngineInput::Peer(PendingPeerInput {
+                                input: CoreInput::new(self.self_party, payload.clone()),
+                                durable: Some(record),
+                            }));
                     }
                     let self_party = self.self_party;
                     let recipients = self
@@ -552,15 +493,11 @@ where
         Ok(())
     }
 
-    fn replay_persisted_incoming_messages(
-        &mut self,
-        records: Vec<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
-    ) {
+    fn replay_persisted_incoming_messages(&mut self, records: Vec<IncomingRecord>) {
         for record in records {
             if self.mapping.member_id(record.source).is_none() {
                 warn!(
                     source_party = record.source.0,
-                    message_id = ?record.message_id,
                     "skipping persisted incoming DKG message from unknown party"
                 );
                 continue;
@@ -571,12 +508,6 @@ where
                     warn!(?err, "skipping malformed persisted DKG message");
                     continue;
                 }
-            };
-            let Ok(_) = self
-                .durable_store
-                .identity(record.source, self.self_party, &message)
-            else {
-                continue;
             };
             self.pending_inputs
                 .push_back(PendingEngineInput::Peer(PendingPeerInput {
@@ -606,9 +537,9 @@ where
         Ok(())
     }
 
-    fn replay_persisted_outgoing_messages(
+    fn restore_persisted_outgoing_messages(
         &mut self,
-        records: Vec<OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
+        records: Vec<OutgoingRecord>,
     ) -> Result<(), RunnerError> {
         for record in records {
             let message = match DkgMessage::decode(record.payload.clone()) {
@@ -618,18 +549,35 @@ where
                     continue;
                 }
             };
-            for to in record.recipients {
-                if self.mapping.member_id(to).is_none() {
-                    warn!(?to, "skipping persisted DKG message to unknown party");
-                    continue;
-                }
-                self.queue_delivery_send(
-                    record.message_id.clone(),
-                    [to],
-                    record.payload.clone(),
-                    delivery_abort_group_for_peer_payload(message.kind(), self.self_party, to),
-                )?;
-            }
+            let Some(first_recipient) = record.recipients.first().copied() else {
+                warn!("skipping persisted DKG message without recipients");
+                continue;
+            };
+            let message_id = self.message_id_for_recipients(&record.recipients, &message)?;
+            let recipients = record
+                .recipients
+                .iter()
+                .map(|party| {
+                    self.mapping
+                        .member_id(*party)
+                        .ok_or(RunnerError::UnknownParty {
+                            action: "restore delivery to",
+                            party: party.0,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.delivery_outbound
+                .extend(self.delivery.schedule_reliable(
+                    message_id,
+                    recipients,
+                    record.payload,
+                    delivery_abort_group_for_peer_payload(
+                        message.kind(),
+                        self.self_party,
+                        first_recipient,
+                    ),
+                    Instant::now(),
+                )?);
         }
         Ok(())
     }
@@ -666,14 +614,12 @@ where
                 return Err(RunnerError::SyncMustBeUnicast);
             }
             let recipient = *recipients.first().expect("checked one sync recipient");
-            let identity = message
-                .identity(
-                    self.self_party,
-                    recipient,
-                    self.party_count,
-                    self.max_ladder_level,
-                )
-                .map_err(DkgDurableStoreError::Classification)?;
+            let identity = message.identity(
+                self.self_party,
+                recipient,
+                self.party_count,
+                self.max_ladder_level,
+            )?;
             let to = self
                 .mapping
                 .member_id(recipient)
@@ -695,47 +641,69 @@ where
                 .push(self.delivery.schedule_once(to, message.into_bytes()));
             return Ok(());
         }
-        let Some((message_id, payload)) = self
-            .durable_store
-            .accept_outgoing(recipients.clone(), message)?
-        else {
-            return Ok(());
-        };
+        let message_id = self.message_id_for_recipients(&recipients, &message)?;
+        let payload = message.into_bytes();
         let abort_group = delivery_abort_group_for_peer_payload(
             kind,
             self.self_party,
             *recipients.first().expect("checked recipients above"),
         );
-        self.queue_delivery_send(message_id, recipients, payload, abort_group)
-    }
-
-    fn queue_delivery_send(
-        &mut self,
-        message_id: DkgMessageId,
-        recipients: impl IntoIterator<Item = PartyId>,
-        payload: Bytes,
-        abort_group: Option<DeliveryAbortGroup>,
-    ) -> Result<(), RunnerError> {
-        let recipients = recipients
-            .into_iter()
+        let delivery_recipients = recipients
+            .iter()
             .map(|party| {
                 self.mapping
-                    .member_id(party)
+                    .member_id(*party)
                     .ok_or(RunnerError::UnknownParty {
                         action: "send to",
                         party: party.0,
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.delivery_outbound
-            .extend(self.delivery.schedule_reliable(
-                message_id,
+        let sends = self.delivery.schedule_reliable(
+            message_id.clone(),
+            delivery_recipients,
+            payload.clone(),
+            abort_group,
+            Instant::now(),
+        )?;
+        if sends.is_empty() {
+            return Ok(());
+        }
+        // The scheduler is mutated first, but its sends remain private until
+        // the WAL succeeds. A WAL failure terminates the runner without
+        // exposing an output that recovery could not reconstruct.
+        self.recovery_wal
+            .append(&RecoveryRecord::Outgoing(OutgoingRecord {
                 recipients,
                 payload,
-                abort_group,
-                Instant::now(),
-            )?);
+            }))?;
+        failpoint::failpoint!(
+            name = "dkg.network.outgoing_persisted",
+            description = "after durable DKG output and before network delivery is exposed",
+        );
+        self.delivery_outbound.extend(sends);
         Ok(())
+    }
+
+    fn message_id_for_recipients(
+        &self,
+        recipients: &BTreeSet<PartyId>,
+        message: &DkgMessage,
+    ) -> Result<DkgMessageId, DkgMessageError> {
+        let mut keys = BTreeSet::new();
+        for recipient in recipients {
+            keys.extend(
+                message
+                    .identity(
+                        self.self_party,
+                        *recipient,
+                        self.party_count,
+                        self.max_ladder_level,
+                    )?
+                    .keys,
+            );
+        }
+        DkgMessageId::new(keys)
     }
 
     fn log_phase_change(&mut self) {

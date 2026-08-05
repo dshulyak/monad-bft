@@ -105,7 +105,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     let temp = TempDir::new().unwrap();
     let epoch = Epoch(19);
     let validators = test_validators(4);
-    let (mut runner, _) = test_runner(temp.path(), epoch);
+    let (mut runner, wal_path) = test_runner(temp.path(), epoch);
     let sender = validators[1];
     let self_id = validators[0];
     let self_party = runner.self_party;
@@ -135,7 +135,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
         runner.handle_network_message(sender, wire.clone()).unwrap();
     }
 
-    assert!(runner.durable_store.incoming_records().is_empty());
+    assert!(RecoveryState::load(&wal_path).unwrap().incoming.is_empty());
     assert!(runner.delivery_outbound.is_empty());
     assert!(sender_delivery.next_timer().is_some());
 }
@@ -166,7 +166,6 @@ fn test_runner(root: &std::path::Path, epoch: Epoch) -> (Runner<NopSignature>, s
         recovery_state: recovery,
     })
     .unwrap();
-    runner.initialize().unwrap();
     runner.finish_chain_recovery().unwrap();
     runner.take_chain_calls();
     runner.take_delivery_outbound();

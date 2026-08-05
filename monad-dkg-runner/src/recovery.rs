@@ -1,23 +1,19 @@
 //! DKG recovery policy layered on the generic append-only WAL.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
 };
 
 use bytes::Bytes;
-use dkg_core::PartyId;
-use dkg_protocol::DkgMessageId;
 use monad_types::Epoch;
 use thiserror::Error;
 
-use super::record::{EngineSeed, RecoveryRecord, WalCodecError, ENGINE_SEED_BYTES};
-use crate::{
-    reliable::{IncomingRecord, MessageJournal, OutgoingRecord},
-    wal::{DurableWal, WalConfig, WalError, FRAME_HEADER_LEN},
+use super::record::{
+    EngineSeed, IncomingRecord, OutgoingRecord, RecoveryRecord, WalCodecError, ENGINE_SEED_BYTES,
 };
+use crate::wal::{DurableWal, WalConfig, WalError, FRAME_HEADER_LEN};
 
 const DEFAULT_MAX_EPOCHS: usize = 2;
 const PREALLOCATE_ENV: &str = "MONAD_DKG_RECOVERY_WAL_PREALLOCATE_BYTES";
@@ -49,8 +45,6 @@ pub(crate) enum RecoveryWalError {
     ConflictingRegistration,
     #[error("empty DKG registration record in recovery WAL")]
     EmptyRegistration,
-    #[error("conflicting DKG outbox records for message ID {0:?}")]
-    ConflictingOutbox(DkgMessageId),
     #[error("create DKG registration failed")]
     Registration(#[source] Box<crate::DkgError>),
 }
@@ -115,30 +109,12 @@ impl RecoveryWal {
     }
 }
 
-impl MessageJournal<PartyId, DkgMessageId, Bytes> for RecoveryWal {
-    type Error = RecoveryWalError;
-
-    fn append_incoming(
-        &mut self,
-        record: &IncomingRecord<PartyId, DkgMessageId, Bytes>,
-    ) -> Result<(), Self::Error> {
-        self.append(&RecoveryRecord::Incoming(record.clone()))
-    }
-
-    fn append_outgoing(
-        &mut self,
-        record: &OutgoingRecord<PartyId, DkgMessageId, Bytes>,
-    ) -> Result<(), Self::Error> {
-        self.append(&RecoveryRecord::Outgoing(record.clone()))
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryState {
     pub(crate) engine_seed: Option<EngineSeed>,
     pub(crate) registration: Option<Bytes>,
-    pub(crate) outbox: BTreeMap<DkgMessageId, OutgoingRecord<PartyId, DkgMessageId, Bytes>>,
-    pub(crate) incoming: BTreeSet<IncomingRecord<PartyId, DkgMessageId, Bytes>>,
+    pub(crate) outgoing: Vec<OutgoingRecord>,
+    pub(crate) incoming: Vec<IncomingRecord>,
 }
 
 impl RecoveryState {
@@ -155,10 +131,8 @@ impl RecoveryState {
                 RecoveryRecord::Registration(registration) => {
                     state.insert_registration(registration)?
                 }
-                RecoveryRecord::Outgoing(record) => state.insert_outbox(record)?,
-                RecoveryRecord::Incoming(record) => {
-                    state.incoming.insert(record);
-                }
+                RecoveryRecord::Outgoing(record) => state.outgoing.push(record),
+                RecoveryRecord::Incoming(record) => state.incoming.push(record),
             }
         }
         Ok(state)
@@ -171,7 +145,7 @@ impl RecoveryState {
         if let Some(seed) = self.engine_seed {
             return Ok(seed);
         }
-        if !self.outbox.is_empty() || !self.incoming.is_empty() {
+        if !self.outgoing.is_empty() || !self.incoming.is_empty() {
             return Err(RecoveryWalError::MissingSeed);
         }
 
@@ -223,21 +197,6 @@ impl RecoveryState {
                 Ok(())
             }
         }
-    }
-
-    fn insert_outbox(
-        &mut self,
-        record: OutgoingRecord<PartyId, DkgMessageId, Bytes>,
-    ) -> Result<(), RecoveryWalError> {
-        let Some(existing) = self.outbox.get_mut(&record.message_id) else {
-            self.outbox.insert(record.message_id.clone(), record);
-            return Ok(());
-        };
-        if existing.payload != record.payload {
-            return Err(RecoveryWalError::ConflictingOutbox(record.message_id));
-        }
-        existing.recipients.extend(record.recipients);
-        Ok(())
     }
 }
 
