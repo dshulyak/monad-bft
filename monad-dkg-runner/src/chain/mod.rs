@@ -17,6 +17,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::DkgError;
 
+use self::recovery::SessionScan;
+
+mod recovery;
 mod submitter;
 mod triedb;
 mod triedb_state;
@@ -515,8 +518,8 @@ impl ChainEventReader {
         self.scans.values().find_map(|scan| {
             let latest = self
                 .finalized
-                .unwrap_or(scan.session.recovery_block)
-                .max(scan.session.recovery_block);
+                .unwrap_or(scan.recovery_block())
+                .max(scan.recovery_block());
             scan.next(latest)
         })
     }
@@ -541,56 +544,6 @@ impl ChainEventReader {
             events,
             recovery_complete_after,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SessionScan {
-    session: ChainEventSession,
-    snapshot_pending: bool,
-    next_block: Option<SeqNum>,
-    recovery_through: SeqNum,
-    recovery_complete: bool,
-}
-
-impl SessionScan {
-    fn new(session: ChainEventSession, finalized: Option<SeqNum>) -> Self {
-        Self {
-            session,
-            snapshot_pending: true,
-            next_block: session.recovery_block.0.checked_add(1).map(SeqNum),
-            recovery_through: finalized.map_or(session.recovery_block, |head| {
-                head.max(session.recovery_block)
-            }),
-            recovery_complete: false,
-        }
-    }
-
-    fn next(self, latest: SeqNum) -> Option<ChainRead> {
-        if self.snapshot_pending {
-            Some(ChainRead::Snapshot(self.session))
-        } else {
-            self.next_block
-                .filter(|block| *block <= latest)
-                .map(|block| ChainRead::Block(block, self.session))
-        }
-    }
-
-    fn advance(&mut self, read: ChainRead) -> bool {
-        let processed = match read {
-            ChainRead::Snapshot(_) => {
-                self.snapshot_pending = false;
-                self.session.recovery_block
-            }
-            ChainRead::Block(block, _) => {
-                self.next_block = block.0.checked_add(1).map(SeqNum);
-                block
-            }
-        };
-        let complete =
-            !self.recovery_complete && !self.snapshot_pending && processed >= self.recovery_through;
-        self.recovery_complete |= complete;
-        complete
     }
 }
 

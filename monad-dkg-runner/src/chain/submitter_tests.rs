@@ -231,6 +231,24 @@ fn active_artifact_keeps_its_epoch_context() {
 }
 
 #[test]
+fn retry_does_not_replace_with_nonce_from_older_context() {
+    let nonce = Arc::new(AtomicU64::new(6));
+    let (mut service, local_rx) =
+        test_submitter_with_nonce(Arc::clone(&nonce), Arc::new(AtomicUsize::new(0)));
+    service.start_session(Epoch(2));
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    let prepared = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    nonce.store(5, Ordering::SeqCst);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
+    let retry = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(decode_nonce(&prepared), 6);
+    assert_eq!(retry, prepared);
+}
+
+#[test]
 fn reprepares_active_artifact_when_buffered_base_fee_increases() {
     let nonce = Arc::new(AtomicU64::new(5));
     let base_fee = Arc::new(AtomicU64::new(100));
@@ -286,6 +304,8 @@ fn overlapping_session_accepts_late_calls_from_previous_epoch() {
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let expected = service
+        .reliable
+        .strategy()
         .config
         .calldata(Epoch(2), &previous, service.signer_address())
         .unwrap();
@@ -307,6 +327,8 @@ fn third_session_evicts_oldest_epoch_and_rejects_its_late_calls() {
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let expected = service
+        .reliable
+        .strategy()
         .config
         .calldata(Epoch(4), &current, service.signer_address())
         .unwrap();

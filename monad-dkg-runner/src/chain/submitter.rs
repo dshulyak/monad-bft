@@ -18,16 +18,17 @@ use zeroize::Zeroize;
 use super::{chain_call_kind, ContractRegistration, DkgChain, DkgChainConfig, DkgContract};
 use crate::DkgError;
 
+use self::reliable::{Attempt, PreparedState, ReliableSubmitter, SubmissionStrategy};
+
+mod reliable;
+
+type TxKey = (Epoch, ChainTxId);
+type ReliableTxSubmitter = ReliableSubmitter<TxSubmission, TxKey, ChainCall>;
+
 pub(crate) struct TxSubmitter {
-    config: TxConfig,
-    signer: PrivateKeySigner,
-    chain: Arc<dyn DkgChain>,
-    pending: BTreeMap<(Epoch, ChainTxId), ChainCall>,
-    prepared: Option<PreparedTx>,
-    finalized: BTreeSet<(Epoch, ChainTxId)>,
+    reliable: ReliableTxSubmitter,
     active_epochs: BTreeSet<Epoch>,
     recovered_epochs: BTreeSet<Epoch>,
-    context_blocks: BTreeMap<Epoch, SeqNum>,
 }
 
 impl TxSubmitter {
@@ -38,7 +39,7 @@ impl TxSubmitter {
         key.0.zeroize();
         let signer = signer?;
 
-        Ok(Self {
+        let submission = TxSubmission {
             config: TxConfig {
                 contract: config.contract,
                 chain_id: config.chain_id,
@@ -47,17 +48,17 @@ impl TxSubmitter {
             },
             signer,
             chain,
-            pending: BTreeMap::new(),
-            prepared: None,
-            finalized: BTreeSet::new(),
+            context_blocks: BTreeMap::new(),
+        };
+        Ok(Self {
+            reliable: ReliableSubmitter::new(submission),
             active_epochs: BTreeSet::new(),
             recovered_epochs: BTreeSet::new(),
-            context_blocks: BTreeMap::new(),
         })
     }
 
     pub(crate) fn signer_address(&self) -> Address {
-        self.signer.address()
+        self.reliable.strategy().signer.address()
     }
 
     pub(crate) fn submit_registration(
@@ -66,12 +67,14 @@ impl TxSubmitter {
         block: SeqNum,
         registration: RegistrationCall,
     ) {
-        self.context_blocks.insert(epoch, block);
+        let submission = self.reliable.strategy_mut();
+        submission.context_blocks.insert(epoch, block);
+        let contract = submission.config.contract;
         self.submit(
             epoch,
             ChainCall::PostRegistration {
                 registration,
-                dkg: dkg_core::Address(self.config.contract.into_array()),
+                dkg: dkg_core::Address(contract.into_array()),
             },
         );
     }
@@ -93,25 +96,16 @@ impl TxSubmitter {
             .active_epochs
             .last()
             .expect("started DKG transaction epoch");
-        self.pending.retain(|(pending_epoch, id), _| {
+        self.reliable.retain(|(pending_epoch, id)| {
             self.active_epochs.contains(pending_epoch)
                 || (*pending_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
         });
-        self.finalized.retain(|(finalized_epoch, id)| {
-            self.active_epochs.contains(finalized_epoch)
-                || (*finalized_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
-        });
         self.recovered_epochs
             .retain(|recovered| self.active_epochs.contains(recovered));
-        self.context_blocks
+        self.reliable
+            .strategy_mut()
+            .context_blocks
             .retain(|epoch, _| self.active_epochs.contains(epoch) || *epoch > latest);
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| !self.pending.contains_key(&prepared.key))
-        {
-            self.prepared = None;
-        }
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
@@ -121,44 +115,34 @@ impl TxSubmitter {
             return;
         }
 
-        if self.finalized.contains(&key) || self.pending.contains_key(&key) {
+        if !self.reliable.enqueue(key.clone(), call) {
             return;
         }
-
-        self.pending.insert(key.clone(), call);
         if immediate || self.recovered_epochs.contains(&epoch) {
             self.submit_keys([key]);
         }
     }
 
     pub(crate) fn retry_registration(&mut self, epoch: Epoch, block: SeqNum) {
-        self.context_blocks.insert(epoch, block);
-        let keys = self
-            .pending
-            .keys()
-            .filter(|(pending_epoch, id)| {
-                *pending_epoch == epoch && matches!(id, ChainTxId::Registration { .. })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        self.reliable
+            .strategy_mut()
+            .context_blocks
+            .insert(epoch, block);
+        let keys = self.reliable.pending_keys(|(pending_epoch, id)| {
+            *pending_epoch == epoch && matches!(id, ChainTxId::Registration { .. })
+        });
         self.submit_keys(keys);
     }
 
     pub(crate) fn confirm_registration(&mut self, epoch: Epoch, registration: &RegistrationCall) {
         let id = ChainTxId::from(registration);
-        self.finalized.insert((epoch, id.clone()));
-        self.remove_pending(&(epoch, id));
+        self.reliable.confirm((epoch, id));
     }
 
     pub(crate) fn cancel_registration(&mut self, epoch: Epoch) {
-        self.pending.retain(|(pending_epoch, id), _| {
-            *pending_epoch != epoch || !matches!(id, ChainTxId::Registration { .. })
+        self.reliable.remove_where(|(pending_epoch, id)| {
+            *pending_epoch == epoch && matches!(id, ChainTxId::Registration { .. })
         });
-        if self.prepared.as_ref().is_some_and(|prepared| {
-            prepared.key.0 == epoch && matches!(&prepared.key.1, ChainTxId::Registration { .. })
-        }) {
-            self.prepared = None;
-        }
     }
 
     pub(crate) fn finalized_block(
@@ -171,156 +155,192 @@ impl TxSubmitter {
         if !self.active_epochs.contains(&epoch) {
             return;
         }
-        self.context_blocks.insert(epoch, block);
+        self.reliable
+            .strategy_mut()
+            .context_blocks
+            .insert(epoch, block);
         for event in events {
             let id = ChainTxId::from(&event);
-            self.finalized.insert((epoch, id.clone()));
-            self.remove_pending(&(epoch, id));
+            self.reliable.confirm((epoch, id));
         }
         if recovery_complete_after {
             self.recovered_epochs.insert(epoch);
         }
         if self.recovered_epochs.contains(&epoch) {
             let keys = self
-                .pending
-                .keys()
-                .filter(|(pending_epoch, _)| *pending_epoch == epoch)
-                .cloned()
-                .collect::<Vec<_>>();
+                .reliable
+                .pending_keys(|(pending_epoch, _)| *pending_epoch == epoch);
             self.submit_keys(keys);
         }
     }
 
-    fn submit_keys(&mut self, keys: impl IntoIterator<Item = (Epoch, ChainTxId)>) {
+    fn submit_keys(&mut self, keys: impl IntoIterator<Item = TxKey>) {
         let keys = keys.into_iter().collect::<Vec<_>>();
         loop {
-            let key = match self.prepared.as_ref() {
-                Some(prepared) if keys.contains(&prepared.key) => prepared.key.clone(),
-                Some(_) => return,
-                None => match keys.iter().find(|key| self.pending.contains_key(key)) {
-                    Some(key) => (*key).clone(),
-                    None => return,
-                },
-            };
-            let (epoch, id) = key.clone();
-            // An active retry stays at its epoch's event-scan boundary. New work
-            // uses the newest boundary so overlapping sessions observe consumed nonces.
-            let block = if self.prepared.is_some() {
-                self.context_blocks.get(&epoch).copied()
-            } else {
-                self.context_blocks.values().copied().max()
-            };
-            let Some(block) = block else {
-                warn!(
+            match self.reliable.attempt(keys.clone()) {
+                Attempt::Idle => return,
+                // This handles a finalized no-op/revert that consumed the nonce but
+                // emitted no event, such as a duplicate BVE witness for one pair.
+                Attempt::Retired {
+                    key: (epoch, _),
+                    value,
+                } => info!(
                     epoch = epoch.0,
-                    "missing DKG transaction context block; will retry"
-                );
-                return;
-            };
-            let transaction_context =
-                match self.chain.transaction_context(block, self.signer.address()) {
-                    Ok(context) => context,
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            block = block.0,
-                            "failed to read DKG transaction context; will retry"
-                        );
-                        return;
-                    }
-                };
-            let chain_nonce = transaction_context.nonce;
-            let max_fee_per_gas =
-                buffered_base_fee_per_gas(u128::from(transaction_context.base_fee_per_gas))
-                    .saturating_add(self.config.max_priority_fee_per_gas);
-
-            // This handles a finalized no-op/revert that consumed the nonce but
-            // emitted no event, such as a duplicate BVE witness for one pair.
-            if self
-                .prepared
-                .as_ref()
-                .is_some_and(|prepared| prepared.transaction.nonce() < chain_nonce)
-            {
-                let call_kind = chain_call_kind(&self.pending[&key]);
-                self.remove_pending(&key);
-                self.finalized.insert((epoch, id));
-                info!(
-                    epoch = epoch.0,
-                    call_kind,
-                    chain_nonce,
+                    call_kind = chain_call_kind(&value),
                     "retired finalized DKG transaction without a matching event"
-                );
-                continue;
-            }
-            if self.prepared.as_ref().is_some_and(|prepared| {
-                prepared.transaction.nonce() == chain_nonce
-                    && prepared.transaction.max_fee_per_gas() < max_fee_per_gas
-            }) {
-                self.prepared = None;
-            }
-            let call_kind = chain_call_kind(&self.pending[&key]);
-            if self.prepared.is_none() {
-                let transaction = match self.config.prepare(
-                    &self.signer,
-                    chain_nonce,
-                    max_fee_per_gas,
-                    epoch,
-                    &self.pending[&key],
-                ) {
-                    Ok(transaction) => transaction,
-                    Err(err) => {
-                        warn!(
-                            ?err,
+                ),
+                Attempt::RefreshFailed { key, error } => {
+                    let (epoch, _) = &key;
+                    let call_kind = self
+                        .reliable
+                        .pending(&key)
+                        .map(chain_call_kind)
+                        .expect("failed refreshed submission remains pending");
+                    match error {
+                        TxSubmissionError::MissingContext => warn!(
+                            epoch = epoch.0,
+                            call_kind, "missing DKG transaction context block; will retry"
+                        ),
+                        TxSubmissionError::ChainContext { block, source } => warn!(
+                            ?source,
+                            block = block.0,
+                            call_kind,
+                            "failed to read DKG transaction context; will retry"
+                        ),
+                        TxSubmissionError::Operation(source) => warn!(
+                            ?source,
                             epoch = epoch.0,
                             call_kind,
                             "failed to prepare DKG chain tx; will retry"
-                        );
-                        return;
+                        ),
                     }
-                };
-                self.prepared = Some(PreparedTx { key, transaction });
+                    return;
+                }
+                Attempt::Submitted { key } => {
+                    let (epoch, _) = &key;
+                    let call_kind = self
+                        .reliable
+                        .pending(&key)
+                        .map(chain_call_kind)
+                        .expect("submitted transaction remains pending");
+                    let prepared = self
+                        .reliable
+                        .prepared(&key)
+                        .expect("submitted transaction remains prepared");
+                    info!(
+                        epoch = epoch.0,
+                        call_kind,
+                        nonce = prepared.transaction.nonce(),
+                        latest_base_fee_per_gas = prepared.latest_base_fee_per_gas,
+                        max_fee_per_gas = prepared.transaction.max_fee_per_gas(),
+                        max_priority_fee_per_gas = self
+                            .reliable
+                            .strategy()
+                            .config
+                            .max_priority_fee_per_gas,
+                        tx_hash = %prepared.transaction.tx_hash(),
+                        "queued DKG transaction for local txpool insertion"
+                    );
+                    return;
+                }
+                Attempt::SubmitFailed { key, error } => {
+                    let (epoch, _) = &key;
+                    let call_kind = self
+                        .reliable
+                        .pending(&key)
+                        .map(chain_call_kind)
+                        .expect("failed submission remains pending");
+                    let prepared = self
+                        .reliable
+                        .prepared(&key)
+                        .expect("failed submission remains prepared");
+                    warn!(
+                        ?error,
+                        epoch = epoch.0,
+                        call_kind,
+                        nonce = prepared.transaction.nonce(),
+                        tx_hash = %prepared.transaction.tx_hash(),
+                        "failed to queue DKG chain tx; will retry"
+                    );
+                    return;
+                }
             }
-
-            let transaction = &self.prepared.as_ref().expect("prepared above").transaction;
-            match self.chain.submit_transaction(transaction.clone()) {
-                Ok(()) => info!(
-                    epoch = epoch.0,
-                    call_kind,
-                    nonce = transaction.nonce(),
-                    latest_base_fee_per_gas = transaction_context.base_fee_per_gas,
-                    max_fee_per_gas = transaction.max_fee_per_gas(),
-                    max_priority_fee_per_gas = self.config.max_priority_fee_per_gas,
-                    tx_hash = %transaction.tx_hash(),
-                    "queued DKG transaction for local txpool insertion"
-                ),
-                Err(err) => warn!(
-                    ?err,
-                    epoch = epoch.0,
-                    call_kind,
-                    nonce = transaction.nonce(),
-                    tx_hash = %transaction.tx_hash(),
-                    "failed to queue DKG chain tx; will retry"
-                ),
-            }
-            return;
-        }
-    }
-
-    fn remove_pending(&mut self, key: &(Epoch, ChainTxId)) {
-        self.pending.remove(key);
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| &prepared.key == key)
-        {
-            self.prepared = None;
         }
     }
 }
 
+struct TxSubmission {
+    config: TxConfig,
+    signer: PrivateKeySigner,
+    chain: Arc<dyn DkgChain>,
+    context_blocks: BTreeMap<Epoch, SeqNum>,
+}
+
 struct PreparedTx {
-    key: (Epoch, ChainTxId),
     transaction: TxEnvelope,
+    latest_base_fee_per_gas: u64,
+}
+
+#[derive(Debug)]
+enum TxSubmissionError {
+    MissingContext,
+    ChainContext { block: SeqNum, source: DkgError },
+    Operation(DkgError),
+}
+
+impl SubmissionStrategy<TxKey, ChainCall> for TxSubmission {
+    type Prepared = PreparedTx;
+    type Error = TxSubmissionError;
+
+    fn refresh(
+        &self,
+        key: &TxKey,
+        call: &ChainCall,
+        prepared: Option<&Self::Prepared>,
+    ) -> Result<PreparedState<Self::Prepared>, Self::Error> {
+        // An active retry stays at its epoch's event-scan boundary. New work
+        // uses the newest boundary so overlapping sessions observe consumed nonces.
+        let block = if prepared.is_some() {
+            self.context_blocks.get(&key.0).copied()
+        } else {
+            self.context_blocks.values().copied().max()
+        }
+        .ok_or(TxSubmissionError::MissingContext)?;
+        let context = self
+            .chain
+            .transaction_context(block, self.signer.address())
+            .map_err(|source| TxSubmissionError::ChainContext { block, source })?;
+        let max_fee_per_gas = buffered_base_fee_per_gas(u128::from(context.base_fee_per_gas))
+            .saturating_add(self.config.max_priority_fee_per_gas);
+
+        if let Some(prepared) = prepared {
+            if prepared.transaction.nonce() < context.nonce {
+                return Ok(PreparedState::Obsolete);
+            }
+            // An overlapping epoch may retry against an older context block;
+            // do not replace its prepared transaction with a stale lower nonce.
+            if prepared.transaction.nonce() != context.nonce
+                || prepared.transaction.max_fee_per_gas() >= max_fee_per_gas
+            {
+                return Ok(PreparedState::Current);
+            }
+        }
+
+        let transaction = self
+            .config
+            .prepare(&self.signer, context.nonce, max_fee_per_gas, key.0, call)
+            .map_err(TxSubmissionError::Operation)?;
+        Ok(PreparedState::Replace(PreparedTx {
+            transaction,
+            latest_base_fee_per_gas: context.base_fee_per_gas,
+        }))
+    }
+
+    fn submit(&self, prepared: &Self::Prepared) -> Result<(), Self::Error> {
+        self.chain
+            .submit_transaction(prepared.transaction.clone())
+            .map_err(TxSubmissionError::Operation)
+    }
 }
 
 struct TxConfig {

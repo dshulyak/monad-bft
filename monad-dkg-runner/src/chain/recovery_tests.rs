@@ -43,6 +43,30 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
 }
 
 #[test]
+fn cursor_enters_live_phase_after_snapshot() {
+    let session = test_session();
+    let mut reader = ChainEventReader::default();
+    reader.start_session(session);
+
+    let snapshot = reader.next_read().unwrap();
+    assert!(
+        reader
+            .complete(snapshot, vec![pc_event(10)])
+            .recovery_complete_after
+    );
+
+    reader.notify_finalized(SeqNum(11));
+    let block = reader.next_read().unwrap();
+    assert_eq!(block, ChainRead::Block(SeqNum(11), session));
+    assert!(
+        !reader
+            .complete(block, vec![pc_event(11)])
+            .recovery_complete_after
+    );
+    assert!(reader.next_read().is_none());
+}
+
+#[test]
 fn read_job_uses_snapshot_then_receipts() {
     let chain = RecordingChain::default();
     let session = test_session();
