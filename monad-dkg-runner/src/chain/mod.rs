@@ -28,96 +28,14 @@ pub use triedb::new_triedb_runner;
 
 pub(crate) use submitter::TxSubmitter;
 
-sol! {
-    struct ContractSecpPoint {
-        uint8 prefix;
-        bytes32 x;
-    }
+sol!("../dkg-contracts/src/DkgContract.sol");
 
-    struct ContractRegistration {
-        ContractSecpPoint qcVerifyingKey;
-        ContractSecpPoint receiverPublicKey;
-        ContractSecpPoint receiverKeyImage;
-        ContractSecpPoint proofU0;
-        ContractSecpPoint proofV0;
-        bytes32 proofZ;
-    }
-
-    struct ContractQcSignature {
-        uint32 signer;
-        bytes32 r;
-        bytes32 s;
-    }
-
-    struct ContractPcQc {
-        uint32 dealer;
-        bytes32 digest;
-        ContractQcSignature[] signatures;
-    }
-
-    struct ContractBveQc {
-        uint32 dealer;
-        bytes32 digest;
-        bytes32 commitmentDigest;
-        ContractQcSignature[] signatures;
-    }
-
-    struct ContractDkgResult {
-        uint64 epoch;
-        bytes32[6] g2x;
-        ContractQcSignature[] signatures;
-    }
-
-    enum ContractRecordKind {
-        PcQc,
-        BveQc,
-        DkgResult
-    }
-
-    struct ContractDkgRecord {
-        ContractRecordKind kind;
-        uint32 dealer;
-        bytes32 digest;
-        bytes32 commitmentDigest;
-        uint64 resultEpoch;
-        bytes32[6] g2x;
-        ContractQcSignature[] signatures;
-    }
-
-    interface DkgContract {
-        function register(uint64 epoch, ContractRegistration registration);
-        function postPcQc(uint64 epoch, ContractPcQc qc);
-        function postBveQc(uint64 epoch, ContractBveQc qc);
-        function submitResult(uint64 epoch, ContractDkgResult result);
-        function registrationOf(uint64 epoch, address party)
-            external view returns (bool exists, ContractRegistration registration);
-        function recordCount(uint64 epoch) external view returns (uint256);
-        function recordAt(uint64 epoch, uint256 index)
-            external view returns (ContractDkgRecord record);
-    }
-
-    event PcQcPosted(
-        uint64 indexed epoch,
-        uint64 indexed sequence,
-        uint32 indexed dealer,
-        bytes32 digest,
-        ContractQcSignature[] signatures
-    );
-    event BveQcPosted(
-        uint64 indexed epoch,
-        uint64 indexed sequence,
-        uint32 indexed dealer,
-        bytes32 digest,
-        bytes32 commitmentDigest,
-        ContractQcSignature[] signatures
-    );
-    event DkgResultPosted(
-        uint64 indexed epoch,
-        uint64 indexed sequence,
-        bytes32[6] g2x,
-        ContractQcSignature[] signatures
-    );
-}
+use DkgContract::{
+    BveQc as ContractBveQc, BveQcPosted, DkgResult as ContractDkgResult, DkgResultPosted,
+    PcQc as ContractPcQc, PcQcPosted, QcSignature as ContractQcSignature,
+    RecordPage as ContractRecordPage, Registration as ContractRegistration,
+    SecpPoint as ContractSecpPoint,
+};
 
 const COMPRESSED_SECP_POINT_BYTES: usize = 33;
 
@@ -131,8 +49,6 @@ pub enum ContractCodecError {
     SignerOutOfRange { signer: u32, party_count: usize },
     #[error("typed DKG QC signers are not strictly increasing at signer {signer}")]
     NonCanonicalSigners { signer: u32 },
-    #[error("typed DKG record has an invalid kind")]
-    InvalidRecordKind,
 }
 
 impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
@@ -196,7 +112,6 @@ impl From<&BveQc> for ContractBveQc {
 impl From<&DkgDoneQc> for ContractDkgResult {
     fn from(qc: &DkgDoneQc) -> Self {
         Self {
-            epoch: qc.epoch.0,
             g2x: std::array::from_fn(|index| {
                 let start = index * 32;
                 B256::from_slice(&qc.g2x.0[start..start + 32])
@@ -212,14 +127,12 @@ impl PcQcPosted {
         record_id: RecordId,
         party_count: usize,
     ) -> Result<ChainEvent, ContractCodecError> {
-        Ok(ChainEvent::PCQc {
-            record_id,
-            qc: PCQc {
-                dealer: PartyId(self.dealer),
-                digest: self.digest.0,
-                signatures: ContractQcSignature::decode_all(self.signatures.clone(), party_count)?,
-            },
-        })
+        ContractPcQc {
+            dealer: self.dealer,
+            digest: self.digest,
+            signatures: self.signatures.clone(),
+        }
+        .into_chain_event(record_id, party_count)
     }
 }
 
@@ -229,15 +142,13 @@ impl BveQcPosted {
         record_id: RecordId,
         party_count: usize,
     ) -> Result<ChainEvent, ContractCodecError> {
-        Ok(ChainEvent::BveQcFinalized {
-            record_id,
-            qc: BveQc {
-                dealer: PartyId(self.dealer),
-                digest: self.digest.0,
-                commitment_digest: self.commitmentDigest.0,
-                signatures: ContractQcSignature::decode_all(self.signatures.clone(), party_count)?,
-            },
-        })
+        ContractBveQc {
+            dealer: self.dealer,
+            digest: self.digest,
+            commitmentDigest: self.commitmentDigest,
+            signatures: self.signatures.clone(),
+        }
+        .into_chain_event(record_id, party_count)
     }
 }
 
@@ -247,6 +158,56 @@ impl DkgResultPosted {
         record_id: RecordId,
         party_count: usize,
     ) -> Result<ChainEvent, ContractCodecError> {
+        ContractDkgResult {
+            g2x: self.g2x,
+            signatures: self.signatures.clone(),
+        }
+        .into_chain_event(record_id, SessionId(self.epoch), party_count)
+    }
+}
+
+impl ContractPcQc {
+    pub(super) fn into_chain_event(
+        self,
+        record_id: RecordId,
+        party_count: usize,
+    ) -> Result<ChainEvent, ContractCodecError> {
+        Ok(ChainEvent::PCQc {
+            record_id,
+            qc: PCQc {
+                dealer: PartyId(self.dealer),
+                digest: self.digest.0,
+                signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
+            },
+        })
+    }
+}
+
+impl ContractBveQc {
+    pub(super) fn into_chain_event(
+        self,
+        record_id: RecordId,
+        party_count: usize,
+    ) -> Result<ChainEvent, ContractCodecError> {
+        Ok(ChainEvent::BveQcFinalized {
+            record_id,
+            qc: BveQc {
+                dealer: PartyId(self.dealer),
+                digest: self.digest.0,
+                commitment_digest: self.commitmentDigest.0,
+                signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
+            },
+        })
+    }
+}
+
+impl ContractDkgResult {
+    pub(super) fn into_chain_event(
+        self,
+        record_id: RecordId,
+        epoch: SessionId,
+        party_count: usize,
+    ) -> Result<ChainEvent, ContractCodecError> {
         let mut point = [0_u8; BLS_G2_SERIALIZED_BYTES];
         for (chunk, limb) in point.chunks_exact_mut(32).zip(self.g2x) {
             chunk.copy_from_slice(limb.as_slice());
@@ -254,54 +215,11 @@ impl DkgResultPosted {
         Ok(ChainEvent::DkgResultRecorded {
             record_id,
             qc: DkgDoneQc {
-                epoch: SessionId(self.epoch),
+                epoch,
                 g2x: BlsG2SerializedBytes(point),
-                signatures: ContractQcSignature::decode_all(self.signatures.clone(), party_count)?,
+                signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
             },
         })
-    }
-}
-
-impl ContractDkgRecord {
-    pub(super) fn into_chain_event(
-        self,
-        record_id: RecordId,
-        party_count: usize,
-    ) -> Result<ChainEvent, ContractCodecError> {
-        match self.kind {
-            ContractRecordKind::PcQc => Ok(ChainEvent::PCQc {
-                record_id,
-                qc: PCQc {
-                    dealer: PartyId(self.dealer),
-                    digest: self.digest.0,
-                    signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
-                },
-            }),
-            ContractRecordKind::BveQc => Ok(ChainEvent::BveQcFinalized {
-                record_id,
-                qc: BveQc {
-                    dealer: PartyId(self.dealer),
-                    digest: self.digest.0,
-                    commitment_digest: self.commitmentDigest.0,
-                    signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
-                },
-            }),
-            ContractRecordKind::DkgResult => {
-                let mut point = [0_u8; BLS_G2_SERIALIZED_BYTES];
-                for (chunk, limb) in point.chunks_exact_mut(32).zip(self.g2x) {
-                    chunk.copy_from_slice(limb.as_slice());
-                }
-                Ok(ChainEvent::DkgResultRecorded {
-                    record_id,
-                    qc: DkgDoneQc {
-                        epoch: SessionId(self.resultEpoch),
-                        g2x: BlsG2SerializedBytes(point),
-                        signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
-                    },
-                })
-            }
-            ContractRecordKind::__Invalid => Err(ContractCodecError::InvalidRecordKind),
-        }
     }
 }
 

@@ -212,18 +212,29 @@ contract DkgContractTest {
         postPc(fixture, pc);
         postBve(fixture, 0, bve);
 
-        require(fixture.dkg.recordCount(EPOCH) == 2, "wrong record count");
-        DkgContract.DkgRecord memory storedPc = fixture.dkg.recordAt(EPOCH, 0);
-        DkgContract.DkgRecord memory storedBve = fixture.dkg.recordAt(EPOCH, 1);
-        require(storedPc.kind == DkgContract.RecordKind.PcQc, "wrong PC kind");
+        DkgContract.RecordPage memory first = fixture.dkg.records(EPOCH, 0, 1);
+        require(first.total == 2 && first.next == 1, "wrong first page boundary");
+        require(first.pcQcs.length == 1 && first.pcQcs[0].sequence == 0, "wrong PC page");
+        DkgContract.PcQc memory storedPc = first.pcQcs[0].qc;
         require(storedPc.dealer == pc.dealer && storedPc.digest == pc.digest, "wrong PC");
         require(storedPc.signatures.length == 1, "wrong PC witness");
-        require(storedBve.kind == DkgContract.RecordKind.BveQc, "wrong BVE kind");
+
+        DkgContract.RecordPage memory second = fixture.dkg.records(EPOCH, first.next, 1);
+        require(second.total == 2 && second.next == 2, "wrong second page boundary");
+        require(second.bveQcs.length == 1 && second.bveQcs[0].sequence == 1, "wrong BVE page");
+        DkgContract.BveQc memory storedBve = second.bveQcs[0].qc;
         require(
             storedBve.dealer == bve.dealer && storedBve.digest == bve.digest
                 && storedBve.commitmentDigest == bve.commitmentDigest,
             "wrong BVE"
         );
+    }
+
+    function testEmptyRecordPageCarriesItsTotal() external {
+        (DkgContract dkg,,) = deploySingleRegistrationTarget();
+        DkgContract.RecordPage memory page = dkg.records(EPOCH, 0, 1);
+        require(page.total == 0 && page.next == 0, "wrong empty page boundary");
+        require(page.pcQcs.length == 0 && page.bveQcs.length == 0 && page.results.length == 0, "nonempty page");
     }
 
     function testProtocolRecordsEmitTypedEvents() external {
@@ -258,11 +269,11 @@ contract DkgContractTest {
 
         postPc(fixture, original);
         postPc(fixture, original);
-        require(fixture.dkg.recordCount(EPOCH) == 1, "identical QC was recorded twice");
+        require(recordTotal(fixture.dkg) == 1, "identical QC was recorded twice");
 
         DkgContract.PcQc memory alternateWitness = pcQc(3, 0x11, 2);
         postPc(fixture, alternateWitness);
-        require(fixture.dkg.recordCount(EPOCH) == 2, "alternate witness not recorded");
+        require(recordTotal(fixture.dkg) == 2, "alternate witness not recorded");
     }
 
     function testBveQcIsBoundedPerSubmittingValidatorAndDealer() external {
@@ -270,17 +281,22 @@ contract DkgContractTest {
 
         postBve(fixture, 0, bveQc(3, 0x11, 1));
         postBve(fixture, 0, bveQc(3, 0x11, 2));
-        require(fixture.dkg.recordCount(EPOCH) == 1, "submitter posted two witnesses for one dealer");
+        require(recordTotal(fixture.dkg) == 1, "submitter posted two witnesses for one dealer");
 
         postBve(fixture, 1, bveQc(3, 0x11, 3));
-        require(fixture.dkg.recordCount(EPOCH) == 2, "second validator could not post its witness");
+        require(recordTotal(fixture.dkg) == 2, "second validator could not post its witness");
     }
 
     function testMalformedQcCannotOccupyRecordSlot() external {
         Fixture memory fixture = deploySession();
         DkgContract.PcQc memory malformed = pcQc(1, 0x11, 1);
-        malformed.signatures[0].signer = 256;
+        malformed.signatures[0].signer = 4;
 
+        VM.expectRevert();
+        VM.prank(fixture.validators[0]);
+        fixture.dkg.postPcQc(EPOCH, malformed);
+
+        malformed = pcQc(4, 0x11, 1);
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.postPcQc(EPOCH, malformed);
@@ -291,11 +307,10 @@ contract DkgContractTest {
         DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
         submitResult(fixture, result);
 
-        require(fixture.dkg.recordCount(EPOCH) == 1, "wrong record count");
-        DkgContract.DkgRecord memory stored = fixture.dkg.recordAt(EPOCH, 0);
-        require(stored.kind == DkgContract.RecordKind.DkgResult, "wrong result kind");
-        require(stored.resultEpoch == EPOCH, "wrong result epoch");
-        require(stored.g2x[0] == result.g2x[0], "wrong result point");
+        DkgContract.RecordPage memory page = fixture.dkg.records(EPOCH, 0, 1);
+        require(page.total == 1 && page.next == 1, "wrong result page boundary");
+        require(page.results.length == 1 && page.results[0].sequence == 0, "wrong result page");
+        require(page.results[0].result.g2x[0] == result.g2x[0], "wrong result point");
 
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
@@ -348,15 +363,6 @@ contract DkgContractTest {
         fixture.dkg.postBveQc(EPOCH, bveQc(1, 0x11, 1));
     }
 
-    function testResultEpochMustMatchNamespace() external {
-        Fixture memory fixture = deploySession();
-        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
-        result.epoch = EPOCH + 1;
-        VM.expectRevert();
-        VM.prank(fixture.validators[0]);
-        fixture.dkg.submitResult(EPOCH, result);
-    }
-
     function deploySession() private returns (Fixture memory fixture) {
         fixture.staking = new TestValidatorLookup();
         fixture.dkg = new DkgContract(address(fixture.staking));
@@ -393,6 +399,10 @@ contract DkgContractTest {
     function submitResult(Fixture memory fixture, DkgContract.DkgResult memory result) private {
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
+    }
+
+    function recordTotal(DkgContract dkg) private view returns (uint64) {
+        return dkg.records(EPOCH, 0, 1).total;
     }
 
     function registration(uint8 qcKey) private pure returns (DkgContract.Registration memory) {
@@ -467,7 +477,6 @@ contract DkgContractTest {
         pure
         returns (DkgContract.DkgResult memory result)
     {
-        result.epoch = EPOCH;
         for (uint256 i = 0; i < 6; i++) {
             result.g2x[i] = bytes32(uint256(pointByte) + i);
         }

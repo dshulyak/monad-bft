@@ -67,20 +67,42 @@ contract DkgContract {
 
     /// @dev The protocol's serialized BLS12-381 G2 point is exactly 192 bytes.
     struct DkgResult {
-        uint64 epoch;
         bytes32[6] g2x;
         QcSignature[] signatures;
     }
 
-    /// @dev Global ordered record. Fields not used by `kind` remain zero.
-    struct DkgRecord {
+    struct RecordRef {
         RecordKind kind;
-        uint32 dealer;
-        bytes32 digest;
-        bytes32 commitmentDigest;
-        uint64 resultEpoch;
-        bytes32[6] g2x;
-        QcSignature[] signatures;
+        uint64 index;
+    }
+
+    struct SequencedPcQc {
+        uint64 sequence;
+        PcQc qc;
+    }
+
+    struct SequencedBveQc {
+        uint64 sequence;
+        BveQc qc;
+    }
+
+    struct SequencedDkgResult {
+        uint64 sequence;
+        DkgResult result;
+    }
+
+    struct RecordPage {
+        uint64 total;
+        uint64 next;
+        SequencedPcQc[] pcQcs;
+        SequencedBveQc[] bveQcs;
+        SequencedDkgResult[] results;
+    }
+
+    struct RecordCounts {
+        uint256 pc;
+        uint256 bve;
+        uint256 result;
     }
 
     bytes private constant SESSION_ID_DOMAIN = "BTX-DKG/protocol/session-id/v1";
@@ -96,7 +118,10 @@ contract DkgContract {
 
     address private immutable STAKING;
 
-    mapping(uint64 epoch => DkgRecord[] records) private recordsByEpoch;
+    mapping(uint64 epoch => RecordRef[] records) private recordsByEpoch;
+    mapping(uint64 epoch => PcQc[] records) private pcQcsByEpoch;
+    mapping(uint64 epoch => BveQc[] records) private bveQcsByEpoch;
+    mapping(uint64 epoch => DkgResult[] records) private resultsByEpoch;
     mapping(uint64 epoch => address[] parties) private registeredPartiesByEpoch;
     mapping(uint64 epoch => mapping(address party => Registration registration)) private registrations;
     /// @dev Bit `i` says registration `i` belongs to the frozen target set.
@@ -129,6 +154,7 @@ contract DkgContract {
     error InvalidPointPrefix(uint8 prefix);
     error InvalidSecpPoint();
     error MalformedQc();
+    error InvalidRecordPage(uint64 start, uint32 limit);
     error NotEpochParty(uint64 epoch, address caller);
     error NotValidator(address caller);
     error PartySetUnavailable(uint64 epoch);
@@ -136,7 +162,6 @@ contract DkgContract {
     error ResultAlreadyRecorded(uint64 resultEpoch);
     error StakingLookupFailed();
     error TooManyRegistrations(uint64 epoch);
-    error WrongResultEpoch(uint64 expected, uint64 actual);
 
     constructor(address staking_) {
         STAKING = staking_;
@@ -144,11 +169,6 @@ contract DkgContract {
 
     modifier onlyValidator() {
         _requireValidator();
-        _;
-    }
-
-    modifier onlyEpochParty(uint64 epoch) {
-        _requireEpochParty(epoch);
         _;
     }
 
@@ -179,11 +199,12 @@ contract DkgContract {
         emit PartyRegistered(epoch, msg.sender, registration);
     }
 
-    function postPcQc(uint64 epoch, PcQc calldata qc) external onlyEpochParty(epoch) {
+    function postPcQc(uint64 epoch, PcQc calldata qc) external {
+        address[] memory parties = _requireEpochParty(epoch);
         if (resultRecorded[epoch]) {
             revert DkgAlreadyFinished(epoch);
         }
-        _validateQc(qc.dealer, qc.signatures);
+        _validateQc(qc.dealer, qc.signatures, parties.length);
         bytes32 witnessHash = keccak256(abi.encode(qc));
         if (seenPcQcs[epoch][witnessHash]) {
             return;
@@ -191,39 +212,39 @@ contract DkgContract {
         seenPcQcs[epoch][witnessHash] = true;
 
         uint64 sequence = _nextSequence(epoch);
-        DkgRecord storage record = recordsByEpoch[epoch].push();
-        record.kind = RecordKind.PcQc;
+        uint64 index = _recordIndex(pcQcsByEpoch[epoch].length);
+        PcQc storage record = pcQcsByEpoch[epoch].push();
         record.dealer = qc.dealer;
         record.digest = qc.digest;
         _copySignatures(record.signatures, qc.signatures);
+        recordsByEpoch[epoch].push(RecordRef({kind: RecordKind.PcQc, index: index}));
         emit PcQcPosted(epoch, sequence, qc.dealer, qc.digest, qc.signatures);
     }
 
-    function postBveQc(uint64 epoch, BveQc calldata qc) external onlyEpochParty(epoch) {
+    function postBveQc(uint64 epoch, BveQc calldata qc) external {
+        address[] memory parties = _requireEpochParty(epoch);
         if (resultRecorded[epoch]) {
             revert DkgAlreadyFinished(epoch);
         }
-        _validateQc(qc.dealer, qc.signatures);
+        _validateQc(qc.dealer, qc.signatures, parties.length);
         if (submittedBveQc[epoch][msg.sender][qc.dealer]) {
             return;
         }
         submittedBveQc[epoch][msg.sender][qc.dealer] = true;
 
         uint64 sequence = _nextSequence(epoch);
-        DkgRecord storage record = recordsByEpoch[epoch].push();
-        record.kind = RecordKind.BveQc;
+        uint64 index = _recordIndex(bveQcsByEpoch[epoch].length);
+        BveQc storage record = bveQcsByEpoch[epoch].push();
         record.dealer = qc.dealer;
         record.digest = qc.digest;
         record.commitmentDigest = qc.commitmentDigest;
         _copySignatures(record.signatures, qc.signatures);
+        recordsByEpoch[epoch].push(RecordRef({kind: RecordKind.BveQc, index: index}));
         emit BveQcPosted(epoch, sequence, qc.dealer, qc.digest, qc.commitmentDigest, qc.signatures);
     }
 
     function submitResult(uint64 epoch, DkgResult calldata result) external {
         address[] memory parties = _requireEpochParty(epoch);
-        if (result.epoch != epoch) {
-            revert WrongResultEpoch(epoch, result.epoch);
-        }
         if (resultRecorded[epoch]) {
             revert ResultAlreadyRecorded(epoch);
         }
@@ -231,11 +252,11 @@ contract DkgContract {
         resultRecorded[epoch] = true;
 
         uint64 sequence = _nextSequence(epoch);
-        DkgRecord storage record = recordsByEpoch[epoch].push();
-        record.kind = RecordKind.DkgResult;
-        record.resultEpoch = result.epoch;
+        uint64 index = _recordIndex(resultsByEpoch[epoch].length);
+        DkgResult storage record = resultsByEpoch[epoch].push();
         record.g2x = result.g2x;
         _copySignatures(record.signatures, result.signatures);
+        recordsByEpoch[epoch].push(RecordRef({kind: RecordKind.DkgResult, index: index}));
         emit DkgResultPosted(epoch, sequence, result.g2x, result.signatures);
     }
 
@@ -269,12 +290,57 @@ contract DkgContract {
         return (index != type(uint256).max, index == type(uint256).max ? 0 : uint32(index));
     }
 
-    function recordCount(uint64 epoch) external view returns (uint256) {
-        return recordsByEpoch[epoch].length;
+    function records(uint64 epoch, uint64 start, uint32 limit) external view returns (RecordPage memory page) {
+        uint256 total = recordsByEpoch[epoch].length;
+        if (start > total || limit == 0) {
+            revert InvalidRecordPage(start, limit);
+        }
+        uint256 requestedEnd = uint256(start) + limit;
+        uint256 end = requestedEnd < total ? requestedEnd : total;
+        RecordCounts memory counts = _recordCounts(epoch, start, end);
+
+        page.total = _recordIndex(total);
+        page.next = _recordIndex(end);
+        page.pcQcs = new SequencedPcQc[](counts.pc);
+        page.bveQcs = new SequencedBveQc[](counts.bve);
+        page.results = new SequencedDkgResult[](counts.result);
+        _fillRecordPage(epoch, start, end, page);
     }
 
-    function recordAt(uint64 epoch, uint256 index) external view returns (DkgRecord memory) {
-        return recordsByEpoch[epoch][index];
+    function _recordCounts(uint64 epoch, uint256 start, uint256 end) private view returns (RecordCounts memory counts) {
+        RecordRef[] storage ordered = recordsByEpoch[epoch];
+        for (uint256 sequence = start; sequence < end; sequence++) {
+            RecordKind kind = ordered[sequence].kind;
+            if (kind == RecordKind.PcQc) {
+                counts.pc++;
+            } else if (kind == RecordKind.BveQc) {
+                counts.bve++;
+            } else {
+                counts.result++;
+            }
+        }
+    }
+
+    function _fillRecordPage(uint64 epoch, uint256 start, uint256 end, RecordPage memory page) private view {
+        RecordRef[] storage ordered = recordsByEpoch[epoch];
+        RecordCounts memory cursor;
+        for (uint256 sequence = start; sequence < end; sequence++) {
+            RecordRef storage recordRef = ordered[sequence];
+            uint64 recordSequence = _recordIndex(sequence);
+            if (recordRef.kind == RecordKind.PcQc) {
+                page.pcQcs[cursor.pc].sequence = recordSequence;
+                page.pcQcs[cursor.pc].qc = pcQcsByEpoch[epoch][recordRef.index];
+                cursor.pc++;
+            } else if (recordRef.kind == RecordKind.BveQc) {
+                page.bveQcs[cursor.bve].sequence = recordSequence;
+                page.bveQcs[cursor.bve].qc = bveQcsByEpoch[epoch][recordRef.index];
+                cursor.bve++;
+            } else {
+                page.results[cursor.result].sequence = recordSequence;
+                page.results[cursor.result].result = resultsByEpoch[epoch][recordRef.index];
+                cursor.result++;
+            }
+        }
     }
 
     /// @dev Freeze `PartyId -> address` from consensus-owned staking state.
@@ -619,11 +685,14 @@ contract DkgContract {
     }
 
     function _nextSequence(uint64 epoch) private view returns (uint64 sequence) {
-        uint256 length = recordsByEpoch[epoch].length;
-        if (length > type(uint64).max) {
+        return _recordIndex(recordsByEpoch[epoch].length);
+    }
+
+    function _recordIndex(uint256 index) private pure returns (uint64) {
+        if (index > type(uint64).max) {
             revert MalformedQc();
         }
-        return uint64(length);
+        return uint64(index);
     }
 
     function _validateRegistration(Registration calldata registration) private pure {
@@ -640,22 +709,22 @@ contract DkgContract {
         }
     }
 
-    function _validateQc(uint32 dealer, QcSignature[] calldata signatures) private pure {
-        if (dealer >= MAX_PARTIES) {
+    function _validateQc(uint32 dealer, QcSignature[] calldata signatures, uint256 partyCount) private pure {
+        if (dealer >= partyCount) {
             revert MalformedQc();
         }
-        _validateSignatures(signatures);
+        _validateSignatures(signatures, partyCount);
     }
 
-    function _validateSignatures(QcSignature[] calldata signatures) private pure {
+    function _validateSignatures(QcSignature[] calldata signatures, uint256 partyCount) private pure {
         uint256 count = signatures.length;
-        if (count == 0 || count > MAX_PARTIES) {
+        if (count == 0 || count > partyCount) {
             revert MalformedQc();
         }
         uint32 previous;
         for (uint256 i = 0; i < count; i++) {
             uint32 signer = signatures[i].signer;
-            if (signer >= MAX_PARTIES || (i != 0 && signer <= previous)) {
+            if (signer >= partyCount || (i != 0 && signer <= previous)) {
                 revert MalformedQc();
             }
             previous = signer;
