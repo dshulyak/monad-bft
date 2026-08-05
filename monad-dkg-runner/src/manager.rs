@@ -94,7 +94,7 @@ pub struct DkgManagerHandle<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
-    events: flume::Sender<DkgManagerEvent<ST>>,
+    events: Option<flume::Sender<DkgManagerEvent<ST>>>,
 }
 
 impl<ST> DkgManagerHandle<ST>
@@ -103,11 +103,24 @@ where
 {
     pub fn channel() -> (Self, DkgManagerInbox<ST>) {
         let (events, receiver) = flume::unbounded();
-        (Self { events }, DkgManagerInbox { events: receiver })
+        (
+            Self {
+                events: Some(events),
+            },
+            DkgManagerInbox { events: receiver },
+        )
+    }
+
+    pub fn disabled() -> Self {
+        Self { events: None }
     }
 
     fn send(&self, event: DkgManagerEvent<ST>) {
-        if self.events.send(event).is_err() {
+        if self
+            .events
+            .as_ref()
+            .is_some_and(|events| events.send(event).is_err())
+        {
             warn!("DKG manager input channel closed");
         }
     }
@@ -150,15 +163,22 @@ where
     chain_session: Option<(Epoch, usize)>,
     sync_block: Option<SeqNum>,
     latest_finalized: Option<SeqNum>,
-    chain: Option<ManagedChain>,
+    chain: ManagedChain,
 }
 
 impl<ST> DkgManager<ST>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
-    pub fn new(self_id: NodeId<CertificateSignaturePubKey<ST>>, storage_root: PathBuf) -> Self {
-        Self {
+    pub(crate) fn new(
+        self_id: NodeId<CertificateSignaturePubKey<ST>>,
+        storage_root: PathBuf,
+        config: DkgChainConfig,
+        chain: Arc<dyn DkgChain>,
+    ) -> Result<Self, DkgError> {
+        let submitter = TxSubmitter::new(&config, Arc::clone(&chain))?;
+        let registration = LocalRegistration::new(submitter.signer_address());
+        Ok(Self {
             self_id,
             storage_root,
             pending_outbound: Vec::new(),
@@ -168,27 +188,14 @@ where
             chain_session: None,
             sync_block: None,
             latest_finalized: None,
-            chain: None,
-        }
-    }
-
-    pub(crate) fn new_with_chain(
-        self_id: NodeId<CertificateSignaturePubKey<ST>>,
-        storage_root: PathBuf,
-        config: DkgChainConfig,
-        chain: Arc<dyn DkgChain>,
-    ) -> Result<Self, DkgError> {
-        let mut manager = Self::new(self_id, storage_root);
-        let submitter = TxSubmitter::new(&config, Arc::clone(&chain))?;
-        let registration = LocalRegistration::new(submitter.signer_address());
-        manager.chain = Some(ManagedChain {
-            io: chain,
-            local_keys: config.local_keys.clone(),
-            submitter,
-            event_reader: ChainEventReader::default(),
-            registration,
-        });
-        Ok(manager)
+            chain: ManagedChain {
+                io: chain,
+                local_keys: config.local_keys.clone(),
+                submitter,
+                event_reader: ChainEventReader::default(),
+                registration,
+            },
+        })
     }
 
     pub async fn run(
@@ -235,20 +242,18 @@ where
     /// Calls are monotone and idempotent. Advancing the target abandons any
     /// unfinalized registration transaction for the older epoch.
     pub fn prepare_registration(&mut self, epoch: Epoch) {
-        let Some(chain) = self.chain.as_mut() else {
-            return;
-        };
-        if chain
+        if self
+            .chain
             .registration
             .epoch
             .is_some_and(|current| current >= epoch)
         {
             return;
         }
-        if let Some(previous) = chain.registration.epoch {
-            chain.submitter.cancel_registration(previous);
+        if let Some(previous) = self.chain.registration.epoch {
+            self.chain.submitter.cancel_registration(previous);
         }
-        chain.registration.start_epoch(epoch);
+        self.chain.registration.start_epoch(epoch);
         self.schedule_local_registration_read();
     }
 
@@ -259,9 +264,7 @@ where
             self.schedule_pending_registration_reads();
             self.schedule_local_registration_read();
         }
-        if let Some(chain) = self.chain.as_mut() {
-            chain.event_reader.notify_finalized(block);
-        }
+        self.chain.event_reader.notify_finalized(block);
         self.schedule_chain_read();
     }
 
@@ -275,16 +278,14 @@ where
         }
         self.sync_block = Some(block);
         self.record_finalized_head(block);
-        if let Some(chain) = self.chain.as_mut() {
-            chain.event_reader.notify_finalized(block);
-            if let Some((epoch, party_count)) = self.chain_session {
-                chain.submitter.start_session(epoch);
-                chain.event_reader.start_session(ChainEventSession {
-                    epoch,
-                    party_count,
-                    recovery_block: block,
-                });
-            }
+        self.chain.event_reader.notify_finalized(block);
+        if let Some((epoch, party_count)) = self.chain_session {
+            self.chain.submitter.start_session(epoch);
+            self.chain.event_reader.start_session(ChainEventSession {
+                epoch,
+                party_count,
+                recovery_block: block,
+            });
         }
         self.schedule_chain_read();
         self.schedule_pending_registration_reads();
@@ -322,9 +323,6 @@ where
         {
             return Ok(());
         }
-        if self.chain.is_none() {
-            return Err(DkgError::Unsupported("DKG registration reads"));
-        }
         self.pending_registered_session = Some((
             epoch,
             PendingRegisteredSession {
@@ -337,12 +335,9 @@ where
     }
 
     fn close_registration_window(&mut self, epoch: Epoch) {
-        let Some(chain) = self.chain.as_mut() else {
-            return;
-        };
-        if chain.registration.epoch == Some(epoch) {
-            chain.submitter.cancel_registration(epoch);
-            chain.registration.phase = LocalRegistrationPhase::Done;
+        if self.chain.registration.epoch == Some(epoch) {
+            self.chain.submitter.cancel_registration(epoch);
+            self.chain.registration.phase = LocalRegistrationPhase::Done;
         }
     }
 
@@ -354,25 +349,21 @@ where
             let Some(latest) = self.latest_finalized else {
                 return;
             };
-            let Some((epoch, block, result)) = self.chain.as_ref().and_then(|chain| {
-                let registration = &chain.registration;
-                let epoch = registration.epoch?;
-                (registration.phase != LocalRegistrationPhase::Done).then(|| {
-                    let block = registration.unavailable_block.unwrap_or(latest);
-                    (
-                        epoch,
-                        block,
-                        chain
-                            .io
-                            .read_registrations(block, epoch, &[registration.address]),
-                    )
-                })
-            }) else {
+            let registration = &self.chain.registration;
+            let Some(epoch) = registration.epoch else {
                 return;
             };
+            if registration.phase == LocalRegistrationPhase::Done {
+                return;
+            }
+            let block = registration.unavailable_block.unwrap_or(latest);
+            let result =
+                self.chain
+                    .io
+                    .read_registrations(block, epoch, &[self.chain.registration.address]);
             match result {
-                Ok(Some(mut registrations)) => {
-                    self.chain.as_mut().unwrap().registration.unavailable_block = None;
+                Ok(mut registrations) => {
+                    self.chain.registration.unavailable_block = None;
                     debug_assert!(registrations.len() <= 1);
                     if let Err(err) =
                         self.accept_local_registration_read(epoch, block, registrations.pop())
@@ -389,12 +380,12 @@ where
                         return;
                     }
                 }
-                Ok(None) => {
-                    self.chain.as_mut().unwrap().registration.unavailable_block = Some(block);
+                Err(DkgError::ChainDataUnavailable { .. }) => {
+                    self.chain.registration.unavailable_block = Some(block);
                     return;
                 }
                 Err(err) => {
-                    let registration = &mut self.chain.as_mut().unwrap().registration;
+                    let registration = &mut self.chain.registration;
                     registration.unavailable_block = Some(block);
                     debug!(?err, epoch = epoch.0, block = block.0, party = %registration.address, "failed to read local DKG registration from finalized state");
                     return;
@@ -410,22 +401,19 @@ where
         observed: Option<RegistrationCall>,
     ) -> Result<(), DkgError> {
         let storage_root = self.storage_root.clone();
-        let Some(chain) = self.chain.as_mut() else {
-            return Ok(());
-        };
-        if chain.registration.epoch != Some(epoch) {
+        if self.chain.registration.epoch != Some(epoch) {
             return Ok(());
         }
         let local_bytes = match load_or_create_local_registration(
             &storage_root,
             epoch,
-            chain.registration.address.into_array(),
-            &chain.local_keys,
+            self.chain.registration.address.into_array(),
+            &self.chain.local_keys,
             observed.as_ref(),
         ) {
             Ok(bytes) => bytes,
             Err(err) => {
-                chain.registration.phase = LocalRegistrationPhase::Done;
+                self.chain.registration.phase = LocalRegistrationPhase::Done;
                 return Err(DkgError::operation("load local DKG registration", err));
             }
         };
@@ -436,23 +424,25 @@ where
         );
 
         if let Some(bytes) = observed {
-            chain.registration.phase = LocalRegistrationPhase::Done;
+            self.chain.registration.phase = LocalRegistrationPhase::Done;
             if bytes != local_bytes {
                 return Err(DkgError::FinalizedRegistrationConflict {
-                    address: chain.registration.address,
+                    address: self.chain.registration.address,
                 });
             }
-            chain.submitter.confirm_registration(epoch, &local_bytes);
+            self.chain
+                .submitter
+                .confirm_registration(epoch, &local_bytes);
         } else {
-            match chain.registration.phase {
+            match self.chain.registration.phase {
                 LocalRegistrationPhase::Submitted => {
-                    chain.submitter.retry_registration(epoch, block);
+                    self.chain.submitter.retry_registration(epoch, block);
                 }
                 LocalRegistrationPhase::Open => {
-                    chain
+                    self.chain
                         .submitter
                         .submit_registration(epoch, block, local_bytes);
-                    chain.registration.phase = LocalRegistrationPhase::Submitted;
+                    self.chain.registration.phase = LocalRegistrationPhase::Submitted;
                 }
                 LocalRegistrationPhase::Done => {}
             }
@@ -466,9 +456,7 @@ where
         if self.sync_block.is_none() {
             return;
         }
-        let Some(io) = self.chain.as_ref().map(|chain| Arc::clone(&chain.io)) else {
-            return;
-        };
+        let io = Arc::clone(&self.chain.io);
         let Some((epoch, block, parties)) =
             self.pending_registered_session
                 .as_ref()
@@ -486,7 +474,7 @@ where
             return;
         };
         match io.read_registrations(block, epoch, &parties) {
-            Ok(Some(state)) => {
+            Ok(state) => {
                 if let Err(err) = self.accept_registration_snapshot(epoch, state) {
                     error!(
                         ?err,
@@ -496,7 +484,7 @@ where
                     );
                 }
             }
-            Ok(None) => {}
+            Err(DkgError::ChainDataUnavailable { .. }) => {}
             Err(err) => warn!(
                 ?err,
                 epoch = epoch.0,
@@ -520,11 +508,7 @@ where
         let recovery_block = pending
             .registration_block
             .expect("registration read has a finalized block");
-        let local_keys = &self
-            .chain
-            .as_ref()
-            .expect("registered session requires chain integration")
-            .local_keys;
+        let local_keys = &self.chain.local_keys;
         let registered = assemble_registered_session(
             epoch,
             self.self_id,
@@ -545,7 +529,7 @@ where
         &mut self,
         epoch: Epoch,
         validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
-        key_material: crate::session::DkgRegisteredKeyMaterial,
+        key_material: crate::DkgRegisteredKeyMaterial,
         recovery_block: Option<SeqNum>,
     ) -> Result<(), DkgError> {
         let party_count = validators.len();
@@ -580,12 +564,9 @@ where
         recovery_block: Option<SeqNum>,
     ) {
         self.chain_session = Some((epoch, party_count));
-        let Some(chain) = self.chain.as_mut() else {
-            return;
-        };
-        chain.submitter.start_session(epoch);
+        self.chain.submitter.start_session(epoch);
         if let Some(recovery_block) = recovery_block {
-            chain.event_reader.start_session(ChainEventSession {
+            self.chain.event_reader.start_session(ChainEventSession {
                 epoch,
                 party_count,
                 recovery_block,
@@ -650,32 +631,24 @@ where
     }
 
     fn submit_chain_calls(&mut self, epoch: Epoch, calls: Vec<dkg_protocol::ChainCall>) {
-        let Some(chain) = self.chain.as_mut() else {
-            return;
-        };
         for call in calls {
             failpoint::failpoint!(
                 name = "dkg.chain.call_buffered",
                 description =
                     "after a DKG chain call is buffered and before transaction submission",
             );
-            chain.submitter.submit(epoch, call);
+            self.chain.submitter.submit(epoch, call);
         }
     }
 
     fn schedule_chain_read(&mut self) {
         loop {
-            let Some((read, io)) = self.chain.as_ref().and_then(|chain| {
-                chain
-                    .event_reader
-                    .next_read()
-                    .map(|read| (read, Arc::clone(&chain.io)))
-            }) else {
+            let Some(read) = self.chain.event_reader.next_read() else {
                 return;
             };
-            let events = match io.read_events(read) {
-                Ok(Some(events)) => events,
-                Ok(None) => return,
+            let events = match self.chain.io.read_events(read) {
+                Ok(events) => events,
+                Err(DkgError::ChainDataUnavailable { .. }) => return,
                 Err(err) => {
                     warn!(
                         ?err,
@@ -686,12 +659,7 @@ where
                     return;
                 }
             };
-            let batch = self
-                .chain
-                .as_mut()
-                .expect("chain checked before blocking read")
-                .event_reader
-                .complete(read, events);
+            let batch = self.chain.event_reader.complete(read, events);
             if let Err(err) = self.accept_chain_batch(batch) {
                 error!(
                     ?err,
@@ -720,16 +688,14 @@ where
                 .map_err(|err| DkgError::operation("finish DKG chain recovery", err))?;
         }
         let calls = self.take_runner_effects(epoch);
-        if let Some(chain) = self.chain.as_mut() {
-            // Apply the observed events before their engine-generated calls so
-            // recovery cannot resubmit an effect that this same batch finalized.
-            chain.submitter.finalized_block(
-                epoch,
-                batch.block,
-                batch.events,
-                batch.recovery_complete_after,
-            );
-        }
+        // Apply the observed events before their engine-generated calls so
+        // recovery cannot resubmit an effect that this same batch finalized.
+        self.chain.submitter.finalized_block(
+            epoch,
+            batch.block,
+            batch.events,
+            batch.recovery_complete_after,
+        );
         self.submit_chain_calls(epoch, calls);
         Ok(())
     }
@@ -761,7 +727,14 @@ mod tests {
     fn execution_sync_is_explicit_and_monotone() {
         let self_id = test_nodes(1).pop().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let mut manager = DkgManager::<NopSignature>::new(self_id, directory.path().to_path_buf());
+        let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
+        let mut manager = DkgManager::<NopSignature>::new(
+            self_id,
+            directory.path().to_path_buf(),
+            DkgChainConfig::new([1; 32], Address::ZERO, 1),
+            chain,
+        )
+        .unwrap();
 
         manager.notify_finalized(SeqNum(10));
         assert_eq!(manager.sync_block, None);
@@ -784,7 +757,7 @@ mod tests {
         let nodes = test_nodes(4);
         let directory = tempfile::tempdir().unwrap();
         let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
-        let mut manager = DkgManager::<NopSignature>::new_with_chain(
+        let mut manager = DkgManager::<NopSignature>::new(
             nodes[0],
             directory.path().to_path_buf(),
             DkgChainConfig::new([1; 32], Address::ZERO, 1),
@@ -823,7 +796,7 @@ mod tests {
         let nodes = test_nodes(1);
         let directory = tempfile::tempdir().unwrap();
         let chain: Arc<dyn DkgChain> = Arc::new(RecordingChain::default());
-        let mut manager = DkgManager::<NopSignature>::new_with_chain(
+        let mut manager = DkgManager::<NopSignature>::new(
             nodes[0],
             directory.path().to_path_buf(),
             DkgChainConfig::new([1; 32], Address::ZERO, 1),
@@ -859,7 +832,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let chain = Arc::new(RecordingChain::default());
         let chain_adapter: Arc<dyn DkgChain> = chain.clone();
-        let mut manager = DkgManager::<NopSignature>::new_with_chain(
+        let mut manager = DkgManager::<NopSignature>::new(
             self_id,
             directory.path().to_path_buf(),
             DkgChainConfig::new([1; 32], Address::ZERO, 1),
@@ -900,7 +873,7 @@ mod tests {
             state: registrations,
         });
         let directory = tempfile::tempdir().unwrap();
-        let mut manager = DkgManager::<NopSignature>::new_with_chain(
+        let mut manager = DkgManager::<NopSignature>::new(
             nodes[0],
             directory.path().to_path_buf(),
             chain_config,
@@ -936,7 +909,7 @@ mod tests {
             transactions,
         });
         let directory = tempfile::tempdir().unwrap();
-        let mut manager = DkgManager::<NopSignature>::new_with_chain(
+        let mut manager = DkgManager::<NopSignature>::new(
             nodes[0],
             directory.path().to_path_buf(),
             DkgChainConfig::new([9; 32], Address::ZERO, 1),
@@ -947,7 +920,7 @@ mod tests {
         manager.notify_sync_complete(SeqNum(10));
         let first = transaction_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let (address, keys) = {
-            let managed = manager.chain.as_ref().unwrap();
+            let managed = &manager.chain;
             (
                 managed.registration.address.into_array(),
                 managed.local_keys.clone(),
@@ -975,22 +948,22 @@ mod tests {
     impl DkgChain for RecordingChain {
         fn read_registrations(
             &self,
-            _block: SeqNum,
+            block: SeqNum,
             _epoch: Epoch,
             _parties: &[Address],
-        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
-            Ok(None)
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Err(crate::DkgError::ChainDataUnavailable { block })
         }
 
         fn read_events(
             &self,
             read: crate::chain::ChainRead,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
             self.reads.lock().unwrap().push((
                 matches!(read, crate::chain::ChainRead::Snapshot(_)),
                 read.block(),
             ));
-            Ok(Some(Vec::new()))
+            Ok(Vec::new())
         }
 
         fn transaction_context(
@@ -1024,17 +997,15 @@ mod tests {
             _block: SeqNum,
             _epoch: Epoch,
             _parties: &[Address],
-        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
-            Ok(Some(
-                self.registration.lock().unwrap().iter().copied().collect(),
-            ))
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Ok(self.registration.lock().unwrap().iter().copied().collect())
         }
 
         fn read_events(
             &self,
             _read: crate::chain::ChainRead,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
-            Ok(Some(Vec::new()))
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
+            Ok(Vec::new())
         }
 
         fn transaction_context(
@@ -1064,21 +1035,20 @@ mod tests {
             _block: SeqNum,
             _epoch: Epoch,
             parties: &[Address],
-        ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
-            Ok(Some(
-                self.state
-                    .iter()
-                    .filter(|registration| parties.contains(&Address::from(registration.address.0)))
-                    .copied()
-                    .collect(),
-            ))
+        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+            Ok(self
+                .state
+                .iter()
+                .filter(|registration| parties.contains(&Address::from(registration.address.0)))
+                .copied()
+                .collect())
         }
 
         fn read_events(
             &self,
             _read: crate::chain::ChainRead,
-        ) -> Result<Option<Vec<dkg_protocol::ChainEvent>>, crate::DkgError> {
-            Ok(Some(Vec::new()))
+        ) -> Result<Vec<dkg_protocol::ChainEvent>, crate::DkgError> {
+            Ok(Vec::new())
         }
 
         fn transaction_context(

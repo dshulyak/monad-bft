@@ -15,7 +15,7 @@ use monad_types::{Epoch, NodeId};
 use proptest::prelude::*;
 
 use super::*;
-use crate::{session::test_registered_key_material, DeliveryOutbound};
+use crate::{test_registered_key_material, DeliveryOutbound};
 
 const NODE_COUNT: usize = 4;
 const TEST_EPOCH: Epoch = Epoch(12);

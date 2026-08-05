@@ -26,12 +26,14 @@ fn encodes_post_pc_qc_contract_calldata() {
         signatures: vec![sig(0)],
     };
     let call = ChainCall::PostPCQc { qc: qc.clone() };
-    let calldata = contract_calldata(Epoch(9), &call, Address::ZERO).unwrap();
+    let calldata = test_tx_config()
+        .calldata(Epoch(9), &call, Address::ZERO)
+        .unwrap();
     assert_eq!(
         calldata,
         DkgContract::postPcQcCall {
             epoch: 9,
-            qc: pc_qc_to_contract(&qc),
+            qc: (&qc).into(),
         }
         .abi_encode()
     );
@@ -45,12 +47,14 @@ fn encodes_submit_result_contract_calldata() {
         signatures: vec![sig(0)],
     };
     let call = ChainCall::PostDkgResult { qc: qc.clone() };
-    let calldata = contract_calldata(Epoch(9), &call, Address::ZERO).unwrap();
+    let calldata = test_tx_config()
+        .calldata(Epoch(9), &call, Address::ZERO)
+        .unwrap();
     assert_eq!(
         calldata,
         DkgContract::submitResultCall {
             epoch: 9,
-            result: dkg_result_to_contract(&qc),
+            result: (&qc).into(),
         }
         .abi_encode()
     );
@@ -281,7 +285,10 @@ fn overlapping_session_accepts_late_calls_from_previous_epoch() {
     service.submit(Epoch(2), previous.clone());
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let expected = contract_calldata(Epoch(2), &previous, service.signer_address()).unwrap();
+    let expected = service
+        .config
+        .calldata(Epoch(2), &previous, service.signer_address())
+        .unwrap();
     assert_eq!(transaction.input().as_ref(), expected.as_slice(),);
     assert!(local_rx.try_recv().is_err());
 }
@@ -299,7 +306,10 @@ fn third_session_evicts_oldest_epoch_and_rejects_its_late_calls() {
     service.submit(Epoch(4), current.clone());
 
     let transaction = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let expected = contract_calldata(Epoch(4), &current, service.signer_address()).unwrap();
+    let expected = service
+        .config
+        .calldata(Epoch(4), &current, service.signer_address())
+        .unwrap();
     assert_eq!(transaction.input().as_ref(), expected.as_slice());
     assert!(local_rx.try_recv().is_err());
 }
@@ -318,11 +328,11 @@ impl DkgChain for TestChain {
         _block: SeqNum,
         _epoch: Epoch,
         _parties: &[Address],
-    ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+    ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
         unreachable!()
     }
 
-    fn read_events(&self, _read: ChainRead) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
+    fn read_events(&self, _read: ChainRead) -> Result<Vec<ChainEvent>, crate::DkgError> {
         unreachable!()
     }
 
@@ -395,6 +405,15 @@ fn test_submitter_with_context_and_block(
     });
     let config = DkgChainConfig::new([0x01; 32], Address::repeat_byte(0x22), 0x4eaf);
     (TxSubmitter::new(&config, chain).unwrap(), receiver)
+}
+
+fn test_tx_config() -> TxConfig {
+    TxConfig {
+        contract: Address::repeat_byte(0x22),
+        chain_id: 0x4eaf,
+        gas_limit: crate::chain::DEFAULT_TX_GAS_LIMIT,
+        max_priority_fee_per_gas: crate::chain::DEFAULT_TX_MAX_PRIORITY_FEE_PER_GAS,
+    }
 }
 
 fn pc_call(qc: PCQc) -> ChainCall {

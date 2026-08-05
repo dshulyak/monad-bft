@@ -53,15 +53,9 @@ pub fn build_manager(
     storage_root: &Path,
     state_read: ExecutionStateReadThreadClient<SignatureType, SignatureCollectionType>,
     execution_delay: SeqNum,
-) -> Result<
-    (
-        DkgManager<SignatureType>,
-        Option<flume::Receiver<TxEnvelope>>,
-    ),
-    DkgError,
-> {
+) -> Result<Option<(DkgManager<SignatureType>, flume::Receiver<TxEnvelope>)>, DkgError> {
     if !node.node_config.dkg.enabled {
-        return Ok((DkgManager::new(self_id, storage_root.to_path_buf()), None));
+        return Ok(None);
     }
 
     let config = &node.node_config.dkg;
@@ -73,12 +67,12 @@ pub fn build_manager(
     chain_config.gas_limit = config.tx_gas_limit;
     chain_config.max_priority_fee_per_gas = config.tx_max_priority_fee_per_gas;
 
-    let (manager, transactions) = new_triedb_manager(
+    new_triedb_manager(
         self_id,
         storage_root.to_path_buf(),
         chain_config,
         state_read,
         execution_delay,
-    )?;
-    Ok((manager, Some(transactions)))
+    )
+    .map(Some)
 }

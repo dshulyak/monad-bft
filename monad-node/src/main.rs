@@ -245,7 +245,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         Err(err) => warn!(?err, "failed to discover retained DKG sessions"),
     }
     let state_read = build_state_reader(&node_state, SeqNum(EXECUTION_DELAY));
-    let (dkg_manager, dkg_local_tx_rx) = build_manager(
+    let dkg_manager = build_manager(
         &node_state,
         self_router_node_id,
         &dkg_storage_root,
@@ -254,18 +254,25 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     )
     .unwrap_or_else(|err| {
         error!(?err, "failed to configure DKG manager chain integration");
-        (
-            monad_dkg_runner::DkgManager::new(self_router_node_id, dkg_storage_root.clone()),
-            None,
-        )
+        None
     });
-    let (dkg_events, dkg_event_rx) = monad_dkg_runner::DkgManagerHandle::channel();
-    let (dkg_outbound_tx, dkg_outbound_rx) = flume::unbounded();
-    tokio::spawn(async move {
-        if let Err(err) = dkg_manager.run(dkg_event_rx, dkg_outbound_tx).await {
-            error!(?err, "DKG manager task stopped");
+    let (dkg_events, dkg_outbound_rx, dkg_local_tx_rx) = match dkg_manager {
+        Some((manager, local_tx_rx)) => {
+            let (events, event_rx) = monad_dkg_runner::DkgManagerHandle::channel();
+            let (outbound_tx, outbound_rx) = flume::unbounded();
+            tokio::spawn(async move {
+                if let Err(err) = manager.run(event_rx, outbound_tx).await {
+                    error!(?err, "DKG manager task stopped");
+                }
+            });
+            (events, Some(outbound_rx), Some(local_tx_rx))
         }
-    });
+        None => (
+            monad_dkg_runner::DkgManagerHandle::<SignatureType>::disabled(),
+            None,
+            None,
+        ),
+    };
     let (score_provider, score_reader) =
         ema::create::<NodeId<CertificateSignaturePubKey<SignatureType>>, StdClock>(
             node_state.node_config.txpool_peer_score.clone(),
@@ -641,7 +648,12 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     Err(err) => warn!(?err, "DKG local transaction channel closed"),
                 }
             }
-            dkg_outbound = dkg_outbound_rx.recv_async() => {
+            dkg_outbound = async {
+                match &dkg_outbound_rx {
+                    Some(receiver) => receiver.recv_async().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match dkg_outbound {
                     Ok(output) => executor.exec(vec![Command::RouterCommand(
                         RouterCommand::Publish {

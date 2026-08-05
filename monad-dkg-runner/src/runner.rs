@@ -28,12 +28,11 @@ use crate::{
     record::EngineSeed,
     recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     reliable::{EnqueueError, IncomingRecord, IncomingStatus, MessageIdentity, OutgoingRecord},
-    session::DkgRegisteredKeyMaterial,
     transport::{
         delivery_abort_group_for_peer_payload, DeliveryAbortGroup, DeliveryEngine, DeliveryInbound,
         DeliveryOutbound,
     },
-    DkgError,
+    DkgError, DkgRegisteredKeyMaterial,
 };
 
 use self::message_store::{DkgDurableStore, DkgDurableStoreError};
@@ -226,8 +225,7 @@ where
 
     fn new(init: RunnerInit<ST>) -> Result<Self, RunnerError> {
         let party_count = init.mapping.len();
-        let delivery =
-            DeliveryEngine::with_inbound_validators(init.epoch, init.mapping.members.clone());
+        let delivery = DeliveryEngine::new(init.epoch, init.mapping.members.iter().copied());
         let params = DkgEngineParams::default();
         let output_count = params.output_count;
         let engine = build_engine(
@@ -593,7 +591,8 @@ where
         let record_id = event.record_id();
         self.delivery
             .abort_group(delivery_abort_group_for_chain_event(&event));
-        self.enqueue_chain_event(event);
+        self.pending_inputs
+            .push_back(PendingEngineInput::Chain(event));
         failpoint::failpoint!(
             name = "dkg.chain.event_buffered",
             description = "after a finalized chain event is buffered and before engine application",
@@ -641,11 +640,6 @@ where
         }
         self.chain_calls.push(call);
         Ok(())
-    }
-
-    fn enqueue_chain_event(&mut self, event: ChainEvent) {
-        self.pending_inputs
-            .push_back(PendingEngineInput::Chain(event));
     }
 
     fn send_data_to_recipients(

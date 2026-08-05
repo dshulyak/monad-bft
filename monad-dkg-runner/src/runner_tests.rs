@@ -9,7 +9,7 @@ use monad_types::{Epoch, NodeId};
 use tempfile::TempDir;
 
 use super::*;
-use crate::session::test_registered_key_material;
+use crate::test_registered_key_material;
 
 #[test]
 fn retrieval_response_completes_its_request() {
@@ -61,15 +61,17 @@ fn runner_submits_chain_call_and_processes_finalized_event() {
 
     let pending_before = runner.pending_inputs.len();
     for dealer in 0..3 {
-        runner.enqueue_chain_event(ChainEvent::BveQcFinalized {
-            record_id: RecordId(100 + u64::from(dealer)),
-            qc: BveQc {
-                dealer: PartyId(dealer),
-                digest: [dealer as u8; 32],
-                commitment_digest: [dealer as u8 + 1; 32],
-                signatures: vec![sig(0), sig(1), sig(2)],
-            },
-        });
+        runner
+            .pending_inputs
+            .push_back(PendingEngineInput::Chain(ChainEvent::BveQcFinalized {
+                record_id: RecordId(100 + u64::from(dealer)),
+                qc: BveQc {
+                    dealer: PartyId(dealer),
+                    digest: [dealer as u8; 32],
+                    commitment_digest: [dealer as u8 + 1; 32],
+                    signatures: vec![sig(0), sig(1), sig(2)],
+                },
+            }));
     }
     assert_eq!(runner.pending_inputs.len(), pending_before + 3);
 }
@@ -115,7 +117,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     });
     let mut invalid_ack = vec![TAG_PC_ACK];
     invalid_ack.extend_from_slice(&[0; 96]);
-    let mut sender_delivery = DeliveryEngine::<NopSignature>::new(epoch);
+    let mut sender_delivery = DeliveryEngine::<NopSignature>::new(epoch, []);
     let wire = sender_delivery
         .schedule_reliable(
             message_id,

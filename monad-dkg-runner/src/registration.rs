@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use alloy_primitives::Address;
 use dkg_crypto::{K256SecpBackend, ReceiverKeyRegistrationError};
@@ -14,8 +17,7 @@ use thiserror::Error;
 
 use crate::{
     recovery::{RecoveryWal, RecoveryWalConfig, RecoveryWalError},
-    session::DkgRegisteredKeyMaterial,
-    DkgLocalKeyMaterial, DkgValidator,
+    DkgLocalKeyMaterial, DkgRegisteredKeyMaterial, DkgValidator,
 };
 
 #[derive(Debug, Error)]
@@ -87,7 +89,7 @@ where
         }
     }
 
-    let mut registrations_by_address = BTreeMap::new();
+    let mut registrations_by_address = HashMap::new();
     for record in registrations {
         let address = record.address.0;
         if registrations_by_address.contains_key(&address) {

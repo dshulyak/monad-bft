@@ -46,13 +46,9 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
 fn read_job_uses_snapshot_then_receipts() {
     let chain = RecordingChain::default();
     let session = test_session();
-    let snapshot = chain
-        .read_events(ChainRead::Snapshot(session))
-        .unwrap()
-        .unwrap();
+    let snapshot = chain.read_events(ChainRead::Snapshot(session)).unwrap();
     let block = chain
         .read_events(ChainRead::Block(SeqNum(11), session))
-        .unwrap()
         .unwrap();
 
     assert_eq!(snapshot[0].record_id(), RecordId(10));
@@ -82,16 +78,16 @@ impl DkgChain for RecordingChain {
         _block: SeqNum,
         _epoch: Epoch,
         _parties: &[Address],
-    ) -> Result<Option<Vec<RegistrationCall>>, crate::DkgError> {
+    ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
         unreachable!()
     }
 
-    fn read_events(&self, read: ChainRead) -> Result<Option<Vec<ChainEvent>>, crate::DkgError> {
+    fn read_events(&self, read: ChainRead) -> Result<Vec<ChainEvent>, crate::DkgError> {
         self.reads
             .lock()
             .unwrap()
             .push((matches!(read, ChainRead::Snapshot(_)), read.block()));
-        Ok(Some(vec![pc_event(read.block().0)]))
+        Ok(vec![pc_event(read.block().0)])
     }
 
     fn transaction_context(

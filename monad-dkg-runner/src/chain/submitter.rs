@@ -15,13 +15,7 @@ use monad_types::{Epoch, SeqNum};
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
-use super::{
-    bindings::{
-        bve_qc_to_contract, dkg_result_to_contract, pc_qc_to_contract, registration_to_contract,
-        DkgContract,
-    },
-    chain_call_kind, DkgChain, DkgChainConfig,
-};
+use super::{chain_call_kind, ContractRegistration, DkgChain, DkgChainConfig, DkgContract};
 use crate::DkgError;
 
 pub(crate) struct TxSubmitter {
@@ -121,7 +115,7 @@ impl TxSubmitter {
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
-        let key = (epoch, ChainTxId::from_call(&call));
+        let key = (epoch, ChainTxId::from(&call));
         let immediate = matches!(&call, ChainCall::PostRegistration { .. });
         if !immediate && !self.active_epochs.contains(&epoch) {
             return;
@@ -151,7 +145,7 @@ impl TxSubmitter {
     }
 
     pub(crate) fn confirm_registration(&mut self, epoch: Epoch, registration: &RegistrationCall) {
-        let id = ChainTxId::registration(registration);
+        let id = ChainTxId::from(registration);
         self.finalized.insert((epoch, id.clone()));
         self.remove_pending(&(epoch, id));
     }
@@ -179,7 +173,7 @@ impl TxSubmitter {
         }
         self.context_blocks.insert(epoch, block);
         for event in events {
-            let id = ChainTxId::from_event(&event);
+            let id = ChainTxId::from(&event);
             self.finalized.insert((epoch, id.clone()));
             self.remove_pending(&(epoch, id));
         }
@@ -266,8 +260,7 @@ impl TxSubmitter {
             }
             let call_kind = chain_call_kind(&self.pending[&key]);
             if self.prepared.is_none() {
-                let transaction = match prepare_chain_call(
-                    &self.config,
+                let transaction = match self.config.prepare(
                     &self.signer,
                     chain_nonce,
                     max_fee_per_gas,
@@ -356,14 +349,16 @@ enum ChainTxId {
     },
 }
 
-impl ChainTxId {
-    fn registration(registration: &RegistrationCall) -> Self {
+impl From<&RegistrationCall> for ChainTxId {
+    fn from(registration: &RegistrationCall) -> Self {
         Self::Registration {
             digest: *blake3::hash(&encode_registration(registration)).as_bytes(),
         }
     }
+}
 
-    fn from_call(call: &ChainCall) -> Self {
+impl From<&ChainCall> for ChainTxId {
+    fn from(call: &ChainCall) -> Self {
         match call {
             ChainCall::PostPCQc { qc } => Self::PcQc {
                 dealer: qc.dealer.0,
@@ -375,11 +370,13 @@ impl ChainTxId {
                 digest: qc.digest,
             },
             ChainCall::PostDkgResult { qc } => Self::DkgResult { g2x: qc.g2x.0 },
-            ChainCall::PostRegistration { registration, .. } => Self::registration(registration),
+            ChainCall::PostRegistration { registration, .. } => registration.into(),
         }
     }
+}
 
-    fn from_event(event: &ChainEvent) -> Self {
+impl From<&ChainEvent> for ChainTxId {
+    fn from(event: &ChainEvent) -> Self {
         match event {
             ChainEvent::PCQc { qc, .. } => Self::PcQc {
                 dealer: qc.dealer.0,
@@ -395,69 +392,77 @@ impl ChainTxId {
     }
 }
 
-fn prepare_chain_call(
-    config: &TxConfig,
-    signer: &PrivateKeySigner,
-    nonce: u64,
-    max_fee_per_gas: u128,
-    epoch: Epoch,
-    call: &ChainCall,
-) -> Result<TxEnvelope, DkgError> {
-    if let ChainCall::PostRegistration { dkg, .. } = call {
-        if dkg.0 != config.contract.into_array() {
-            return Err(DkgError::RegistrationContractMismatch {
-                expected: config.contract,
-                actual: Address::from(dkg.0),
-            });
-        }
-    }
-    let calldata = contract_calldata(epoch, call, signer.address())?;
-    let transaction = TxEip1559 {
-        chain_id: config.chain_id,
-        nonce,
-        gas_limit: config.gas_limit,
-        max_fee_per_gas,
-        max_priority_fee_per_gas: config.max_priority_fee_per_gas,
-        to: TxKind::Call(config.contract),
-        value: U256::ZERO,
-        access_list: Default::default(),
-        input: calldata.into(),
-    };
-    let signature = signer
-        .sign_hash_sync(&transaction.signature_hash())
-        .map_err(|err| DkgError::operation("sign DKG transaction", err))?;
-    Ok(TxEnvelope::Eip1559(transaction.into_signed(signature)))
-}
-
-fn contract_calldata(epoch: Epoch, call: &ChainCall, signer: Address) -> Result<Vec<u8>, DkgError> {
-    match call {
-        ChainCall::PostPCQc { qc } => Ok(DkgContract::postPcQcCall {
-            epoch: epoch.0,
-            qc: pc_qc_to_contract(qc),
-        }
-        .abi_encode()),
-        ChainCall::PostBveQc { qc } => Ok(DkgContract::postBveQcCall {
-            epoch: epoch.0,
-            qc: bve_qc_to_contract(qc),
-        }
-        .abi_encode()),
-        ChainCall::PostDkgResult { qc } if qc.epoch.0 == epoch.0 => {
-            Ok(DkgContract::submitResultCall {
-                epoch: epoch.0,
-                result: dkg_result_to_contract(qc),
+impl TxConfig {
+    fn prepare(
+        &self,
+        signer: &PrivateKeySigner,
+        nonce: u64,
+        max_fee_per_gas: u128,
+        epoch: Epoch,
+        call: &ChainCall,
+    ) -> Result<TxEnvelope, DkgError> {
+        if let ChainCall::PostRegistration { dkg, .. } = call {
+            if dkg.0 != self.contract.into_array() {
+                return Err(DkgError::RegistrationContractMismatch {
+                    expected: self.contract,
+                    actual: Address::from(dkg.0),
+                });
             }
-            .abi_encode())
         }
-        ChainCall::PostDkgResult { qc } => Err(DkgError::ResultEpochMismatch {
-            expected: epoch.0,
-            actual: qc.epoch.0,
-        }),
-        ChainCall::PostRegistration { registration, .. } => Ok(DkgContract::registerCall {
-            epoch: epoch.0,
-            registration: registration_to_contract(registration, signer)
-                .map_err(|source| DkgError::operation("encode typed DKG registration", source))?,
+
+        let transaction = TxEip1559 {
+            chain_id: self.chain_id,
+            nonce,
+            gas_limit: self.gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas,
+            to: TxKind::Call(self.contract),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: self.calldata(epoch, call, signer.address())?.into(),
+        };
+        let signature = signer
+            .sign_hash_sync(&transaction.signature_hash())
+            .map_err(|err| DkgError::operation("sign DKG transaction", err))?;
+        Ok(TxEnvelope::Eip1559(transaction.into_signed(signature)))
+    }
+
+    fn calldata(
+        &self,
+        epoch: Epoch,
+        call: &ChainCall,
+        signer: Address,
+    ) -> Result<Vec<u8>, DkgError> {
+        match call {
+            ChainCall::PostPCQc { qc } => Ok(DkgContract::postPcQcCall {
+                epoch: epoch.0,
+                qc: qc.into(),
+            }
+            .abi_encode()),
+            ChainCall::PostBveQc { qc } => Ok(DkgContract::postBveQcCall {
+                epoch: epoch.0,
+                qc: qc.into(),
+            }
+            .abi_encode()),
+            ChainCall::PostDkgResult { qc } if qc.epoch.0 == epoch.0 => {
+                Ok(DkgContract::submitResultCall {
+                    epoch: epoch.0,
+                    result: qc.into(),
+                }
+                .abi_encode())
+            }
+            ChainCall::PostDkgResult { qc } => Err(DkgError::ResultEpochMismatch {
+                expected: epoch.0,
+                actual: qc.epoch.0,
+            }),
+            ChainCall::PostRegistration { registration, .. } => Ok(DkgContract::registerCall {
+                epoch: epoch.0,
+                registration: ContractRegistration::try_from((registration, signer)).map_err(
+                    |source| DkgError::operation("encode typed DKG registration", source),
+                )?,
+            }
+            .abi_encode()),
         }
-        .abi_encode()),
     }
 }
 

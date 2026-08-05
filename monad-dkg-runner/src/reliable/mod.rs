@@ -62,17 +62,6 @@ pub(crate) struct ScheduledSend<Peer, Payload> {
     pub(crate) payload: Payload,
 }
 
-pub(crate) struct OnceScheduler;
-
-impl OnceScheduler {
-    pub(crate) fn schedule<Peer, Payload>(
-        to: Peer,
-        payload: Payload,
-    ) -> ScheduledSend<Peer, Payload> {
-        ScheduledSend { to, payload }
-    }
-}
-
 pub(crate) struct RetryScheduler<Peer, MessageId, Payload, Policy>
 where
     Policy: ObsolescencePolicy,

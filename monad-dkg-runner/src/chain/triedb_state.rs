@@ -23,7 +23,8 @@ use monad_types::{Epoch, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use thiserror::Error;
 
-use super::bindings::{record_to_chain_event, registration_from_contract, DkgContract};
+use super::{ContractDkgRecord, DkgContract};
+use crate::DkgError;
 
 const DKG_ETH_CALL_GAS_LIMIT: u64 = 5_000_000;
 
@@ -33,6 +34,8 @@ pub(super) enum TriedbStateError {
     UnsupportedChainId { chain_id: u64 },
     #[error(transparent)]
     StateRead(#[from] ExecutionStateReadExtError),
+    #[error("DKG state at block {block} is not available yet")]
+    NotAvailable { block: u64 },
     #[error("DKG contract {contract} has no code at block {block}")]
     ContractMissing { contract: Address, block: u64 },
     #[error("DKG {kind} count exceeds usize")]
@@ -60,6 +63,17 @@ pub(super) enum TriedbStateError {
     InvalidRecord { sequence: u64 },
 }
 
+impl TriedbStateError {
+    pub(super) fn into_dkg_error(self, operation: &'static str) -> DkgError {
+        match self {
+            Self::NotAvailable { block } => DkgError::ChainDataUnavailable {
+                block: SeqNum(block),
+            },
+            source => DkgError::operation(operation, source),
+        }
+    }
+}
+
 pub(super) struct TriedbDkgStateReader {
     chain_id: ChainId,
     numeric_chain_id: u64,
@@ -84,7 +98,7 @@ impl TriedbDkgStateReader {
         state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
         block: SeqNum,
         contract: Address,
-    ) -> Result<Option<u64>, TriedbStateError>
+    ) -> Result<u64, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -94,16 +108,20 @@ impl TriedbDkgStateReader {
             .raw_read_latest_finalized_block()
             .is_none_or(|latest| latest < required_head)
         {
-            return Ok(None);
+            return Err(TriedbStateError::NotAvailable { block: block.0 });
         }
         let header = match state_read.get_finalized_block_header(block) {
             Ok(header) => header,
-            Err(ExecutionStateReadExtError::NotAvailableYet) => return Ok(None),
+            Err(ExecutionStateReadExtError::NotAvailableYet) => {
+                return Err(TriedbStateError::NotAvailable { block: block.0 })
+            }
             Err(err) => return Err(err.into()),
         };
         let account = match state_read.get_finalized_account(block, contract) {
             Ok(account) => account,
-            Err(ExecutionStateReadExtError::NotAvailableYet) => return Ok(None),
+            Err(ExecutionStateReadExtError::NotAvailableYet) => {
+                return Err(TriedbStateError::NotAvailable { block: block.0 })
+            }
             Err(err) => return Err(err.into()),
         };
         if account.is_none_or(|account| account.code_hash.is_none()) {
@@ -112,7 +130,7 @@ impl TriedbDkgStateReader {
                 block: block.0,
             });
         }
-        Ok(Some(DKG_ETH_CALL_GAS_LIMIT.min(header.0.gas_limit)))
+        Ok(DKG_ETH_CALL_GAS_LIMIT.min(header.0.gas_limit))
     }
 
     pub(super) fn read_registrations<ST, SCT>(
@@ -122,14 +140,12 @@ impl TriedbDkgStateReader {
         contract: Address,
         epoch: Epoch,
         parties: &[Address],
-    ) -> Result<Option<Vec<RegistrationCall>>, TriedbStateError>
+    ) -> Result<Vec<RegistrationCall>, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        let Some(gas_limit) = self.state_context(state_read, block, contract)? else {
-            return Ok(None);
-        };
+        let gas_limit = self.state_context(state_read, block, contract)?;
 
         if parties.len() > 256 {
             return Err(TriedbStateError::TooManyParties {
@@ -150,14 +166,11 @@ impl TriedbDkgStateReader {
                 },
             )?;
             if registration.exists {
-                registrations.push(registration_from_contract(
-                    party,
-                    &registration.registration,
-                ));
+                registrations.push(registration.registration.into_registration(party));
             }
         }
 
-        Ok(Some(registrations))
+        Ok(registrations)
     }
 
     pub(super) fn read<ST, SCT>(
@@ -167,7 +180,7 @@ impl TriedbDkgStateReader {
         contract: Address,
         epoch: Epoch,
         party_count: usize,
-    ) -> Result<Option<Vec<ChainEvent>>, TriedbStateError>
+    ) -> Result<Vec<ChainEvent>, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -176,10 +189,9 @@ impl TriedbDkgStateReader {
             return Err(TriedbStateError::TooManyParties { count: party_count });
         }
         let gas_limit = match self.state_context(state_read, block, contract) {
-            Ok(Some(gas_limit)) => gas_limit,
-            Ok(None) => return Ok(None),
+            Ok(gas_limit) => gas_limit,
             Err(TriedbStateError::ContractMissing { .. }) => {
-                return Ok(Some(Vec::new()));
+                return Ok(Vec::new());
             }
             Err(err) => return Err(err),
         };
@@ -205,10 +217,11 @@ impl TriedbDkgStateReader {
                     index: U256::from(index),
                 },
             )?;
-            let event = record_to_chain_event(RecordId(index as u64), record, party_count)
-                .map_err(|_| TriedbStateError::InvalidRecord {
-                    sequence: index as u64,
-                })?;
+            let event =
+                ContractDkgRecord::into_chain_event(record, RecordId(index as u64), party_count)
+                    .map_err(|_| TriedbStateError::InvalidRecord {
+                        sequence: index as u64,
+                    })?;
             if let ChainEvent::DkgResultRecorded { qc, .. } = &event {
                 if qc.epoch.0 != epoch.0 {
                     return Err(TriedbStateError::ResultEpochMismatch {
@@ -219,7 +232,7 @@ impl TriedbDkgStateReader {
             }
             events.push(event);
         }
-        Ok(Some(events))
+        Ok(events)
     }
 
     fn call<ST, SCT, C: SolCall>(

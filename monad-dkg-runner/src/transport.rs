@@ -16,7 +16,7 @@ use monad_types::{Epoch, NodeId};
 use tracing::warn;
 
 use crate::reliable::{
-    EnqueueError, ObsolescencePolicy, OnceScheduler, RetryConfig, RetryScheduler, ScheduledSend,
+    EnqueueError, ObsolescencePolicy, RetryConfig, RetryScheduler, ScheduledSend,
 };
 
 pub(crate) struct DeliveryInbound<ST: CertificateSignatureRecoverable> {
@@ -34,6 +34,17 @@ const DKG_RETRY: RetryConfig = RetryConfig::new(
 pub struct DeliveryOutbound<ST: CertificateSignatureRecoverable> {
     pub to: NodeId<CertificateSignaturePubKey<ST>>,
     pub payload: Bytes,
+}
+
+impl<ST: CertificateSignatureRecoverable>
+    From<ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>> for DeliveryOutbound<ST>
+{
+    fn from(send: ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>) -> Self {
+        Self {
+            to: send.to,
+            payload: send.payload,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -65,7 +76,7 @@ impl ObsolescencePolicy for DkgObsolescence {
 
 pub(crate) struct DeliveryEngine<ST: CertificateSignatureRecoverable> {
     epoch: Epoch,
-    inbound_validators: Option<BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
+    inbound_validators: BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>,
     scheduler: RetryScheduler<
         NodeId<CertificateSignaturePubKey<ST>>,
         DkgMessageId,
@@ -78,21 +89,15 @@ impl<ST> DeliveryEngine<ST>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
-    pub(crate) fn new(epoch: Epoch) -> Self {
+    pub(crate) fn new(
+        epoch: Epoch,
+        validators: impl IntoIterator<Item = NodeId<CertificateSignaturePubKey<ST>>>,
+    ) -> Self {
         Self {
             epoch,
-            inbound_validators: None,
+            inbound_validators: validators.into_iter().collect(),
             scheduler: RetryScheduler::new(DKG_RETRY),
         }
-    }
-
-    pub(crate) fn with_inbound_validators(
-        epoch: Epoch,
-        validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
-    ) -> Self {
-        let mut engine = Self::new(epoch);
-        engine.inbound_validators = Some(validators.into_iter().collect());
-        engine
     }
 
     pub(crate) fn next_timer(&self) -> Option<Instant> {
@@ -104,13 +109,10 @@ where
         sender: NodeId<CertificateSignaturePubKey<ST>>,
         payload: Bytes,
     ) -> Option<DeliveryInbound<ST>> {
-        match decode_wire(payload.as_ref()) {
+        let wire: Result<WireEnvelope, _> = payload.as_ref().try_into();
+        match wire {
             Ok(WireEnvelope { epoch, payload }) if epoch == self.epoch.0 => {
-                if self
-                    .inbound_validators
-                    .as_ref()
-                    .is_some_and(|validators| !validators.contains(&sender))
-                {
+                if !self.inbound_validators.contains(&sender) {
                     warn!(
                         epoch = self.epoch.0,
                         sender = ?sender,
@@ -132,7 +134,7 @@ where
         self.scheduler
             .retry_due(now)
             .into_iter()
-            .map(delivery_outbound)
+            .map(Into::into)
             .collect()
     }
 
@@ -148,11 +150,15 @@ where
             .enqueue(
                 message_id,
                 recipients,
-                encode_wire(self.epoch, payload),
+                WireEnvelope {
+                    epoch: self.epoch.0,
+                    payload,
+                }
+                .into(),
                 abort_group,
                 now,
             )
-            .map(|sends| sends.into_iter().map(delivery_outbound).collect())
+            .map(|sends| sends.into_iter().map(Into::into).collect())
     }
 
     pub(crate) fn schedule_once(
@@ -160,10 +166,15 @@ where
         to: NodeId<CertificateSignaturePubKey<ST>>,
         payload: Bytes,
     ) -> DeliveryOutbound<ST> {
-        delivery_outbound(OnceScheduler::schedule(
+        ScheduledSend {
             to,
-            encode_wire(self.epoch, payload),
-        ))
+            payload: WireEnvelope {
+                epoch: self.epoch.0,
+                payload,
+            }
+            .into(),
+        }
+        .into()
     }
 
     pub(crate) fn complete(&mut self, message_id: &DkgMessageId) {
@@ -172,15 +183,6 @@ where
 
     pub(crate) fn abort_group(&mut self, group: DeliveryAbortGroup) {
         self.scheduler.observe(group);
-    }
-}
-
-fn delivery_outbound<ST: CertificateSignatureRecoverable>(
-    send: ScheduledSend<NodeId<CertificateSignaturePubKey<ST>>, Bytes>,
-) -> DeliveryOutbound<ST> {
-    DeliveryOutbound {
-        to: send.to,
-        payload: send.payload,
     }
 }
 
@@ -209,7 +211,8 @@ pub(crate) fn delivery_abort_group_for_peer_payload(
 }
 
 pub(crate) fn delivery_epoch(payload: &[u8]) -> Option<Epoch> {
-    match decode_wire(payload) {
+    let wire: Result<WireEnvelope, _> = payload.try_into();
+    match wire {
         Ok(wire) => Some(Epoch(wire.epoch)),
         Err(err) => {
             warn!(?err, "dropping malformed DKG delivery message");
@@ -224,16 +227,18 @@ struct WireEnvelope {
     payload: Bytes,
 }
 
-fn encode_wire(epoch: Epoch, payload: Bytes) -> Bytes {
-    alloy_rlp::encode(WireEnvelope {
-        epoch: epoch.0,
-        payload,
-    })
-    .into()
+impl From<WireEnvelope> for Bytes {
+    fn from(wire: WireEnvelope) -> Self {
+        alloy_rlp::encode(wire).into()
+    }
 }
 
-fn decode_wire(data: &[u8]) -> Result<WireEnvelope, alloy_rlp::Error> {
-    alloy_rlp::decode_exact(data)
+impl TryFrom<&[u8]> for WireEnvelope {
+    type Error = alloy_rlp::Error;
+
+    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        alloy_rlp::decode_exact(data)
+    }
 }
 
 #[cfg(test)]

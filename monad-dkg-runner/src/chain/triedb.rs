@@ -13,19 +13,16 @@ use monad_execution_state_read::{
 };
 use monad_types::{Epoch, NodeId, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
+use thiserror::Error;
 
 use crate::{DkgChainConfig, DkgError, DkgManager};
 
-#[cfg(test)]
-use super::bindings::{bve_qc_to_contract, dkg_result_to_contract, pc_qc_to_contract};
 use super::{
-    bindings::{
-        bve_chain_event, pc_chain_event, result_chain_event, BveQcPosted, DkgResultPosted,
-        PcQcPosted,
-    },
-    triedb_state::TriedbDkgStateReader,
-    ChainRead, DkgChain, DkgTransactionContext,
+    triedb_state::TriedbDkgStateReader, BveQcPosted, ChainRead, ContractCodecError, DkgChain,
+    DkgResultPosted, DkgTransactionContext, PcQcPosted,
 };
+#[cfg(test)]
+use super::{ContractBveQc, ContractDkgResult, ContractPcQc};
 
 pub fn new_triedb_manager<ST, SCT>(
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
@@ -47,7 +44,7 @@ where
         contract: chain_config.contract,
         transactions,
     });
-    let manager = DkgManager::new_with_chain(self_id, storage_root, chain_config, chain)?;
+    let manager = DkgManager::new(self_id, storage_root, chain_config, chain)?;
     Ok((manager, transaction_rx))
 }
 
@@ -72,33 +69,34 @@ where
         block: SeqNum,
         epoch: Epoch,
         parties: &[Address],
-    ) -> Result<Option<Vec<RegistrationCall>>, DkgError> {
+    ) -> Result<Vec<RegistrationCall>, DkgError> {
         let mut state = self.state_read.clone();
         self.state_reader
             .read_registrations(&mut state, block, self.contract, epoch, parties)
-            .map_err(|source| DkgError::operation("read DKG registrations", source))
+            .map_err(|source| source.into_dkg_error("read DKG registrations"))
     }
 
-    fn read_events(&self, read: ChainRead) -> Result<Option<Vec<ChainEvent>>, DkgError> {
+    fn read_events(&self, read: ChainRead) -> Result<Vec<ChainEvent>, DkgError> {
         let session = read.session();
         match read {
-            ChainRead::Snapshot(_) => self.state_reader.read(
-                &mut self.state_read.clone(),
-                read.block(),
-                self.contract,
-                session.epoch,
-                session.party_count,
-            ),
+            ChainRead::Snapshot(_) => self
+                .state_reader
+                .read(
+                    &mut self.state_read.clone(),
+                    read.block(),
+                    self.contract,
+                    session.epoch,
+                    session.party_count,
+                )
+                .map_err(|source| source.into_dkg_error("read DKG chain events")),
             ChainRead::Block(block, _) => read_dkg_events(
                 &mut self.state_read.clone(),
                 block,
                 &DkgLogMatcher::new(self.contract),
                 session.epoch,
                 session.party_count,
-            )
-            .map_err(Into::into),
+            ),
         }
-        .map_err(|source| DkgError::operation("read DKG chain events", source))
     }
 
     fn transaction_context(
@@ -133,36 +131,47 @@ fn read_dkg_events<ST, SCT>(
     matcher: &DkgLogMatcher,
     epoch: Epoch,
     party_count: usize,
-) -> Result<Option<Vec<ChainEvent>>, ExecutionStateReadExtError>
+) -> Result<Vec<ChainEvent>, DkgError>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
 {
-    let header = match state_read.get_finalized_block_header(block) {
-        Ok(header) => header,
-        Err(ExecutionStateReadExtError::NotAvailableYet) => return Ok(None),
-        Err(err) => return Err(err),
+    let read_error = |source| match source {
+        ExecutionStateReadExtError::NotAvailableYet => DkgError::ChainDataUnavailable { block },
+        source => DkgError::operation("read finalized DKG events", source),
     };
+    let header = state_read
+        .get_finalized_block_header(block)
+        .map_err(read_error)?;
     if !matcher.maybe_matches_bloom(header.0.logs_bloom) {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
-    let receipts = match state_read.get_finalized_receipts(block) {
-        Ok(receipts) => receipts,
-        Err(ExecutionStateReadExtError::NotAvailableYet) => return Ok(None),
-        Err(err) => return Err(err),
-    };
+    let receipts = state_read
+        .get_finalized_receipts(block)
+        .map_err(read_error)?;
     let mut events = Vec::new();
     for receipt in receipts {
         if !matcher.maybe_matches_bloom(*receipt.receipt.logs_bloom()) {
             continue;
         }
         for log in receipt.receipt.logs() {
-            if let Some(event) = matcher.match_log(log, epoch, party_count) {
+            if let Some(event) = matcher
+                .match_log(log, epoch, party_count)
+                .map_err(|source| DkgError::operation("decode DKG chain event", source))?
+            {
                 events.push(event);
             }
         }
     }
-    Ok(Some(events))
+    Ok(events)
+}
+
+#[derive(Debug, Error)]
+enum DkgLogError {
+    #[error("decode DKG contract event failed: {0}")]
+    Decode(#[from] alloy_sol_types::Error),
+    #[error(transparent)]
+    Contract(#[from] ContractCodecError),
 }
 
 struct DkgLogMatcher {
@@ -192,56 +201,54 @@ impl DkgLogMatcher {
         self.blooms.iter().any(|expected| bloom.contains(expected))
     }
 
-    fn match_log(&self, log: &Log, epoch: Epoch, party_count: usize) -> Option<ChainEvent> {
+    fn match_log(
+        &self,
+        log: &Log,
+        epoch: Epoch,
+        party_count: usize,
+    ) -> Result<Option<ChainEvent>, DkgLogError> {
         if log.address != self.contract {
-            return None;
+            return Ok(None);
         }
 
-        match log.topics().first().copied()? {
+        let Some(topic) = log.topics().first().copied() else {
+            return Ok(None);
+        };
+        match topic {
             PcQcPosted::SIGNATURE_HASH => {
-                let event = PcQcPosted::decode_log(log).ok()?;
+                let event = PcQcPosted::decode_log(log)?;
                 if event.epoch != epoch.0 {
-                    return None;
+                    return Ok(None);
                 }
-                pc_chain_event(
-                    RecordId(event.sequence),
-                    event.dealer,
-                    event.digest,
-                    event.signatures.clone(),
-                    party_count,
-                )
-                .ok()
+                let record_id = RecordId(event.sequence);
+                event
+                    .to_chain_event(record_id, party_count)
+                    .map(Some)
+                    .map_err(Into::into)
             }
             BveQcPosted::SIGNATURE_HASH => {
-                let event = BveQcPosted::decode_log(log).ok()?;
+                let event = BveQcPosted::decode_log(log)?;
                 if event.epoch != epoch.0 {
-                    return None;
+                    return Ok(None);
                 }
-                bve_chain_event(
-                    RecordId(event.sequence),
-                    event.dealer,
-                    event.digest,
-                    event.commitmentDigest,
-                    event.signatures.clone(),
-                    party_count,
-                )
-                .ok()
+                let record_id = RecordId(event.sequence);
+                event
+                    .to_chain_event(record_id, party_count)
+                    .map(Some)
+                    .map_err(Into::into)
             }
             DkgResultPosted::SIGNATURE_HASH => {
-                let event = DkgResultPosted::decode_log(log).ok()?;
+                let event = DkgResultPosted::decode_log(log)?;
                 if event.epoch != epoch.0 {
-                    return None;
+                    return Ok(None);
                 }
-                result_chain_event(
-                    RecordId(event.sequence),
-                    event.epoch,
-                    event.g2x,
-                    event.signatures.clone(),
-                    party_count,
-                )
-                .ok()
+                let record_id = RecordId(event.sequence);
+                event
+                    .to_chain_event(record_id, party_count)
+                    .map(Some)
+                    .map_err(Into::into)
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 }
@@ -271,15 +278,17 @@ mod tests {
                 Epoch(9),
                 4,
             )
+            .unwrap()
             .is_none());
         assert!(matcher
             .match_log(&log_for_call(contract, Epoch(8), 0, &call), Epoch(9), 4)
+            .unwrap()
             .is_none());
 
         let ChainCall::PostPCQc { qc } = &call else {
             unreachable!()
         };
-        let mut qc = pc_qc_to_contract(qc);
+        let mut qc = ContractPcQc::from(qc);
         qc.signatures[0].signer = 4;
         let log = Log {
             address: contract,
@@ -292,7 +301,7 @@ mod tests {
             }
             .encode_log_data(),
         };
-        assert!(matcher.match_log(&log, Epoch(9), 4).is_none());
+        assert!(matcher.match_log(&log, Epoch(9), 4).is_err());
     }
 
     #[test]
@@ -369,7 +378,8 @@ mod tests {
                     Epoch(9),
                     4,
                 )
-                .expect("contract log should decode");
+                .expect("contract log should decode")
+                .expect("contract log should match");
             assert_eq!(event, expected);
         }
     }
@@ -377,7 +387,7 @@ mod tests {
     fn log_for_call(contract: Address, epoch: Epoch, sequence: u64, call: &ChainCall) -> Log {
         let data = match call {
             ChainCall::PostPCQc { qc } => {
-                let qc = pc_qc_to_contract(qc);
+                let qc = ContractPcQc::from(qc);
                 PcQcPosted {
                     epoch: epoch.0,
                     sequence,
@@ -388,7 +398,7 @@ mod tests {
                 .encode_log_data()
             }
             ChainCall::PostBveQc { qc } => {
-                let qc = bve_qc_to_contract(qc);
+                let qc = ContractBveQc::from(qc);
                 BveQcPosted {
                     epoch: epoch.0,
                     sequence,
@@ -400,7 +410,7 @@ mod tests {
                 .encode_log_data()
             }
             ChainCall::PostDkgResult { qc } => {
-                let result = dkg_result_to_contract(qc);
+                let result = ContractDkgResult::from(qc);
                 DkgResultPosted {
                     epoch: epoch.0,
                     sequence,

@@ -25,9 +25,8 @@ fn configured_validator_sender_is_delivered() {
         dealer: PartyId(2),
         signer: PartyId(1),
     });
-    let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
-    let receiver_delivery =
-        DeliveryEngine::<TestSig>::with_inbound_validators(epoch, vec![sender, receiver]);
+    let mut sender_delivery = DeliveryEngine::<TestSig>::new(epoch, []);
+    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch, [sender, receiver]);
     let outbound = sender_delivery
         .schedule_reliable(id, [receiver], Bytes::from_static(b"pc-ack"), None, now)
         .unwrap();
@@ -39,7 +38,7 @@ fn configured_validator_sender_is_delivered() {
     );
     assert_eq!(payload, Bytes::from_static(b"pc-ack"));
 
-    let rejected = DeliveryEngine::<TestSig>::with_inbound_validators(epoch, vec![receiver]);
+    let rejected = DeliveryEngine::<TestSig>::new(epoch, [receiver]);
     assert!(rejected
         .handle_network_message(sender, outbound[0].payload.clone())
         .is_none());
@@ -92,8 +91,8 @@ fn send_once_does_not_schedule_a_retry() {
     let epoch = Epoch(8);
     let sender = node(1);
     let receiver = node(2);
-    let sender_delivery = DeliveryEngine::<TestSig>::new(epoch);
-    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch);
+    let sender_delivery = DeliveryEngine::<TestSig>::new(epoch, []);
+    let receiver_delivery = DeliveryEngine::<TestSig>::new(epoch, [sender]);
 
     let outbound = sender_delivery.schedule_once(receiver, Bytes::from_static(b"response"));
 
