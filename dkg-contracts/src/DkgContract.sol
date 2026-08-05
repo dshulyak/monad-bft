@@ -30,6 +30,11 @@ contract DkgContract {
         DkgResult
     }
 
+    enum ValidatorSetKind {
+        Consensus,
+        Snapshot
+    }
+
     /// @dev SEC1-compressed secp256k1 point: prefix (2 or 3) plus x-coordinate.
     struct SecpPoint {
         uint8 prefix;
@@ -39,10 +44,9 @@ contract DkgContract {
     struct Registration {
         address qcVerifier;
         SecpPoint receiverPublicKey;
-        SecpPoint receiverKeyImage;
-        SecpPoint proofU0;
-        SecpPoint proofV0;
-        bytes32 proofZ;
+        uint32 receiverProofNonce;
+        bytes32 receiverProofR;
+        bytes32 receiverProofS;
     }
 
     /// @dev Compact secp256k1 signature split into its fixed-width limbs.
@@ -67,6 +71,7 @@ contract DkgContract {
 
     /// @dev The protocol's serialized BLS12-381 G2 point is exactly 192 bytes.
     struct DkgResult {
+        bytes32 sessionId;
         bytes32[6] g2x;
         QcSignature[] signatures;
     }
@@ -105,15 +110,16 @@ contract DkgContract {
         uint256 result;
     }
 
-    bytes private constant SESSION_ID_DOMAIN = "BTX-DKG/protocol/session-id/v1";
     bytes private constant STATEMENT_DOMAIN = "BTX-DKG/protocol/qc-signature/v1";
     bytes private constant DKG_DONE_QC_DOMAIN = "BTX-DKG/protocol/dkg-done-qc/v1";
-    uint64 private constant DKG_OUTPUT_COUNT = 2;
-    uint256 private constant SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    bytes private constant RECEIVER_KEY_PROOF_DOMAIN = "BTX-DKG/protocol/receiver-key-pop/v1";
+    uint256 private constant SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
     uint256 private constant SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+    uint256 private constant SECP256K1_SQRT_EXPONENT =
+        0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C;
     uint256 private constant MAX_PARTIES = 256;
 
-    address private immutable STAKING;
+    IMonadStaking private immutable STAKING;
 
     mapping(uint64 epoch => RecordRef[] records) private recordsByEpoch;
     mapping(uint64 epoch => PcQc[] records) private pcQcsByEpoch;
@@ -124,7 +130,8 @@ contract DkgContract {
     /// @dev Registration indices in canonical validator-set order. One byte per
     /// party is sufficient because registrations are bounded to 256.
     mapping(uint64 epoch => bytes registrationOrder) private frozenRegistrationOrderByEpoch;
-    mapping(uint64 epoch => mapping(bytes32 witnessHash => bool seen)) private seenPcQcs;
+    mapping(uint64 epoch => mapping(address submitter => mapping(uint32 dealer => bool submitted))) private
+        submittedPcQc;
     mapping(uint64 epoch => mapping(address submitter => mapping(uint32 dealer => bool submitted))) private
         submittedBveQc;
     mapping(uint64 epoch => bool recorded) private resultRecorded;
@@ -142,13 +149,16 @@ contract DkgContract {
         bytes32 commitmentDigest,
         QcSignature[] signatures
     );
-    event DkgResultPosted(uint64 indexed epoch, uint64 indexed sequence, bytes32[6] g2x, QcSignature[] signatures);
+    event DkgResultPosted(
+        uint64 indexed epoch, uint64 indexed sequence, bytes32 sessionId, bytes32[6] g2x, QcSignature[] signatures
+    );
 
     error AlreadyRegistered(uint64 epoch, address party);
     error DkgAlreadyFinished(uint64 epoch);
     error InvalidDkgResult();
-    error InvalidPointPrefix(uint8 prefix);
+    error InvalidSecpPoint();
     error InvalidQcVerifier();
+    error InvalidReceiverProof();
     error MalformedQc();
     error InvalidRecordPage(uint64 start, uint32 limit);
     error NotEpochParty(uint64 epoch, address caller);
@@ -160,7 +170,7 @@ contract DkgContract {
     error TooManyRegistrations(uint64 epoch);
 
     constructor(address staking_) {
-        STAKING = staking_;
+        STAKING = IMonadStaking(staking_);
     }
 
     modifier onlyValidator() {
@@ -176,7 +186,8 @@ contract DkgContract {
 
     function _requireEpochParty(uint64 epoch) private returns (address[] memory parties) {
         parties = _partySet(epoch);
-        if (_partyId(parties, msg.sender) == type(uint256).max) {
+        (bool exists,) = _partyId(parties, msg.sender);
+        if (!exists) {
             revert NotEpochParty(epoch, msg.sender);
         }
     }
@@ -189,7 +200,7 @@ contract DkgContract {
         if (registeredPartiesByEpoch[epoch].length == MAX_PARTIES) {
             revert TooManyRegistrations(epoch);
         }
-        _validateRegistration(registration);
+        _validateRegistration(epoch, msg.sender, registration);
         registrations[epoch][msg.sender] = registration;
         registeredPartiesByEpoch[epoch].push(msg.sender);
         emit PartyRegistered(epoch, msg.sender, registration);
@@ -201,11 +212,10 @@ contract DkgContract {
             revert DkgAlreadyFinished(epoch);
         }
         _validateQc(qc.dealer, qc.signatures, parties.length);
-        bytes32 witnessHash = keccak256(abi.encode(qc));
-        if (seenPcQcs[epoch][witnessHash]) {
+        if (submittedPcQc[epoch][msg.sender][qc.dealer]) {
             return;
         }
-        seenPcQcs[epoch][witnessHash] = true;
+        submittedPcQc[epoch][msg.sender][qc.dealer] = true;
 
         uint64 sequence = _nextSequence(epoch);
         uint64 index = _recordIndex(pcQcsByEpoch[epoch].length);
@@ -250,10 +260,11 @@ contract DkgContract {
         uint64 sequence = _nextSequence(epoch);
         uint64 index = _recordIndex(resultsByEpoch[epoch].length);
         DkgResult storage record = resultsByEpoch[epoch].push();
+        record.sessionId = result.sessionId;
         record.g2x = result.g2x;
         _copySignatures(record.signatures, result.signatures);
         recordsByEpoch[epoch].push(RecordRef({kind: RecordKind.DkgResult, index: index}));
-        emit DkgResultPosted(epoch, sequence, result.g2x, result.signatures);
+        emit DkgResultPosted(epoch, sequence, result.sessionId, result.g2x, result.signatures);
     }
 
     function registrationOf(uint64 epoch, address party)
@@ -282,8 +293,7 @@ contract DkgContract {
     }
 
     function partyIdOf(uint64 epoch, address party) external view returns (bool exists, uint32 partyId) {
-        uint256 index = _partyId(_partySetView(epoch), party);
-        return (index != type(uint256).max, index == type(uint256).max ? 0 : uint32(index));
+        return _partyId(_partySetView(epoch), party);
     }
 
     function records(uint64 epoch, uint64 start, uint32 limit) external view returns (RecordPage memory page) {
@@ -352,7 +362,7 @@ contract DkgContract {
     }
 
     function _freezePartySet(uint64 epoch) private returns (address[] memory parties) {
-        uint64[] memory validatorIds = _readValidatorSet(_validatorSetGetter(epoch));
+        uint64[] memory validatorIds = _readValidatorSet(_validatorSetKind(epoch));
         address[] storage registered = registeredPartiesByEpoch[epoch];
         parties = new address[](registered.length);
         uint64[] memory registeredValidatorIds = new uint64[](registered.length);
@@ -414,35 +424,31 @@ contract DkgContract {
         }
     }
 
-    function _validatorSetGetter(uint64 epoch) private returns (bytes4 getter) {
+    function _validatorSetKind(uint64 epoch) private returns (ValidatorSetKind) {
         (uint64 currentEpoch, bool inDelay) = _stakingEpoch();
         if (epoch == currentEpoch) {
-            return
-                inDelay
-                    ? IMonadStaking.getSnapshotValidatorSet.selector
-                    : IMonadStaking.getConsensusValidatorSet.selector;
+            return inDelay ? ValidatorSetKind.Snapshot : ValidatorSetKind.Consensus;
         }
         if (inDelay && currentEpoch != type(uint64).max && epoch == currentEpoch + 1) {
-            return IMonadStaking.getConsensusValidatorSet.selector;
+            return ValidatorSetKind.Consensus;
         }
         revert PartySetUnavailable(epoch);
     }
 
     function _stakingEpoch() private returns (uint64 epoch, bool inDelay) {
-        bytes memory output = _stakingCall(abi.encodeCall(IMonadStaking.getEpoch, ()));
-        if (output.length != 64) {
+        try STAKING.getEpoch() returns (uint64 currentEpoch, bool inEpochDelayPeriod) {
+            return (currentEpoch, inEpochDelayPeriod);
+        } catch {
             revert StakingLookupFailed();
         }
-        return abi.decode(output, (uint64, bool));
     }
 
-    function _readValidatorSet(bytes4 getter) private returns (uint64[] memory validatorIds) {
+    function _readValidatorSet(ValidatorSetKind kind) private returns (uint64[] memory validatorIds) {
         validatorIds = new uint64[](MAX_PARTIES);
         uint256 count;
         uint32 startIndex;
         while (true) {
-            bytes memory output = _stakingCall(abi.encodeWithSelector(getter, startIndex));
-            (bool done, uint32 nextIndex, uint64[] memory page) = abi.decode(output, (bool, uint32, uint64[]));
+            (bool done, uint32 nextIndex, uint64[] memory page) = _readValidatorPage(kind, startIndex);
             if (count + page.length > MAX_PARTIES || (!done && nextIndex <= startIndex)) {
                 revert StakingLookupFailed();
             }
@@ -459,19 +465,32 @@ contract DkgContract {
         }
     }
 
-    function _validatorId(address validator) private returns (uint64) {
-        bytes memory output = _stakingCall(abi.encodeCall(IMonadStaking.getValidatorId, (validator)));
-        if (output.length != 32) {
+    function _readValidatorPage(ValidatorSetKind kind, uint32 startIndex)
+        private
+        returns (bool done, uint32 nextIndex, uint64[] memory validatorIds)
+    {
+        if (kind == ValidatorSetKind.Consensus) {
+            try STAKING.getConsensusValidatorSet(startIndex) returns (
+                bool pageDone, uint32 followingIndex, uint64[] memory page
+            ) {
+                return (pageDone, followingIndex, page);
+            } catch {
+                revert StakingLookupFailed();
+            }
+        }
+        try STAKING.getSnapshotValidatorSet(startIndex) returns (
+            bool pageDone, uint32 followingIndex, uint64[] memory page
+        ) {
+            return (pageDone, followingIndex, page);
+        } catch {
             revert StakingLookupFailed();
         }
-        return abi.decode(output, (uint64));
     }
 
-    function _stakingCall(bytes memory input) private returns (bytes memory output) {
-        // Native staking has no bytecode and currently accepts CALL, not STATICCALL.
-        bool success;
-        (success, output) = STAKING.call(input);
-        if (!success) {
+    function _validatorId(address validator) private returns (uint64) {
+        try STAKING.getValidatorId(validator) returns (uint64 validatorId) {
+            return validatorId;
+        } catch {
             revert StakingLookupFailed();
         }
     }
@@ -485,30 +504,31 @@ contract DkgContract {
             revert InvalidDkgResult();
         }
 
-        bytes32 digest = _doneQcDigest(epoch, result.g2x, parties);
-        uint32 previous;
+        // A quorum signs the supplied session id together with the epoch and
+        // result. At most f Byzantine signers cannot authenticate a session id
+        // that the honest engine did not derive for this party set.
+        bytes32 digest = _doneQcDigest(epoch, result.sessionId, result.g2x);
+        uint256 seenSigners;
         for (uint256 i = 0; i < count; i++) {
             QcSignature calldata signature = result.signatures[i];
-            if (signature.signer >= partyCount || (i != 0 && signature.signer <= previous)) {
+            if (signature.signer >= partyCount) {
                 revert InvalidDkgResult();
             }
+            uint256 signerBit = uint256(1) << signature.signer;
+            if ((seenSigners & signerBit) != 0) {
+                revert InvalidDkgResult();
+            }
+            seenSigners |= signerBit;
             address party = parties[signature.signer];
             address expectedSigner = registrations[epoch][party].qcVerifier;
             if (!_signatureMatches(expectedSigner, digest, signature.r, signature.s)) {
                 revert InvalidDkgResult();
             }
-            previous = signature.signer;
         }
     }
 
-    /// @dev Reproduce `DkgSetupContext::assemble` followed by
-    /// `dkg_done_qc_statement` from the research engine byte-for-byte.
-    function _doneQcDigest(uint64 epoch, bytes32[6] calldata g2x, address[] memory parties)
-        private
-        view
-        returns (bytes32)
-    {
-        bytes32 sessionId = _deriveSessionId(epoch, parties);
+    /// @dev Reproduce the research engine's `dkg_done_qc_statement`.
+    function _doneQcDigest(uint64 epoch, bytes32 sessionId, bytes32[6] calldata g2x) private pure returns (bytes32) {
         return sha256(
             abi.encodePacked(
                 STATEMENT_DOMAIN,
@@ -527,56 +547,36 @@ contract DkgContract {
         );
     }
 
-    function _deriveSessionId(uint64 epoch, address[] memory parties) private view returns (bytes32) {
-        uint256 count = parties.length;
-        uint64 thresholdDegree = uint64((count - 1) / 3);
-        uint64 quorum = 2 * thresholdDegree + 1;
-        uint64 dealerThreshold = DKG_OUTPUT_COUNT + thresholdDegree;
-        if (dealerThreshold < quorum) {
-            dealerThreshold = quorum;
-        }
-
-        // Constant fields occupy 64 bytes; each party contributes id(4),
-        // weight(8), QC verifier(20), and validator address(20).
-        bytes memory preimage = new bytes(SESSION_ID_DOMAIN.length + 64 + count * 52);
-        uint256 offset;
-        for (uint256 i = 0; i < SESSION_ID_DOMAIN.length; i++) {
-            preimage[offset++] = SESSION_ID_DOMAIN[i];
-        }
-        offset = _writeLe64(preimage, offset, epoch);
-        offset = _writeLe64(preimage, offset, uint64(count));
-        for (uint32 i = 0; i < count; i++) {
-            offset = _writeLe32(preimage, offset, i);
-        }
-        offset = _writeLe64(preimage, offset, uint64(count));
-        for (uint256 i = 0; i < count; i++) {
-            offset = _writeLe64(preimage, offset, 1);
-        }
-        offset = _writeLe64(preimage, offset, thresholdDegree);
-        offset = _writeLe64(preimage, offset, quorum);
-        offset = _writeLe64(preimage, offset, dealerThreshold);
-        offset = _writeLe64(preimage, offset, uint64(count));
-        for (uint256 i = 0; i < count; i++) {
-            _writeAddress(preimage, offset, registrations[epoch][parties[i]].qcVerifier);
-            offset += 20;
-        }
-        offset = _writeLe64(preimage, offset, uint64(count));
-        for (uint256 i = 0; i < count; i++) {
-            _writeAddress(preimage, offset, parties[i]);
-            offset += 20;
-        }
-        assert(offset == preimage.length);
-        return sha256(preimage);
-    }
-
     function _signatureMatches(address expected, bytes32 digest, bytes32 r, bytes32 s) private pure returns (bool) {
-        uint256 rValue = uint256(r);
-        uint256 sValue = uint256(s);
-        if (expected == address(0) || rValue == 0 || rValue >= SECP256K1_N || sValue == 0 || sValue > SECP256K1_HALF_N)
-        {
+        if (expected == address(0) || uint256(s) > SECP256K1_HALF_N) {
             return false;
         }
         return ecrecover(digest, 27, r, s) == expected || ecrecover(digest, 28, r, s) == expected;
+    }
+
+    function _secpAddress(SecpPoint calldata point) private view returns (address) {
+        uint256 x = uint256(point.x);
+        if ((point.prefix != 2 && point.prefix != 3) || x >= SECP256K1_P) {
+            revert InvalidSecpPoint();
+        }
+        uint256 ySquared = addmod(mulmod(mulmod(x, x, SECP256K1_P), x, SECP256K1_P), 7, SECP256K1_P);
+        uint256 y = _modExp(ySquared, SECP256K1_SQRT_EXPONENT, SECP256K1_P);
+        if (mulmod(y, y, SECP256K1_P) != ySquared) {
+            revert InvalidSecpPoint();
+        }
+        if ((y & 1) != (point.prefix & 1)) {
+            y = SECP256K1_P - y;
+        }
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes32(x), bytes32(y))))));
+    }
+
+    function _modExp(uint256 base, uint256 exponent, uint256 modulus) private view returns (uint256 result) {
+        bytes memory input = abi.encodePacked(uint256(32), uint256(32), uint256(32), base, exponent, modulus);
+        (bool success, bytes memory output) = address(0x05).staticcall(input);
+        if (!success || output.length != 32) {
+            revert InvalidSecpPoint();
+        }
+        result = abi.decode(output, (uint256));
     }
 
     function _nextSequence(uint64 epoch) private view returns (uint64 sequence) {
@@ -590,20 +590,35 @@ contract DkgContract {
         return uint64(index);
     }
 
-    function _validateRegistration(Registration calldata registration) private pure {
+    function _validateRegistration(uint64 epoch, address party, Registration calldata registration) private view {
         if (registration.qcVerifier == address(0)) {
             revert InvalidQcVerifier();
         }
-        _validatePoint(registration.receiverPublicKey);
-        _validatePoint(registration.receiverKeyImage);
-        _validatePoint(registration.proofU0);
-        _validatePoint(registration.proofV0);
+        address receiverVerifier = _secpAddress(registration.receiverPublicKey);
+        bytes32 digest = _receiverKeyProofDigest(epoch, party, registration);
+        // The proof is checked before storage so the contract and engine freeze
+        // the same eligible set even when a validator submits malformed keys.
+        if (!_signatureMatches(receiverVerifier, digest, registration.receiverProofR, registration.receiverProofS)) {
+            revert InvalidReceiverProof();
+        }
     }
 
-    function _validatePoint(SecpPoint calldata point) private pure {
-        if (point.prefix != 2 && point.prefix != 3) {
-            revert InvalidPointPrefix(point.prefix);
-        }
+    function _receiverKeyProofDigest(uint64 epoch, address party, Registration calldata registration)
+        private
+        pure
+        returns (bytes32)
+    {
+        return sha256(
+            abi.encodePacked(
+                RECEIVER_KEY_PROOF_DOMAIN,
+                party,
+                _le64(epoch),
+                registration.qcVerifier,
+                registration.receiverPublicKey.prefix,
+                registration.receiverPublicKey.x,
+                _le32(registration.receiverProofNonce)
+            )
+        );
     }
 
     function _validateQc(uint32 dealer, QcSignature[] calldata signatures, uint256 partyCount) private pure {
@@ -618,13 +633,17 @@ contract DkgContract {
         if (count == 0 || count > partyCount) {
             revert MalformedQc();
         }
-        uint32 previous;
+        uint256 seenSigners;
         for (uint256 i = 0; i < count; i++) {
             uint32 signer = signatures[i].signer;
-            if (signer >= partyCount || (i != 0 && signer <= previous)) {
+            if (signer >= partyCount) {
                 revert MalformedQc();
             }
-            previous = signer;
+            uint256 signerBit = uint256(1) << signer;
+            if ((seenSigners & signerBit) != 0) {
+                revert MalformedQc();
+            }
+            seenSigners |= signerBit;
         }
     }
 
@@ -632,20 +651,6 @@ contract DkgContract {
         for (uint256 i = 0; i < source.length; i++) {
             target.push(source[i]);
         }
-    }
-
-    function _writeLe32(bytes memory output, uint256 offset, uint32 value) private pure returns (uint256) {
-        for (uint256 i = 0; i < 4; i++) {
-            output[offset + i] = bytes1(uint8(value >> (i * 8)));
-        }
-        return offset + 4;
-    }
-
-    function _writeLe64(bytes memory output, uint256 offset, uint64 value) private pure returns (uint256) {
-        for (uint256 i = 0; i < 8; i++) {
-            output[offset + i] = bytes1(uint8(value >> (i * 8)));
-        }
-        return offset + 8;
     }
 
     function _le64(uint64 value) private pure returns (bytes8 result) {
@@ -656,18 +661,20 @@ contract DkgContract {
         return bytes8(reversed);
     }
 
-    function _writeAddress(bytes memory output, uint256 offset, address value) private pure {
-        assembly ("memory-safe") {
-            mstore(add(add(output, 0x20), offset), shl(96, value))
+    function _le32(uint32 value) private pure returns (bytes4 result) {
+        uint32 reversed;
+        for (uint256 i = 0; i < 4; i++) {
+            reversed |= uint32(uint8(value >> (i * 8))) << uint32((3 - i) * 8);
         }
+        return bytes4(reversed);
     }
 
-    function _partyId(address[] memory parties, address party) private pure returns (uint256) {
-        for (uint256 i = 0; i < parties.length; i++) {
+    function _partyId(address[] memory parties, address party) private pure returns (bool exists, uint32 partyId) {
+        for (uint32 i = 0; i < parties.length; i++) {
             if (parties[i] == party) {
-                return i;
+                return (true, i);
             }
         }
-        return type(uint256).max;
+        return (false, 0);
     }
 }

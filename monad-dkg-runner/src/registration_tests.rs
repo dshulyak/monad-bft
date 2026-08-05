@@ -7,7 +7,9 @@ use monad_types::{Epoch, NodeId};
 use zeroize::Zeroize;
 
 use crate::{
-    registration::{assemble_registered_session, load_or_create_local_registration},
+    registration::{
+        assemble_registered_session, load_or_create_local_registration, RegistrationError,
+    },
     DkgLocalKeyMaterial, DkgValidator,
 };
 
@@ -67,7 +69,13 @@ fn intersects_registrations_with_finalized_validators() {
         .collect();
     let registrations = [0usize, 1, 3, 4]
         .into_iter()
-        .map(|index| registration([index as u8 + 1; 20], &keys[index]))
+        .map(|index| {
+            let mut registration = registration([index as u8 + 1; 20], &keys[index]);
+            if index == 4 {
+                registration.receiver_public_key.0 = [0; 33];
+            }
+            registration
+        })
         .collect();
 
     let session =
@@ -87,6 +95,24 @@ fn intersects_registrations_with_finalized_validators() {
             dkg_core::Address([2; 20])
         ]
     );
+}
+
+#[test]
+fn rejects_invalid_proof_for_a_finalized_validator() {
+    let nodes = test_nodes(1);
+    let keys = test_keys(1);
+    let address = [1; 20];
+    let validators = vec![DkgValidator::<NopSignature> {
+        node_id: nodes[0],
+        address,
+    }];
+    let mut malformed = registration(address, &keys[0]);
+    malformed.receiver_proof[0] ^= 1;
+
+    assert!(matches!(
+        assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], vec![malformed]),
+        Err(RegistrationError::InvalidReceiverProof { .. })
+    ));
 }
 
 #[test]

@@ -347,6 +347,7 @@ mod tests {
             ChainCall::PostDkgResult {
                 qc: DkgDoneQc {
                     epoch: SessionId(9),
+                    session_id: [0x55; 32],
                     g2x: BlsG2SerializedBytes([0x44; BLS_G2_SERIALIZED_BYTES]),
                     signatures: vec![signature(0), signature(1), signature(2)],
                 },
@@ -414,6 +415,7 @@ mod tests {
                 DkgResultPosted {
                     epoch: epoch.0,
                     sequence,
+                    sessionId: result.sessionId,
                     g2x: result.g2x,
                     signatures: result.signatures,
                 }

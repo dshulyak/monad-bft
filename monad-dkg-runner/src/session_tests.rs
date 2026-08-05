@@ -1,10 +1,10 @@
 use dkg_core::{PartyId, RecordId, SessionId};
-use dkg_crypto::{BLS_G2_SERIALIZED_BYTES, BlsG2SerializedBytes};
+use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
     BveQc, ChainCall, ChainEvent, DkgDoneQc, DkgMessageId, DkgMessageKey, QcSignature,
     QcSignatureBytes, TAG_PC_ACK,
 };
-use monad_crypto::{NopKeyPair, NopSignature, certificate_signature::CertificateKeyPair};
+use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSignature};
 use monad_types::{Epoch, NodeId};
 use tempfile::TempDir;
 
@@ -39,6 +39,7 @@ fn session_submits_chain_call_and_processes_finalized_event() {
 
     let qc = DkgDoneQc {
         epoch: SessionId(epoch.0),
+        session_id: [0x55; 32],
         g2x: BlsG2SerializedBytes([0x44; BLS_G2_SERIALIZED_BYTES]),
         signatures: vec![sig(0), sig(1), sig(2)],
     };

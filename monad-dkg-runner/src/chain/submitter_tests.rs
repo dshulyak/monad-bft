@@ -43,6 +43,7 @@ fn encodes_post_pc_qc_contract_calldata() {
 fn encodes_submit_result_contract_calldata() {
     let qc = DkgDoneQc {
         epoch: SessionId(9),
+        session_id: [0x11; 32],
         g2x: BlsG2SerializedBytes([0x22; BLS_G2_SERIALIZED_BYTES]),
         signatures: vec![sig(0)],
     };

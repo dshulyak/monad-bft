@@ -4,7 +4,7 @@ use std::{
 };
 
 use alloy_primitives::Address;
-use dkg_crypto::{K256SecpBackend, ReceiverKeyRegistrationError};
+use dkg_crypto::{secp::signature::SignatureError, K256SecpBackend};
 use dkg_protocol::{
     decode_registration, encode_registration, verify_party_registration, PartyRegistration,
     RegistrationCall, RegistrationCodecError,
@@ -53,7 +53,7 @@ pub(crate) enum RegistrationError {
     Verification {
         address: Address,
         #[source]
-        source: ReceiverKeyRegistrationError,
+        source: SignatureError,
     },
     #[error("invalid DKG receiver proof for {address} at epoch {epoch}")]
     InvalidReceiverProof { address: Address, epoch: u64 },
@@ -89,13 +89,18 @@ where
     let mut registrations_by_address = HashMap::new();
     for record in registrations {
         let address = record.address.0;
+        // Registrations outside the finalized validator set cannot participate
+        // in this session. Ignore them before decoding so unrelated malformed
+        // records cannot abort bootstrap for the selected validators.
+        if !validator_addresses.contains(&address) {
+            continue;
+        }
         if registrations_by_address.contains_key(&address) {
             return Err(RegistrationError::DuplicateRegistration {
                 address: Address::from(address),
             });
         }
-        let registration = verify_registration(record, epoch)?;
-        registrations_by_address.insert(address, registration);
+        registrations_by_address.insert(address, record);
     }
 
     // Party IDs are compact ranks in the finalized validator-set order. Missing
@@ -107,14 +112,16 @@ where
                 .remove(&validator.address)
                 .map(|registration| (validator.node_id, registration))
         })
-        .collect::<Vec<_>>();
+        .map(|(node_id, registration)| {
+            verify_registration(registration, epoch).map(|registration| (node_id, registration))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if eligible.is_empty() {
         return Err(RegistrationError::NoEligibleValidator);
     }
 
     let local = local_keys.decode().map_err(RegistrationError::LocalKeys)?;
-    if let Some((_, registration)) = eligible.iter().find(|(node_id, _)| *node_id == self_id)
-    {
+    if let Some((_, registration)) = eligible.iter().find(|(node_id, _)| *node_id == self_id) {
         if registration.receiver.public_key != local.receiver_public_key {
             return Err(RegistrationError::ReceiverKeyMismatch);
         }

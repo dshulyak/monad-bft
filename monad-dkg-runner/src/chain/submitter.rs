@@ -212,7 +212,7 @@ impl TxSubmitter {
                     // A finalized no-op/revert can consume the nonce without an
                     // event, such as a duplicate BVE witness for one pair.
                     info!(
-                        epoch = key.0.0,
+                        epoch = key.0 .0,
                         call_kind = chain_call_kind(&call),
                         "retired finalized DKG transaction without a matching event"
                     );
@@ -222,7 +222,7 @@ impl TxSubmitter {
                     let call_kind = chain_call_kind(call);
                     match error {
                         TxSubmissionError::MissingContext => warn!(
-                            epoch = key.0.0,
+                            epoch = key.0 .0,
                             call_kind, "missing DKG transaction context block; will retry"
                         ),
                         TxSubmissionError::ChainContext { block, source } => warn!(
@@ -233,7 +233,7 @@ impl TxSubmitter {
                         ),
                         TxSubmissionError::Operation(source) => warn!(
                             ?source,
-                            epoch = key.0.0,
+                            epoch = key.0 .0,
                             call_kind,
                             "failed to prepare DKG chain tx; will retry"
                         ),
@@ -407,6 +407,7 @@ enum ChainTxId {
         digest: [u8; 32],
     },
     DkgResult {
+        session_id: [u8; 32],
         g2x: [u8; BLS_G2_SERIALIZED_BYTES],
     },
 }
@@ -431,7 +432,10 @@ impl From<&ChainCall> for ChainTxId {
                 commitment_digest: qc.commitment_digest,
                 digest: qc.digest,
             },
-            ChainCall::PostDkgResult { qc } => Self::DkgResult { g2x: qc.g2x.0 },
+            ChainCall::PostDkgResult { qc } => Self::DkgResult {
+                session_id: qc.session_id,
+                g2x: qc.g2x.0,
+            },
             ChainCall::PostRegistration { registration, .. } => registration.into(),
         }
     }
@@ -449,7 +453,10 @@ impl From<&ChainEvent> for ChainTxId {
                 commitment_digest: qc.commitment_digest,
                 digest: qc.digest,
             },
-            ChainEvent::DkgResultRecorded { qc, .. } => Self::DkgResult { g2x: qc.g2x.0 },
+            ChainEvent::DkgResultRecorded { qc, .. } => Self::DkgResult {
+                session_id: qc.session_id,
+                g2x: qc.g2x.0,
+            },
         }
     }
 }

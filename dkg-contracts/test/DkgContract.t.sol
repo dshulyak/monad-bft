@@ -101,13 +101,17 @@ contract DkgContractTest {
         DkgContract.QcSignature[] signatures
     );
     event DkgResultPosted(
-        uint64 indexed epoch, uint64 indexed sequence, bytes32[6] g2x, DkgContract.QcSignature[] signatures
+        uint64 indexed epoch,
+        uint64 indexed sequence,
+        bytes32 sessionId,
+        bytes32[6] g2x,
+        DkgContract.QcSignature[] signatures
     );
     event PartySetFrozen(uint64 indexed epoch, uint256 partyCount, bytes32 partiesHash);
 
     function testRegisterStoresTypedPartyRegistration() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
-        DkgContract.Registration memory expected = registration(1);
+        DkgContract.Registration memory expected = registration(validator, 1);
         VM.prank(validator);
         dkg.register(EPOCH, expected);
 
@@ -118,19 +122,76 @@ contract DkgContractTest {
         require(keccak256(abi.encode(stored)) == keccak256(abi.encode(expected)), "wrong registration");
     }
 
+    function testReceiverProofMatchesRustVector() external pure {
+        address validator = VM.addr(100);
+        DkgContract.Registration memory record = registration(validator, 1);
+        require(
+            receiverKeyProofDigest(validator, record.qcVerifier, record.receiverPublicKey, record.receiverProofNonce)
+                == 0x336475c01467c96c760ff8210e598f3e07d0004a6e4bd19c2dcede6e5bad65f1,
+            "receiver proof transcript differs from Rust"
+        );
+        require(
+            record.receiverProofR == 0xc76aa5c99ef3e13e46cb5fe8a8cbed3c6dbe0d2bae141f8e430ea0c14dd57198
+                && record.receiverProofS == 0x624d2e80fe71603bb686e783debbae1b4b59d339f2b526a0d3b47b527abf08c1,
+            "receiver proof signature differs from Rust"
+        );
+    }
+
     function testDuplicateRegistrationReverts() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
+        DkgContract.Registration memory first = registration(validator, 1);
         VM.prank(validator);
-        dkg.register(EPOCH, registration(1));
+        dkg.register(EPOCH, first);
+        DkgContract.Registration memory second = registration(validator, 2);
         VM.expectRevert();
         VM.prank(validator);
-        dkg.register(EPOCH, registration(2));
+        dkg.register(EPOCH, second);
     }
 
     function testMalformedRegistrationCannotOccupyPartySlot() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
-        DkgContract.Registration memory malformed = registration(1);
+        DkgContract.Registration memory malformed = registration(validator, 1);
         malformed.qcVerifier = address(0);
+
+        VM.expectRevert();
+        VM.prank(validator);
+        dkg.register(EPOCH, malformed);
+    }
+
+    function testInvalidReceiverProofCannotOccupyPartySlot() external {
+        (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
+        DkgContract.Registration memory malformed = registration(validator, 1);
+        malformed.receiverProofR = bytes32(uint256(malformed.receiverProofR) ^ 1);
+
+        VM.expectRevert();
+        VM.prank(validator);
+        dkg.register(EPOCH, malformed);
+        require(dkg.registeredPartyCount(EPOCH) == 0, "invalid receiver proof occupied a party slot");
+    }
+
+    function testReceiverProofBindsQcVerifier() external {
+        (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
+        DkgContract.Registration memory malformed = registration(validator, 1);
+        malformed.qcVerifier = VM.addr(2);
+
+        VM.expectRevert();
+        VM.prank(validator);
+        dkg.register(EPOCH, malformed);
+    }
+
+    function testReceiverProofBindsValidator() external {
+        (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
+        DkgContract.Registration memory copied = registration(VM.addr(101), 1);
+
+        VM.expectRevert();
+        VM.prank(validator);
+        dkg.register(EPOCH, copied);
+    }
+
+    function testRegistrationRejectsPointOutsideSecpField() external {
+        (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
+        DkgContract.Registration memory malformed = registration(validator, 1);
+        malformed.receiverPublicKey.x = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
 
         VM.expectRevert();
         VM.prank(validator);
@@ -140,9 +201,10 @@ contract DkgContractTest {
     function testRegistrationClosesAtStakingBoundary() external {
         (DkgContract dkg, TestValidatorLookup staking, address validator) = deploySingleRegistrationTarget();
         staking.setEpoch(6, true);
+        DkgContract.Registration memory record = registration(validator, 1);
         VM.expectRevert();
         VM.prank(validator);
-        dkg.register(EPOCH, registration(1));
+        dkg.register(EPOCH, record);
     }
 
     function testUnregisteredStakingCallerCannotWriteDkgState() external {
@@ -150,16 +212,18 @@ contract DkgContractTest {
         DkgContract dkg = new DkgContract(address(staking));
         address outsider = address(0xBAD);
 
+        DkgContract.Registration memory record = registration(outsider, 1);
         VM.expectRevert();
         VM.prank(outsider);
-        dkg.register(EPOCH, registration(1));
+        dkg.register(EPOCH, record);
     }
 
     function testMissingStakingTargetCannotWriteDkgState() external {
         DkgContract dkg = new DkgContract(address(0x1000));
 
+        DkgContract.Registration memory record = registration(address(this), 1);
         VM.expectRevert();
-        dkg.register(EPOCH, registration(1));
+        dkg.register(EPOCH, record);
     }
 
     function testPartyIdsUseValidatorSetOrder() external {
@@ -191,8 +255,9 @@ contract DkgContractTest {
             validators[i] = VM.addr(200 + i);
             staking.addTarget(validators[i]);
             if (i != 1) {
+                DkgContract.Registration memory record = registration(validators[i], 10);
                 VM.prank(validators[i]);
-                dkg.register(EPOCH, registration(10));
+                dkg.register(EPOCH, record);
             }
         }
         staking.setEpoch(6, true);
@@ -227,8 +292,9 @@ contract DkgContractTest {
                 first = validator;
             }
             staking.addTarget(validator);
+            DkgContract.Registration memory record = registration(validator, 10);
             VM.prank(validator);
-            dkg.register(EPOCH, registration(10));
+            dkg.register(EPOCH, record);
         }
         staking.setEpoch(6, true);
 
@@ -292,11 +358,11 @@ contract DkgContractTest {
 
         DkgContract.DkgResult memory result = signedResult(fixture, 0x33);
         VM.expectEmit(true, true, false, true, address(fixture.dkg));
-        emit DkgResultPosted(EPOCH, 2, result.g2x, result.signatures);
+        emit DkgResultPosted(EPOCH, 2, result.sessionId, result.g2x, result.signatures);
         submitResult(fixture, result);
     }
 
-    function testIdenticalPcQcIsIdempotentAndDifferentWitnessIsRetained() external {
+    function testPcQcIsBoundedPerSubmittingValidatorAndDealer() external {
         Fixture memory fixture = deploySession();
         DkgContract.PcQc memory original = pcQc(3, 0x11, 1);
 
@@ -306,7 +372,10 @@ contract DkgContractTest {
 
         DkgContract.PcQc memory alternateWitness = pcQc(3, 0x11, 2);
         postPc(fixture, alternateWitness);
-        require(recordTotal(fixture.dkg) == 2, "alternate witness not recorded");
+        require(recordTotal(fixture.dkg) == 1, "submitter posted two witnesses for one dealer");
+
+        postPcAs(fixture, 1, alternateWitness);
+        require(recordTotal(fixture.dkg) == 2, "second validator could not post its witness");
     }
 
     function testBveQcIsBoundedPerSubmittingValidatorAndDealer() external {
@@ -343,6 +412,7 @@ contract DkgContractTest {
         DkgContract.RecordPage memory page = fixture.dkg.records(EPOCH, 0, 1);
         require(page.total == 1 && page.next == 1, "wrong result page boundary");
         require(page.results.length == 1 && page.results[0].sequence == 0, "wrong result page");
+        require(page.results[0].result.sessionId == result.sessionId, "wrong session id");
         require(page.results[0].result.g2x[0] == result.g2x[0], "wrong result point");
 
         VM.expectRevert();
@@ -353,6 +423,12 @@ contract DkgContractTest {
     function testSubmitResultRejectsTamperedPointAndSignature() external {
         Fixture memory fixture = deploySession();
         DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+        result.sessionId = bytes32(uint256(result.sessionId) ^ 1);
+        VM.expectRevert();
+        VM.prank(fixture.validators[0]);
+        fixture.dkg.submitResult(EPOCH, result);
+
+        result = signedResult(fixture, 0x44);
         result.g2x[5] = bytes32(uint256(result.g2x[5]) + 1);
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
@@ -360,6 +436,20 @@ contract DkgContractTest {
 
         result = signedResult(fixture, 0x44);
         result.signatures[1].s = bytes32(uint256(result.signatures[1].s) ^ 1);
+        VM.expectRevert();
+        VM.prank(fixture.validators[0]);
+        fixture.dkg.submitResult(EPOCH, result);
+    }
+
+    function testDoneQcSignerOrderDoesNotMatterAndDuplicatesFail() external {
+        Fixture memory fixture = deploySession();
+        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+        (result.signatures[0], result.signatures[2]) = (result.signatures[2], result.signatures[0]);
+        submitResult(fixture, result);
+
+        fixture = deploySession();
+        result = signedResult(fixture, 0x44);
+        result.signatures[2] = result.signatures[1];
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
@@ -403,8 +493,9 @@ contract DkgContractTest {
             fixture.validators[i] = VM.addr(100 + i);
             fixture.qcKeys[i] = i == 3 ? 6 : i + 1;
             fixture.staking.addTarget(fixture.validators[i]);
+            DkgContract.Registration memory record = registration(fixture.validators[i], fixture.qcKeys[i]);
             VM.prank(fixture.validators[i]);
-            fixture.dkg.register(EPOCH, registration(uint8(fixture.qcKeys[i])));
+            fixture.dkg.register(EPOCH, record);
         }
         fixture.staking.setEpoch(6, true);
     }
@@ -420,7 +511,11 @@ contract DkgContractTest {
     }
 
     function postPc(Fixture memory fixture, DkgContract.PcQc memory qc) private {
-        VM.prank(fixture.validators[0]);
+        postPcAs(fixture, 0, qc);
+    }
+
+    function postPcAs(Fixture memory fixture, uint256 validatorIndex, DkgContract.PcQc memory qc) private {
+        VM.prank(fixture.validators[validatorIndex]);
         fixture.dkg.postPcQc(EPOCH, qc);
     }
 
@@ -438,19 +533,33 @@ contract DkgContractTest {
         return dkg.records(EPOCH, 0, 1).total;
     }
 
-    function registration(uint8 qcKey) private pure returns (DkgContract.Registration memory) {
-        return DkgContract.Registration({
-            qcVerifier: VM.addr(qcKey),
-            receiverPublicKey: point(qcKey + 10),
-            receiverKeyImage: point(qcKey + 11),
-            proofU0: point(qcKey + 12),
-            proofV0: point(qcKey + 13),
-            proofZ: bytes32(uint256(qcKey + 14))
-        });
+    function registration(address party, uint256 qcKey) private pure returns (DkgContract.Registration memory result) {
+        result.qcVerifier = VM.addr(qcKey);
+        uint256 receiverKey = 1001;
+        result.receiverPublicKey =
+            DkgContract.SecpPoint({prefix: 3, x: 0x9d1abaec9f5715a15c7628244170951e0f85e87f68ca5393d3f9fc3fa23a69c8});
+        bytes32 digest =
+            receiverKeyProofDigest(party, result.qcVerifier, result.receiverPublicKey, result.receiverProofNonce);
+        (, result.receiverProofR, result.receiverProofS) = VM.sign(receiverKey, digest);
     }
 
-    function point(uint8 seed) private pure returns (DkgContract.SecpPoint memory) {
-        return DkgContract.SecpPoint({prefix: 2 + seed % 2, x: bytes32(uint256(seed))});
+    function receiverKeyProofDigest(
+        address party,
+        address qcVerifier,
+        DkgContract.SecpPoint memory receiverKey,
+        uint32 proofNonce
+    ) private pure returns (bytes32) {
+        return sha256(
+            abi.encodePacked(
+                "BTX-DKG/protocol/receiver-key-pop/v1",
+                party,
+                _le64(EPOCH),
+                qcVerifier,
+                receiverKey.prefix,
+                receiverKey.x,
+                _le32(proofNonce)
+            )
+        );
     }
 
     function pcQc(uint32 dealer, uint8 digest, uint8 witness) private pure returns (DkgContract.PcQc memory) {
@@ -479,7 +588,8 @@ contract DkgContractTest {
         for (uint256 i = 0; i < 6; i++) {
             result.g2x[i] = bytes32(uint256(pointByte) + i);
         }
-        bytes32 digest = doneQcDigest(EPOCH, result.g2x, fixture.validators, fixture.qcKeys);
+        result.sessionId = deriveSessionId(EPOCH, fixture.validators, fixture.qcKeys);
+        bytes32 digest = doneQcDigest(EPOCH, result.sessionId, result.g2x);
         result.signatures = new DkgContract.QcSignature[](3);
         for (uint32 i = 0; i < 3; i++) {
             (, bytes32 r, bytes32 s) = VM.sign(fixture.qcKeys[i], digest);
@@ -487,7 +597,7 @@ contract DkgContractTest {
         }
     }
 
-    function doneQcDigest(uint64 epoch, bytes32[6] memory g2x, address[4] memory parties, uint256[4] memory keys)
+    function deriveSessionId(uint64 epoch, address[4] memory parties, uint256[4] memory keys)
         private
         pure
         returns (bytes32)
@@ -506,7 +616,10 @@ contract DkgContractTest {
         for (uint256 i = 0; i < 4; i++) {
             session = bytes.concat(session, bytes20(parties[i]));
         }
-        bytes32 sessionId = sha256(session);
+        return sha256(session);
+    }
+
+    function doneQcDigest(uint64 epoch, bytes32 sessionId, bytes32[6] memory g2x) private pure returns (bytes32) {
         return sha256(
             abi.encodePacked(
                 "BTX-DKG/protocol/qc-signature/v1",

@@ -6,7 +6,7 @@ use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::sol;
 use dkg_core::{PartyId, RecordId, SessionId};
-use dkg_crypto::{BlsG2SerializedBytes, SecpPointBytes, SecpScalarBytes, BLS_G2_SERIALIZED_BYTES};
+use dkg_crypto::{BlsG2SerializedBytes, SecpPointBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
     BveQc, ChainCall, ChainEvent, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes, RegistrationCall,
 };
@@ -49,8 +49,8 @@ pub enum ContractCodecError {
     SignatureCount { count: usize, maximum: usize },
     #[error("typed DKG QC signer {signer} is outside the {party_count}-party session")]
     SignerOutOfRange { signer: u32, party_count: usize },
-    #[error("typed DKG QC signers are not strictly increasing at signer {signer}")]
-    NonCanonicalSigners { signer: u32 },
+    #[error("typed DKG QC contains duplicate signer {signer}")]
+    DuplicateSigner { signer: u32 },
 }
 
 impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
@@ -68,10 +68,9 @@ impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
         Ok(Self {
             qcVerifier: Address::from(<[u8; 20]>::from(registration.qc_verifier)),
             receiverPublicKey: registration.receiver_public_key.0.into(),
-            receiverKeyImage: registration.receiver_key_image.0.into(),
-            proofU0: registration.proof_u0.0.into(),
-            proofV0: registration.proof_v0.0.into(),
-            proofZ: B256::from(registration.proof_z.0),
+            receiverProofNonce: registration.receiver_proof_nonce,
+            receiverProofR: B256::from_slice(&registration.receiver_proof[..32]),
+            receiverProofS: B256::from_slice(&registration.receiver_proof[32..]),
         })
     }
 }
@@ -81,21 +80,20 @@ impl ContractRegistration {
         self,
         address: Address,
     ) -> Result<RegistrationCall, ContractCodecError> {
-        let qc_verifier = self
-            .qcVerifier
-            .into_array()
-            .try_into()
-            .map_err(|_| ContractCodecError::InvalidQcVerifier {
+        let qc_verifier = self.qcVerifier.into_array().try_into().map_err(|_| {
+            ContractCodecError::InvalidQcVerifier {
                 address: self.qcVerifier,
-            })?;
+            }
+        })?;
+        let mut receiver_proof = [0; 64];
+        receiver_proof[..32].copy_from_slice(self.receiverProofR.as_slice());
+        receiver_proof[32..].copy_from_slice(self.receiverProofS.as_slice());
         Ok(RegistrationCall {
             address: dkg_core::Address(address.into_array()),
             qc_verifier,
             receiver_public_key: SecpPointBytes(self.receiverPublicKey.into()),
-            receiver_key_image: SecpPointBytes(self.receiverKeyImage.into()),
-            proof_u0: SecpPointBytes(self.proofU0.into()),
-            proof_v0: SecpPointBytes(self.proofV0.into()),
-            proof_z: SecpScalarBytes(self.proofZ.0),
+            receiver_proof_nonce: self.receiverProofNonce,
+            receiver_proof,
         })
     }
 }
@@ -124,6 +122,7 @@ impl From<&BveQc> for ContractBveQc {
 impl From<&DkgDoneQc> for ContractDkgResult {
     fn from(qc: &DkgDoneQc) -> Self {
         Self {
+            sessionId: B256::from(qc.session_id),
             g2x: std::array::from_fn(|index| {
                 let start = index * 32;
                 B256::from_slice(&qc.g2x.0[start..start + 32])
@@ -171,6 +170,7 @@ impl DkgResultPosted {
         party_count: usize,
     ) -> Result<ChainEvent, ContractCodecError> {
         ContractDkgResult {
+            sessionId: self.sessionId,
             g2x: self.g2x,
             signatures: self.signatures.clone(),
         }
@@ -228,6 +228,7 @@ impl ContractDkgResult {
             record_id,
             qc: DkgDoneQc {
                 epoch,
+                session_id: self.sessionId.0,
                 g2x: BlsG2SerializedBytes(point),
                 signatures: ContractQcSignature::decode_all(self.signatures, party_count)?,
             },
@@ -265,9 +266,7 @@ impl From<QcSignature> for ContractQcSignature {
 
 impl ContractQcSignature {
     fn encode_all(signatures: &[QcSignature]) -> Vec<Self> {
-        let mut signatures = signatures.to_vec();
-        signatures.sort_unstable_by_key(|signature| signature.signer.0);
-        signatures.into_iter().map(Into::into).collect()
+        signatures.iter().copied().map(Into::into).collect()
     }
 
     fn decode_all(
@@ -281,21 +280,26 @@ impl ContractQcSignature {
             });
         }
 
-        let mut previous = None;
+        let mut seen = vec![false; party_count];
         signatures
             .into_iter()
             .map(|signature| {
                 let signer = signature.signer;
-                if usize::try_from(signer).map_or(true, |signer| signer >= party_count) {
+                let signer_index =
+                    usize::try_from(signer).map_err(|_| ContractCodecError::SignerOutOfRange {
+                        signer,
+                        party_count,
+                    })?;
+                if signer_index >= party_count {
                     return Err(ContractCodecError::SignerOutOfRange {
                         signer,
                         party_count,
                     });
                 }
-                if previous.is_some_and(|previous| signer <= previous) {
-                    return Err(ContractCodecError::NonCanonicalSigners { signer });
+                if seen[signer_index] {
+                    return Err(ContractCodecError::DuplicateSigner { signer });
                 }
-                previous = Some(signer);
+                seen[signer_index] = true;
                 let mut bytes = [0_u8; 64];
                 bytes[..32].copy_from_slice(signature.r.as_slice());
                 bytes[32..].copy_from_slice(signature.s.as_slice());
@@ -525,6 +529,28 @@ mod bindings_tests {
             Err(ContractCodecError::InvalidQcVerifier {
                 address: Address::ZERO
             })
+        ));
+    }
+
+    #[test]
+    fn qc_boundary_accepts_any_unique_signer_order() {
+        let signature = |signer| ContractQcSignature {
+            signer,
+            r: B256::repeat_byte(signer as u8 + 1),
+            s: B256::repeat_byte(signer as u8 + 2),
+        };
+
+        let decoded = ContractQcSignature::decode_all(vec![signature(2), signature(0)], 4).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|signature| signature.signer)
+                .collect::<Vec<_>>(),
+            vec![PartyId(2), PartyId(0)]
+        );
+        assert!(matches!(
+            ContractQcSignature::decode_all(vec![signature(2), signature(2)], 4),
+            Err(ContractCodecError::DuplicateSigner { signer: 2 })
         ));
     }
 }
