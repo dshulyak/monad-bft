@@ -130,7 +130,7 @@ contract DkgContractTest {
     function testMalformedRegistrationCannotOccupyPartySlot() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
         DkgContract.Registration memory malformed = registration(1);
-        malformed.qcVerifyingKey.prefix = 4;
+        malformed.qcVerifier = address(0);
 
         VM.expectRevert();
         VM.prank(validator);
@@ -407,47 +407,13 @@ contract DkgContractTest {
 
     function registration(uint8 qcKey) private pure returns (DkgContract.Registration memory) {
         return DkgContract.Registration({
-            qcVerifyingKey: qcPoint(qcKey),
+            qcVerifier: VM.addr(qcKey),
             receiverPublicKey: point(qcKey + 10),
             receiverKeyImage: point(qcKey + 11),
             proofU0: point(qcKey + 12),
             proofV0: point(qcKey + 13),
             proofZ: bytes32(uint256(qcKey + 14))
         });
-    }
-
-    function qcPoint(uint8 key) private pure returns (DkgContract.SecpPoint memory) {
-        if (key == 1) {
-            return
-                DkgContract.SecpPoint({
-                    prefix: 2, x: 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
-                });
-        }
-        if (key == 2) {
-            return
-                DkgContract.SecpPoint({
-                    prefix: 2, x: 0xc6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
-                });
-        }
-        if (key == 3) {
-            return
-                DkgContract.SecpPoint({
-                    prefix: 2, x: 0xf9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
-                });
-        }
-        if (key == 4) {
-            return
-                DkgContract.SecpPoint({
-                    prefix: 2, x: 0xe493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13
-                });
-        }
-        if (key == 6) {
-            return
-                DkgContract.SecpPoint({
-                    prefix: 3, x: 0xfff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556
-                });
-        }
-        return point(key);
     }
 
     function point(uint8 seed) private pure returns (DkgContract.SecpPoint memory) {
@@ -523,8 +489,7 @@ contract DkgContractTest {
         }
         session = bytes.concat(session, _le64(1), _le64(3), _le64(3), _le64(4));
         for (uint256 i = 0; i < 4; i++) {
-            DkgContract.SecpPoint memory key = qcPoint(uint8(keys[i]));
-            session = bytes.concat(session, bytes1(key.prefix), key.x);
+            session = bytes.concat(session, bytes20(VM.addr(keys[i])));
         }
         session = bytes.concat(session, _le64(4));
         for (uint256 i = 0; i < 4; i++) {

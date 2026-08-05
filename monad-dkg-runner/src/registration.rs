@@ -34,8 +34,8 @@ pub(crate) enum RegistrationError {
     LocalKeys(#[source] crate::DkgError),
     #[error("persisted DKG registration receiver key does not match the local key")]
     ReceiverKeyMismatch,
-    #[error("persisted DKG registration QC key does not match the local key")]
-    QcKeyMismatch,
+    #[error("persisted DKG registration QC verifier does not match the local signer")]
+    QcVerifierMismatch,
     #[error("decode DKG registration for {address} failed: {source}")]
     Decode {
         address: Address,
@@ -119,8 +119,8 @@ where
         if registration.receiver.public_key != local.receiver_public_key {
             return Err(RegistrationError::ReceiverKeyMismatch);
         }
-        if registration.qc_verifying_key != local.qc_verifying_key {
-            return Err(RegistrationError::QcKeyMismatch);
+        if registration.qc_verifier != local.qc_verifier {
+            return Err(RegistrationError::QcVerifierMismatch);
         }
     }
     let validators = eligible.iter().map(|(_, node_id, _)| *node_id).collect();
@@ -159,8 +159,8 @@ pub(crate) fn load_or_create_local_registration(
         return Err(RegistrationError::ReceiverKeyMismatch);
     }
 
-    if registration.qc_verifying_key != local.qc_verifying_key {
-        return Err(RegistrationError::QcKeyMismatch);
+    if registration.qc_verifier != local.qc_verifier {
+        return Err(RegistrationError::QcVerifierMismatch);
     }
     Ok(RegistrationCall::from_party(&registration))
 }

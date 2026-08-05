@@ -43,6 +43,8 @@ const COMPRESSED_SECP_POINT_BYTES: usize = 33;
 pub enum ContractCodecError {
     #[error("typed DKG registration address {actual} does not match signer {expected}")]
     RegistrationAddress { expected: Address, actual: Address },
+    #[error("typed DKG registration contains invalid QC verifier {address}")]
+    InvalidQcVerifier { address: Address },
     #[error("typed DKG QC has {count} signatures, expected 1..={maximum}")]
     SignatureCount { count: usize, maximum: usize },
     #[error("typed DKG QC signer {signer} is outside the {party_count}-party session")]
@@ -64,7 +66,7 @@ impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
         }
 
         Ok(Self {
-            qcVerifyingKey: registration.qc_verifying_key.0.into(),
+            qcVerifier: Address::from(<[u8; 20]>::from(registration.qc_verifier)),
             receiverPublicKey: registration.receiver_public_key.0.into(),
             receiverKeyImage: registration.receiver_key_image.0.into(),
             proofU0: registration.proof_u0.0.into(),
@@ -75,16 +77,26 @@ impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
 }
 
 impl ContractRegistration {
-    pub(super) fn into_registration(self, address: Address) -> RegistrationCall {
-        RegistrationCall {
+    pub(super) fn into_registration(
+        self,
+        address: Address,
+    ) -> Result<RegistrationCall, ContractCodecError> {
+        let qc_verifier = self
+            .qcVerifier
+            .into_array()
+            .try_into()
+            .map_err(|_| ContractCodecError::InvalidQcVerifier {
+                address: self.qcVerifier,
+            })?;
+        Ok(RegistrationCall {
             address: dkg_core::Address(address.into_array()),
-            qc_verifying_key: dkg_protocol::QcVerifyingKeyBytes(self.qcVerifyingKey.into()),
+            qc_verifier,
             receiver_public_key: SecpPointBytes(self.receiverPublicKey.into()),
             receiver_key_image: SecpPointBytes(self.receiverKeyImage.into()),
             proof_u0: SecpPointBytes(self.proofU0.into()),
             proof_v0: SecpPointBytes(self.proofV0.into()),
             proof_z: SecpScalarBytes(self.proofZ.0),
-        }
+        })
     }
 }
 
@@ -496,7 +508,24 @@ mod bindings_tests {
 
         let contract = ContractRegistration::try_from((&registration, address)).unwrap();
 
-        assert_eq!(contract.into_registration(address), registration);
+        assert_eq!(contract.into_registration(address).unwrap(), registration);
+    }
+
+    #[test]
+    fn registration_boundary_rejects_zero_qc_verifier() {
+        let address = Address::repeat_byte(0xA5);
+        let registration = DkgLocalKeyMaterial::derive([0x11; 32])
+            .registration(address.into_array(), 7)
+            .unwrap();
+        let mut contract = ContractRegistration::try_from((&registration, address)).unwrap();
+        contract.qcVerifier = Address::ZERO;
+
+        assert!(matches!(
+            contract.into_registration(address),
+            Err(ContractCodecError::InvalidQcVerifier {
+                address: Address::ZERO
+            })
+        ));
     }
 }
 

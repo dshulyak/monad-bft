@@ -3224,6 +3224,7 @@ dependencies = [
  "secp256k1 0.31.1",
  "serde",
  "sha2",
+ "sha3",
  "zeroize",
 ]
 

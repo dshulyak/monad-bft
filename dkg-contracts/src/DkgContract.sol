@@ -37,7 +37,7 @@ contract DkgContract {
     }
 
     struct Registration {
-        SecpPoint qcVerifyingKey;
+        address qcVerifier;
         SecpPoint receiverPublicKey;
         SecpPoint receiverKeyImage;
         SecpPoint proofU0;
@@ -109,11 +109,8 @@ contract DkgContract {
     bytes private constant STATEMENT_DOMAIN = "BTX-DKG/protocol/qc-signature/v1";
     bytes private constant DKG_DONE_QC_DOMAIN = "BTX-DKG/protocol/dkg-done-qc/v1";
     uint64 private constant DKG_OUTPUT_COUNT = 2;
-    uint256 private constant SECP256K1_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
     uint256 private constant SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
     uint256 private constant SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
-    uint256 private constant SECP256K1_SQRT_EXPONENT =
-        0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C;
     uint256 private constant MAX_PARTIES = 256;
 
     address private immutable STAKING;
@@ -152,7 +149,7 @@ contract DkgContract {
     error DkgAlreadyFinished(uint64 epoch);
     error InvalidDkgResult();
     error InvalidPointPrefix(uint8 prefix);
-    error InvalidSecpPoint();
+    error InvalidQcVerifier();
     error MalformedQc();
     error InvalidRecordPage(uint64 start, uint32 limit);
     error NotEpochParty(uint64 epoch, address caller);
@@ -187,7 +184,7 @@ contract DkgContract {
 
     function register(uint64 epoch, Registration calldata registration) external onlyValidator {
         _requireRegistrationOpen(epoch);
-        if (registrations[epoch][msg.sender].qcVerifyingKey.prefix != 0) {
+        if (registrations[epoch][msg.sender].qcVerifier != address(0)) {
             revert AlreadyRegistered(epoch, msg.sender);
         }
         if (registeredPartiesByEpoch[epoch].length == MAX_PARTIES) {
@@ -266,7 +263,7 @@ contract DkgContract {
         returns (bool exists, Registration memory registration)
     {
         registration = registrations[epoch][party];
-        exists = registration.qcVerifyingKey.prefix != 0;
+        exists = registration.qcVerifier != address(0);
     }
 
     function registeredPartyCount(uint64 epoch) external view returns (uint256) {
@@ -571,7 +568,7 @@ contract DkgContract {
                 revert InvalidDkgResult();
             }
             address party = parties[signature.signer];
-            address expectedSigner = _secpAddress(registrations[epoch][party].qcVerifyingKey);
+            address expectedSigner = registrations[epoch][party].qcVerifier;
             if (!_signatureMatches(expectedSigner, digest, signature.r, signature.s)) {
                 revert InvalidDkgResult();
             }
@@ -615,8 +612,8 @@ contract DkgContract {
         }
 
         // Constant fields occupy 64 bytes; each party contributes id(4),
-        // weight(8), compressed QC key(33), and address(20).
-        bytes memory preimage = new bytes(SESSION_ID_DOMAIN.length + 64 + count * 65);
+        // weight(8), QC verifier(20), and validator address(20).
+        bytes memory preimage = new bytes(SESSION_ID_DOMAIN.length + 64 + count * 52);
         uint256 offset;
         for (uint256 i = 0; i < SESSION_ID_DOMAIN.length; i++) {
             preimage[offset++] = SESSION_ID_DOMAIN[i];
@@ -635,10 +632,8 @@ contract DkgContract {
         offset = _writeLe64(preimage, offset, dealerThreshold);
         offset = _writeLe64(preimage, offset, uint64(count));
         for (uint256 i = 0; i < count; i++) {
-            SecpPoint storage key = registrations[epoch][parties[i]].qcVerifyingKey;
-            preimage[offset++] = bytes1(key.prefix);
-            _writeWord(preimage, offset, key.x);
-            offset += 32;
+            _writeAddress(preimage, offset, registrations[epoch][parties[i]].qcVerifier);
+            offset += 20;
         }
         offset = _writeLe64(preimage, offset, uint64(count));
         for (uint256 i = 0; i < count; i++) {
@@ -659,31 +654,6 @@ contract DkgContract {
         return ecrecover(digest, 27, r, s) == expected || ecrecover(digest, 28, r, s) == expected;
     }
 
-    function _secpAddress(SecpPoint storage point) private view returns (address) {
-        uint256 x = uint256(point.x);
-        if ((point.prefix != 2 && point.prefix != 3) || x >= SECP256K1_P) {
-            revert InvalidSecpPoint();
-        }
-        uint256 ySquared = addmod(mulmod(mulmod(x, x, SECP256K1_P), x, SECP256K1_P), 7, SECP256K1_P);
-        uint256 y = _modExp(ySquared, SECP256K1_SQRT_EXPONENT, SECP256K1_P);
-        if (mulmod(y, y, SECP256K1_P) != ySquared) {
-            revert InvalidSecpPoint();
-        }
-        if ((y & 1) != (point.prefix & 1)) {
-            y = SECP256K1_P - y;
-        }
-        return address(uint160(uint256(keccak256(abi.encodePacked(bytes32(x), bytes32(y))))));
-    }
-
-    function _modExp(uint256 base, uint256 exponent, uint256 modulus) private view returns (uint256 result) {
-        bytes memory input = abi.encodePacked(uint256(32), uint256(32), uint256(32), base, exponent, modulus);
-        (bool success, bytes memory output) = address(0x05).staticcall(input);
-        if (!success || output.length != 32) {
-            revert InvalidSecpPoint();
-        }
-        result = abi.decode(output, (uint256));
-    }
-
     function _nextSequence(uint64 epoch) private view returns (uint64 sequence) {
         return _recordIndex(recordsByEpoch[epoch].length);
     }
@@ -696,7 +666,9 @@ contract DkgContract {
     }
 
     function _validateRegistration(Registration calldata registration) private pure {
-        _validatePoint(registration.qcVerifyingKey);
+        if (registration.qcVerifier == address(0)) {
+            revert InvalidQcVerifier();
+        }
         _validatePoint(registration.receiverPublicKey);
         _validatePoint(registration.receiverKeyImage);
         _validatePoint(registration.proofU0);
@@ -757,12 +729,6 @@ contract DkgContract {
             reversed |= uint64(uint8(value >> (i * 8))) << uint64((7 - i) * 8);
         }
         return bytes8(reversed);
-    }
-
-    function _writeWord(bytes memory output, uint256 offset, bytes32 value) private pure {
-        assembly ("memory-safe") {
-            mstore(add(add(output, 0x20), offset), value)
-        }
     }
 
     function _writeAddress(bytes memory output, uint256 offset, address value) private pure {

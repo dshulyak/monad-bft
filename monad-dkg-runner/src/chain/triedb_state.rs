@@ -23,7 +23,7 @@ use monad_types::{Epoch, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 use thiserror::Error;
 
-use super::{ContractRecordPage, DkgContract};
+use super::{ContractCodecError, ContractRecordPage, DkgContract};
 use crate::DkgError;
 
 const DKG_ETH_CALL_GAS_LIMIT: u64 = 5_000_000;
@@ -44,6 +44,8 @@ pub(super) enum TriedbStateError {
     CountOverflow { kind: &'static str },
     #[error("DKG contract supports at most 256 parties; got {count}")]
     TooManyParties { count: usize },
+    #[error(transparent)]
+    Contract(#[from] ContractCodecError),
     #[error("DKG record total changed from {expected} to {actual} within one finalized snapshot")]
     RecordTotalChanged { expected: u64, actual: u64 },
     #[error("failed to decode DKG contract call {signature} at block {block}")]
@@ -255,7 +257,7 @@ impl TriedbDkgStateReader {
                 },
             )?;
             if registration.exists {
-                registrations.push(registration.registration.into_registration(party));
+                registrations.push(registration.registration.into_registration(party)?);
             }
         }
 

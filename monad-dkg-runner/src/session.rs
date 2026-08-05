@@ -854,7 +854,7 @@ fn build_engine(
         thresholds,
         registrations
             .iter()
-            .map(|registration| registration.qc_verifying_key)
+            .map(|registration| registration.qc_verifier)
             .collect(),
         receiver_publics,
         registrations

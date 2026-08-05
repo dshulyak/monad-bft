@@ -7,7 +7,7 @@ use dkg_crypto::{
     K256SecpBackend, NonIdentitySecpPoint, NonZeroSecpScalar, SecpBackend, SecpScalarBytes,
 };
 use dkg_protocol::{
-    PartyRegistration, QcSigningKey, QcVerifyingKeyBytes, RegistrationCall, SecretKeys,
+    PartyRegistration, QcSigningKey, QcVerifier, RegistrationCall, SecretKeys,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -126,16 +126,16 @@ impl DkgLocalKeyMaterial {
                 .map_err(|err| DkgError::operation("derive DKG receiver public key", err))?;
         let qc_signing_key = QcSigningKey::from_bytes(self.qc_signing_key)
             .map_err(|err| DkgError::operation("decode DKG QC signing key", err))?;
-        let qc_verifying_key = qc_signing_key
-            .verifying_key_bytes()
-            .map_err(|err| DkgError::operation("derive DKG QC verifying key", err))?;
+        let qc_verifier = qc_signing_key
+            .verifier()
+            .map_err(|err| DkgError::operation("derive DKG QC verifier", err))?;
         Ok(DecodedLocalKeyMaterial {
             secret_keys: SecretKeys {
                 receiver_secret_key: Some(receiver_secret_key),
                 qc_signing_key,
             },
             receiver_public_key,
-            qc_verifying_key,
+            qc_verifier,
         })
     }
 }
@@ -174,7 +174,7 @@ pub(crate) struct DkgRegisteredKeyMaterial {
 pub(crate) struct DecodedLocalKeyMaterial {
     pub(crate) secret_keys: SecretKeys<K256SecpBackend>,
     pub(crate) receiver_public_key: NonIdentitySecpPoint<K256SecpBackend>,
-    pub(crate) qc_verifying_key: QcVerifyingKeyBytes,
+    pub(crate) qc_verifier: QcVerifier,
 }
 
 #[cfg(test)]
