@@ -7,11 +7,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-  ASMFLAGS: -march=haswell
+  ASMFLAGS: -march=skylake-avx512
   CC: gcc-15
-  CFLAGS: -march=haswell
+  CFLAGS: -march=skylake-avx512
   CXX: g++-15
-  CXXFLAGS: -march=haswell
+  # CatBlst currently relies on stdio declarations without including <cstdio> itself.
+  CXXFLAGS: -march=skylake-avx512 -include cstdio
+  RUSTFLAGS: -C target-cpu=skylake-avx512
   TRIEDB_TARGET: triedb_driver
 
 permissions:

@@ -229,7 +229,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 zstd = "0.13"
 
 [patch.crates-io]
-blst = { path = "../../blst/bindings/rust" }
+blst = { git = "ssh://git@github.com/category-labs/CatBlst.git", rev = "26ef30d699d035d261936b1ec1217195425fef8e" }
 
 [profile.dev]
 opt-level = 1

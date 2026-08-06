@@ -84,9 +84,15 @@ ENV GIT_MODIFIED=$GIT_MODIFIED
 
 # Builder
 COPY --from=category-research-internal . /usr/category-research-internal/etx-dkg
+COPY --from=stake-weight-quantization . /usr/category-research-internal/stake-weight-quantization
 COPY --from=blst . /usr/blst
 COPY . .
-RUN cargo build --release --example txgen && \
+# CatBlst currently relies on stdio declarations without including <cstdio> itself.
+RUN ASMFLAGS="-march=skylake-avx512" CFLAGS="-march=skylake-avx512" CXXFLAGS="-march=skylake-avx512 -include cstdio" \
+      RUSTFLAGS="-C target-cpu=skylake-avx512" CC=gcc-15 CXX=g++-15 cargo \
+      --config 'patch.crates-io.blst.path="/usr/blst/bindings/rust"' \
+      --config 'patch."ssh://git@github.com/category-labs/CatBlst.git".blst.path="/usr/blst/bindings/rust"' \
+      build --release --example txgen && \
     mv target/release/examples/txgen txgen
 
 # Runner

@@ -86,15 +86,20 @@ ENV GIT_MODIFIED=$GIT_MODIFIED
 
 # Builder
 COPY --from=category-research-internal . /usr/category-research-internal/etx-dkg
+COPY --from=stake-weight-quantization . /usr/category-research-internal/stake-weight-quantization
 COPY --from=blst . /usr/blst
 COPY . .
+# CatBlst currently relies on stdio declarations without including <cstdio> itself.
 RUN case "$TOOLCHAIN" in \
       gcc-avx512) cpu_flags="-march=skylake-avx512"; rust_cpu="skylake-avx512" ;; \
       gcc-avx2) cpu_flags="-march=haswell"; rust_cpu="haswell" ;; \
       *) echo "unsupported TOOLCHAIN=$TOOLCHAIN" >&2; exit 2 ;; \
     esac && \
-    ASMFLAGS="$cpu_flags" CFLAGS="$cpu_flags -fno-omit-frame-pointer" CXXFLAGS="$cpu_flags -fno-omit-frame-pointer" \
-    RUSTFLAGS="-C target-cpu=$rust_cpu -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo build --release --bin monad-rpc && \
+    ASMFLAGS="$cpu_flags" CFLAGS="$cpu_flags -fno-omit-frame-pointer" CXXFLAGS="$cpu_flags -fno-omit-frame-pointer -include cstdio" \
+    RUSTFLAGS="-C target-cpu=$rust_cpu -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo \
+      --config 'patch.crates-io.blst.path="/usr/blst/bindings/rust"' \
+      --config 'patch."ssh://git@github.com/category-labs/CatBlst.git".blst.path="/usr/blst/bindings/rust"' \
+      build --release --bin monad-rpc && \
     mv target/release/monad-rpc rpc && \
     cp `ls -Lt $(find target/release | grep -e "libtriedb_driver.so")` . && \
     ldd $(ls -Lt $(find target/release | grep -e "libtriedb_driver.so")) | docker/filter-dependent-shared-objects.py | xargs -I {} cp {} .
