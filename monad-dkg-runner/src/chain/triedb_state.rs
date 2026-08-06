@@ -42,8 +42,6 @@ pub(super) enum TriedbStateError {
     ContractMissing { contract: Address, block: u64 },
     #[error("DKG {kind} count exceeds usize")]
     CountOverflow { kind: &'static str },
-    #[error("DKG contract supports at most 256 parties; got {count}")]
-    TooManyParties { count: usize },
     #[error(transparent)]
     Contract(#[from] ContractCodecError),
     #[error("DKG record total changed from {expected} to {actual} within one finalized snapshot")]
@@ -238,12 +236,6 @@ impl TriedbDkgStateReader {
     {
         let gas_limit = self.state_context(state_read, block, contract)?;
 
-        if parties.len() > 256 {
-            return Err(TriedbStateError::TooManyParties {
-                count: parties.len(),
-            });
-        }
-
         let mut registrations = Vec::with_capacity(parties.len());
         for &party in parties {
             let registration = self.call(
@@ -276,9 +268,6 @@ impl TriedbDkgStateReader {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        if party_count > 256 {
-            return Err(TriedbStateError::TooManyParties { count: party_count });
-        }
         let gas_limit = match self.state_context(state_read, block, contract) {
             Ok(gas_limit) => gas_limit,
             Err(TriedbStateError::ContractMissing { .. }) => {

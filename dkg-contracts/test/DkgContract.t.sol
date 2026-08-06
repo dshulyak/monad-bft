@@ -20,10 +20,11 @@ contract TestValidatorLookup {
     uint64[] private consensus;
     uint64[] private snapshot;
     uint64 private epoch = 6;
+    uint64 private nextValidatorId = 1;
     bool private inDelay;
 
     function addTarget(address validator) external {
-        uint64 id = uint64(consensus.length + 1);
+        uint64 id = nextValidatorId++;
         validatorIds[validator] = id;
         consensusStakes[id] = WEI_PER_MON;
         snapshotStakes[id] = WEI_PER_MON;
@@ -32,7 +33,7 @@ contract TestValidatorLookup {
     }
 
     function addValidator(address validator) external {
-        uint64 id = uint64(consensus.length + 100);
+        uint64 id = nextValidatorId++;
         validatorIds[validator] = id;
     }
 
@@ -141,7 +142,6 @@ contract DkgContractTest {
         bytes32[6] g2x,
         DkgContract.QcSignature[] signatures
     );
-    event PartySetFrozen(uint64 indexed epoch, uint256 partyCount, bytes32 partiesHash);
 
     function testRegisterStoresTypedPartyRegistration() external {
         (DkgContract dkg,, address validator) = deploySingleRegistrationTarget();
@@ -149,8 +149,6 @@ contract DkgContractTest {
         VM.prank(validator);
         dkg.register(EPOCH, expected);
 
-        require(dkg.registeredPartyCount(EPOCH) == 1, "wrong registration count");
-        require(dkg.registeredParty(EPOCH, 0) == validator, "wrong registered party");
         (bool exists, DkgContract.Registration memory stored) = dkg.registrationOf(EPOCH, validator);
         require(exists, "registration missing");
         require(keccak256(abi.encode(stored)) == keccak256(abi.encode(expected)), "wrong registration");
@@ -200,7 +198,8 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(validator);
         dkg.register(EPOCH, malformed);
-        require(dkg.registeredPartyCount(EPOCH) == 0, "invalid receiver proof occupied a party slot");
+        (bool exists,) = dkg.registrationOf(EPOCH, validator);
+        require(!exists, "invalid receiver proof was stored");
     }
 
     function testReceiverProofBindsQcVerifier() external {
@@ -260,28 +259,7 @@ contract DkgContractTest {
         dkg.register(EPOCH, record);
     }
 
-    function testPartyIdsUseValidatorSetOrder() external {
-        Fixture memory fixture = deploySession();
-        postPc(fixture, pcQc(2, 0x11, 1));
-
-        require(fixture.dkg.frozenPartyCount(EPOCH) == 4, "wrong frozen party count");
-        for (uint32 i = 0; i < 4; i++) {
-            require(
-                fixture.dkg.frozenParty(EPOCH, i) == fixture.validators[i], "party order differs from validator set"
-            );
-            (bool exists, uint32 partyId) = fixture.dkg.partyIdOf(EPOCH, fixture.validators[i]);
-            require(exists && partyId == i, "wrong party id");
-        }
-
-        // A frozen party set must not depend on whichever staking snapshot is
-        // current when it is read later.
-        fixture.staking.setEpoch(99, false);
-        for (uint32 i = 0; i < 4; i++) {
-            require(fixture.dkg.frozenParty(EPOCH, i) == fixture.validators[i], "frozen order changed");
-        }
-    }
-
-    function testPartyIdsCompactMissingRegistrationsWithoutReordering() external {
+    function testPartyCountCompactsMissingRegistrations() external {
         TestValidatorLookup staking = new TestValidatorLookup();
         DkgContract dkg = new DkgContract(address(staking));
         address[5] memory validators;
@@ -299,12 +277,12 @@ contract DkgContractTest {
         VM.prank(validators[0]);
         dkg.postPcQc(EPOCH, pcQc(1, 0x11, 1));
 
-        address[4] memory expected = [validators[0], validators[2], validators[3], validators[4]];
-        for (uint32 i = 0; i < expected.length; i++) {
-            require(dkg.frozenParty(EPOCH, i) == expected[i], "filtered validator order changed");
-            (bool exists, uint32 partyId) = dkg.partyIdOf(EPOCH, expected[i]);
-            require(exists && partyId == i, "filtered party id differs");
-        }
+        VM.prank(validators[0]);
+        dkg.postPcQc(EPOCH, pcQc(3, 0x12, 1));
+        VM.expectRevert();
+        VM.prank(validators[0]);
+        dkg.postPcQc(EPOCH, pcQc(4, 0x13, 1));
+        require(dkg.records(EPOCH, 0, 10).total == 2, "wrong compact party count");
     }
 
     function testNonTargetValidatorCannotPostProtocolRecord() external {
@@ -316,11 +294,11 @@ contract DkgContractTest {
         fixture.dkg.postPcQc(EPOCH, pcQc(2, 0x11, 1));
     }
 
-    function testMaximumPartySetCanFreeze() external {
+    function testPartySetCanExceedLegacyBitmapWidth() external {
         TestValidatorLookup staking = new TestValidatorLookup();
         DkgContract dkg = new DkgContract(address(staking));
         address first;
-        for (uint256 i = 0; i < 200; i++) {
+        for (uint256 i = 0; i < 257; i++) {
             address validator = address(uint160(1000 - i));
             if (i == 0) {
                 first = validator;
@@ -333,9 +311,8 @@ contract DkgContractTest {
         staking.setEpoch(6, true);
 
         VM.prank(first);
-        dkg.postPcQc(EPOCH, pcQc(1, 0x11, 1));
-        require(dkg.frozenPartyCount(EPOCH) == 200, "maximum party set was not frozen");
-        require(dkg.frozenParty(EPOCH, 0) == first, "maximum party set order changed");
+        dkg.postPcQc(EPOCH, pcQc(256, 0x11, 1));
+        require(dkg.records(EPOCH, 0, 1).total == 1, "large party set was rejected");
     }
 
     function testPcAndBveRecordsAreStoredAsTypedRecords() external {
@@ -376,12 +353,6 @@ contract DkgContractTest {
         DkgContract.PcQc memory pc = pcQc(2, 0x11, 1);
         DkgContract.BveQc memory bve = bveQc(3, 0x22, 1);
 
-        address[] memory frozen = new address[](4);
-        for (uint256 i = 0; i < 4; i++) {
-            frozen[i] = fixture.validators[i];
-        }
-        VM.expectEmit(true, false, false, true, address(fixture.dkg));
-        emit PartySetFrozen(EPOCH, 4, keccak256(abi.encode(frozen)));
         VM.expectEmit(true, true, true, true, address(fixture.dkg));
         emit PcQcPosted(EPOCH, 0, pc.dealer, pc.digest, pc.signatures);
         postPc(fixture, pc);
@@ -505,7 +476,7 @@ contract DkgContractTest {
         submitResult(fixture, result);
     }
 
-    function testSinglePartySetCanFreeze() external {
+    function testSinglePartySetCanPost() external {
         (DkgContract dkg, TestValidatorLookup staking, address validator) = deploySingleRegistrationTarget();
         uint256 qcKey = 1;
         DkgContract.Registration memory record = registration(validator, qcKey);
@@ -514,7 +485,7 @@ contract DkgContractTest {
         staking.setEpoch(6, true);
         VM.prank(validator);
         dkg.postPcQc(EPOCH, pcQc(0, 0x11, 1));
-        require(dkg.frozenPartyCount(EPOCH) == 1, "singleton party set did not freeze");
+        require(dkg.records(EPOCH, 0, 1).total == 1, "singleton party set was rejected");
     }
 
     function testSubmitResultRejectsTamperedPointAndSignature() external {
@@ -538,13 +509,14 @@ contract DkgContractTest {
         fixture.dkg.submitResult(EPOCH, result);
     }
 
-    function testDoneQcSignerOrderDoesNotMatterAndDuplicatesFail() external {
+    function testDoneQcRequiresCanonicalSignerOrder() external {
         Fixture memory fixture = deploySession();
         DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
         (result.signatures[0], result.signatures[2]) = (result.signatures[2], result.signatures[0]);
-        submitResult(fixture, result);
+        VM.expectRevert();
+        VM.prank(fixture.validators[0]);
+        fixture.dkg.submitResult(EPOCH, result);
 
-        fixture = deploySession();
         result = signedResult(fixture, 0x44);
         result.signatures[2] = result.signatures[1];
         VM.expectRevert();

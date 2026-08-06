@@ -15,13 +15,13 @@ interface IMonadStaking {
 
 /// @notice Typed on-chain ordering and final-result verification for DKG.
 ///
-/// Party identity is frozen at the staking boundary, not supplied by the result
-/// submitter. The contract intersects the target epoch's locked validator set
-/// with registrations while preserving validator-set order. The runner uses the
-/// same stable filter, so PartyId is the address's compact array index.
+/// Party identity is derived from staking, not supplied by the result submitter.
+/// The contract intersects the target epoch's validator set with registrations
+/// while preserving validator-set order. The runner uses the same stable filter,
+/// so PartyId is the address's compact array index.
 ///
 /// A DKG-DONE QC is accepted only if distinct PartyIds with strictly more than
-/// two thirds of the target epoch's boundary-frozen whole-MON voting weight
+/// two thirds of the target epoch's whole-MON voting weight
 /// carry valid secp256k1 signatures over the engine's exact SHA-256 transcript
 /// `(epoch, session_id, g2x)`. Once accepted, the epoch is terminal and no
 /// further PC or BVE QC can be appended.
@@ -120,19 +120,15 @@ contract DkgContract {
     uint256 private constant SECP256K1_SQRT_EXPONENT =
         0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C;
     uint256 private constant WEI_PER_MON = 1 ether;
-    uint256 private constant MAX_PARTIES = 256;
-
     IMonadStaking private immutable STAKING;
 
     mapping(uint64 epoch => RecordRef[] records) private recordsByEpoch;
     mapping(uint64 epoch => PcQc[] records) private pcQcsByEpoch;
     mapping(uint64 epoch => BveQc[] records) private bveQcsByEpoch;
     mapping(uint64 epoch => DkgResult[] records) private resultsByEpoch;
-    mapping(uint64 epoch => address[] parties) private registeredPartiesByEpoch;
+    mapping(uint64 epoch => uint256 count) private registrationCountByEpoch;
     mapping(uint64 epoch => mapping(address party => Registration registration)) private registrations;
-    /// @dev Registration indices in canonical validator-set order. One byte per
-    /// party is sufficient because registrations are bounded to 256.
-    mapping(uint64 epoch => bytes registrationOrder) private frozenRegistrationOrderByEpoch;
+    mapping(uint64 epoch => mapping(uint64 validatorId => address party)) private registeredPartyByValidatorId;
     mapping(uint64 epoch => mapping(address submitter => mapping(uint32 dealer => bool submitted))) private
         submittedPcQc;
     mapping(uint64 epoch => mapping(address submitter => mapping(uint32 dealer => bool submitted))) private
@@ -140,7 +136,6 @@ contract DkgContract {
     mapping(uint64 epoch => bool recorded) private resultRecorded;
 
     event PartyRegistered(uint64 indexed epoch, address indexed party, Registration registration);
-    event PartySetFrozen(uint64 indexed epoch, uint256 partyCount, bytes32 partiesHash);
     event PcQcPosted(
         uint64 indexed epoch, uint64 indexed sequence, uint32 indexed dealer, bytes32 digest, QcSignature[] signatures
     );
@@ -170,42 +165,34 @@ contract DkgContract {
     error RegistrationClosed(uint64 epoch);
     error ResultAlreadyRecorded(uint64 resultEpoch);
     error StakingLookupFailed();
-    error TooManyRegistrations(uint64 epoch);
 
     constructor(address staking_) {
         STAKING = IMonadStaking(staking_);
     }
 
-    modifier onlyValidator() {
-        _requireValidator();
-        _;
-    }
-
-    function _requireValidator() private {
-        if (_validatorId(msg.sender) == 0) {
-            revert NotValidator(msg.sender);
-        }
-    }
-
     function _requireEpochParty(uint64 epoch) private returns (address[] memory parties) {
         parties = _partySet(epoch);
-        (bool exists,) = _partyId(parties, msg.sender);
-        if (!exists) {
+        if (!_contains(parties, msg.sender)) {
             revert NotEpochParty(epoch, msg.sender);
         }
     }
 
-    function register(uint64 epoch, Registration calldata registration) external onlyValidator {
+    function register(uint64 epoch, Registration calldata registration) external {
         _requireRegistrationOpen(epoch);
+        uint64 validatorId = _validatorId(msg.sender);
+        if (validatorId == 0) {
+            revert NotValidator(msg.sender);
+        }
         if (registrations[epoch][msg.sender].qcVerifier != address(0)) {
             revert AlreadyRegistered(epoch, msg.sender);
         }
-        if (registeredPartiesByEpoch[epoch].length == MAX_PARTIES) {
-            revert TooManyRegistrations(epoch);
+        if (registeredPartyByValidatorId[epoch][validatorId] != address(0)) {
+            revert AlreadyRegistered(epoch, msg.sender);
         }
         _validateRegistration(epoch, msg.sender, registration);
         registrations[epoch][msg.sender] = registration;
-        registeredPartiesByEpoch[epoch].push(msg.sender);
+        registeredPartyByValidatorId[epoch][validatorId] = msg.sender;
+        registrationCountByEpoch[epoch]++;
         emit PartyRegistered(epoch, msg.sender, registration);
     }
 
@@ -279,26 +266,6 @@ contract DkgContract {
         exists = registration.qcVerifier != address(0);
     }
 
-    function registeredPartyCount(uint64 epoch) external view returns (uint256) {
-        return registeredPartiesByEpoch[epoch].length;
-    }
-
-    function registeredParty(uint64 epoch, uint256 index) external view returns (address) {
-        return registeredPartiesByEpoch[epoch][index];
-    }
-
-    function frozenPartyCount(uint64 epoch) external view returns (uint256) {
-        return _partySetView(epoch).length;
-    }
-
-    function frozenParty(uint64 epoch, uint256 index) external view returns (address) {
-        return _partySetView(epoch)[index];
-    }
-
-    function partyIdOf(uint64 epoch, address party) external view returns (bool exists, uint32 partyId) {
-        return _partyId(_partySetView(epoch), party);
-    }
-
     function records(uint64 epoch, uint64 start, uint32 limit) external view returns (RecordPage memory page) {
         uint256 total = recordsByEpoch[epoch].length;
         if (start > total || limit == 0) {
@@ -352,71 +319,43 @@ contract DkgContract {
         }
     }
 
-    /// @dev Freeze `PartyId -> address` from consensus-owned staking state.
-    /// During the boundary delay, consensus is the next epoch and snapshot is
-    /// the current epoch. Outside it, consensus is the current epoch. Once
-    /// frozen here the mapping remains reconstructible after staking rotates
-    /// both sets.
-    function _partySet(uint64 epoch) private returns (address[] memory) {
-        if (frozenRegistrationOrderByEpoch[epoch].length == 0) {
-            return _freezePartySet(epoch);
-        }
-        return _partySetView(epoch);
-    }
-
-    function _freezePartySet(uint64 epoch) private returns (address[] memory parties) {
-        uint64[] memory validatorIds = _readValidatorSet(_validatorSetKind(epoch));
-        address[] storage registered = registeredPartiesByEpoch[epoch];
-        parties = new address[](registered.length);
-        uint64[] memory registeredValidatorIds = new uint64[](registered.length);
-        for (uint256 i = 0; i < registered.length; i++) {
-            uint64 validatorId = _validatorId(registered[i]);
-            if (validatorId == 0) {
-                revert StakingLookupFailed();
-            }
-            registeredValidatorIds[i] = validatorId;
-        }
-
-        bytes memory registrationOrder = new bytes(registered.length);
-        uint256 selectedRegistrations;
+    /// @dev Derive `PartyId -> address` by stable-filtering registrations through
+    /// the target epoch's canonical staking order. The staking window is checked
+    /// on every use, so no historical party-set cache is required.
+    function _partySet(uint64 epoch) private returns (address[] memory parties) {
+        ValidatorSetKind kind = _validatorSetKind(epoch);
+        parties = new address[](registrationCountByEpoch[epoch]);
         uint256 count;
-        for (uint256 i = 0; i < validatorIds.length; i++) {
-            uint64 validatorId = validatorIds[i];
-            if (validatorId == 0) {
+        uint32 startIndex;
+        while (true) {
+            (bool done, uint32 nextIndex, uint64[] memory validatorIds) = _readValidatorPage(kind, startIndex);
+            if (!done && nextIndex <= startIndex) {
                 revert StakingLookupFailed();
             }
-            for (uint256 j = 0; j < registered.length; j++) {
-                if (registeredValidatorIds[j] != validatorId) {
-                    continue;
-                }
-                uint256 registrationBit = uint256(1) << j;
-                if ((selectedRegistrations & registrationBit) != 0) {
+            for (uint256 i = 0; i < validatorIds.length; i++) {
+                uint64 validatorId = validatorIds[i];
+                if (validatorId == 0) {
                     revert StakingLookupFailed();
                 }
-                selectedRegistrations |= registrationBit;
-                registrationOrder[count] = bytes1(uint8(j));
-                parties[count++] = registered[j];
+                address party = registeredPartyByValidatorId[epoch][validatorId];
+                if (party == address(0)) {
+                    continue;
+                }
+                if (count == parties.length) {
+                    revert StakingLookupFailed();
+                }
+                parties[count++] = party;
+            }
+            if (done) {
                 break;
             }
+            startIndex = nextIndex;
         }
-        if (count == 0 || count > MAX_PARTIES) {
+        if (count == 0) {
             revert PartySetUnavailable(epoch);
         }
-
         assembly ("memory-safe") {
             mstore(parties, count)
-            mstore(registrationOrder, count)
-        }
-        frozenRegistrationOrderByEpoch[epoch] = registrationOrder;
-        emit PartySetFrozen(epoch, count, keccak256(abi.encode(parties)));
-    }
-
-    function _partySetView(uint64 epoch) private view returns (address[] memory parties) {
-        bytes storage registrationOrder = frozenRegistrationOrderByEpoch[epoch];
-        address[] storage registered = registeredPartiesByEpoch[epoch];
-        parties = new address[](registrationOrder.length);
-        for (uint256 i = 0; i < registrationOrder.length; i++) {
-            parties[i] = registered[uint8(registrationOrder[i])];
         }
     }
 
@@ -443,28 +382,6 @@ contract DkgContract {
             return (currentEpoch, inEpochDelayPeriod);
         } catch {
             revert StakingLookupFailed();
-        }
-    }
-
-    function _readValidatorSet(ValidatorSetKind kind) private returns (uint64[] memory validatorIds) {
-        validatorIds = new uint64[](MAX_PARTIES);
-        uint256 count;
-        uint32 startIndex;
-        while (true) {
-            (bool done, uint32 nextIndex, uint64[] memory page) = _readValidatorPage(kind, startIndex);
-            if (count + page.length > MAX_PARTIES || (!done && nextIndex <= startIndex)) {
-                revert StakingLookupFailed();
-            }
-            for (uint256 i = 0; i < page.length; i++) {
-                validatorIds[count++] = page[i];
-            }
-            if (done) {
-                break;
-            }
-            startIndex = nextIndex;
-        }
-        assembly ("memory-safe") {
-            mstore(validatorIds, count)
         }
     }
 
@@ -499,9 +416,7 @@ contract DkgContract {
     }
 
     function _validateDkgResult(uint64 epoch, DkgResult calldata result, address[] memory parties) private {
-        uint256 partyCount = parties.length;
-        uint256 count = result.signatures.length;
-        if (count == 0 || count > partyCount) {
+        if (!_signaturesAreCanonical(result.signatures, parties.length)) {
             revert InvalidDkgResult();
         }
 
@@ -529,17 +444,8 @@ contract DkgContract {
         uint256[] memory votingWeights,
         bytes32 digest
     ) private view returns (uint256 signedVotingWeight) {
-        uint256 seenSigners;
         for (uint256 i = 0; i < signatures.length; i++) {
             QcSignature calldata signature = signatures[i];
-            if (signature.signer >= parties.length) {
-                revert InvalidDkgResult();
-            }
-            uint256 signerBit = uint256(1) << signature.signer;
-            if ((seenSigners & signerBit) != 0) {
-                revert InvalidDkgResult();
-            }
-            seenSigners |= signerBit;
             if (!_signatureMatches(
                     registrations[epoch][parties[signature.signer]].qcVerifier, digest, signature.r, signature.s
                 )) {
@@ -672,7 +578,7 @@ contract DkgContract {
         }
         address receiverVerifier = _secpAddress(registration.receiverPublicKey);
         bytes32 digest = _receiverKeyProofDigest(epoch, party, registration);
-        // The proof is checked before storage so the contract and engine freeze
+        // The proof is checked before storage so the contract and engine derive
         // the same eligible set even when a validator submits malformed keys.
         if (!_signatureMatches(receiverVerifier, digest, registration.receiverProofR, registration.receiverProofS)) {
             revert InvalidReceiverProof();
@@ -698,29 +604,29 @@ contract DkgContract {
     }
 
     function _validateQc(uint32 dealer, QcSignature[] calldata signatures, uint256 partyCount) private pure {
-        if (dealer >= partyCount) {
+        if (dealer >= partyCount || !_signaturesAreCanonical(signatures, partyCount)) {
             revert MalformedQc();
         }
-        _validateSignatures(signatures, partyCount);
     }
 
-    function _validateSignatures(QcSignature[] calldata signatures, uint256 partyCount) private pure {
+    function _signaturesAreCanonical(QcSignature[] calldata signatures, uint256 partyCount)
+        private
+        pure
+        returns (bool)
+    {
         uint256 count = signatures.length;
         if (count == 0 || count > partyCount) {
-            revert MalformedQc();
+            return false;
         }
-        uint256 seenSigners;
+        uint32 previous;
         for (uint256 i = 0; i < count; i++) {
             uint32 signer = signatures[i].signer;
-            if (signer >= partyCount) {
-                revert MalformedQc();
+            if (signer >= partyCount || (i != 0 && signer <= previous)) {
+                return false;
             }
-            uint256 signerBit = uint256(1) << signer;
-            if ((seenSigners & signerBit) != 0) {
-                revert MalformedQc();
-            }
-            seenSigners |= signerBit;
+            previous = signer;
         }
+        return true;
     }
 
     function _copySignatures(QcSignature[] storage target, QcSignature[] calldata source) private {
@@ -745,12 +651,12 @@ contract DkgContract {
         return bytes4(reversed);
     }
 
-    function _partyId(address[] memory parties, address party) private pure returns (bool exists, uint32 partyId) {
-        for (uint32 i = 0; i < parties.length; i++) {
+    function _contains(address[] memory parties, address party) private pure returns (bool) {
+        for (uint256 i = 0; i < parties.length; i++) {
             if (parties[i] == party) {
-                return (true, i);
+                return true;
             }
         }
-        return (false, 0);
+        return false;
     }
 }

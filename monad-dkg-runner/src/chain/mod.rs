@@ -47,8 +47,8 @@ pub enum ContractCodecError {
     SignatureCount { count: usize, maximum: usize },
     #[error("typed DKG QC signer {signer} is outside the {party_count}-party session")]
     SignerOutOfRange { signer: u32, party_count: usize },
-    #[error("typed DKG QC contains duplicate signer {signer}")]
-    DuplicateSigner { signer: u32 },
+    #[error("typed DKG QC signer {signer} is not in canonical order")]
+    NonCanonicalSigner { signer: u32 },
 }
 
 impl TryFrom<(&RegistrationCall, Address)> for ContractRegistration {
@@ -278,7 +278,7 @@ impl ContractQcSignature {
             });
         }
 
-        let mut seen = vec![false; party_count];
+        let mut previous = None;
         signatures
             .into_iter()
             .map(|signature| {
@@ -294,10 +294,10 @@ impl ContractQcSignature {
                         party_count,
                     });
                 }
-                if seen[signer_index] {
-                    return Err(ContractCodecError::DuplicateSigner { signer });
+                if previous.is_some_and(|previous| signer <= previous) {
+                    return Err(ContractCodecError::NonCanonicalSigner { signer });
                 }
-                seen[signer_index] = true;
+                previous = Some(signer);
                 let mut bytes = [0_u8; 64];
                 bytes[..32].copy_from_slice(signature.r.as_slice());
                 bytes[32..].copy_from_slice(signature.s.as_slice());
@@ -543,25 +543,37 @@ mod bindings_tests {
     }
 
     #[test]
-    fn qc_boundary_accepts_any_unique_signer_order() {
+    fn qc_boundary_requires_canonical_signer_order() {
         let signature = |signer| ContractQcSignature {
             signer,
-            r: B256::repeat_byte(signer as u8 + 1),
-            s: B256::repeat_byte(signer as u8 + 2),
+            r: B256::repeat_byte((signer as u8).wrapping_add(1)),
+            s: B256::repeat_byte((signer as u8).wrapping_add(2)),
         };
 
-        let decoded = ContractQcSignature::decode_all(vec![signature(2), signature(0)], 4).unwrap();
+        let decoded = ContractQcSignature::decode_all(vec![signature(0), signature(2)], 4).unwrap();
         assert_eq!(
             decoded
                 .iter()
                 .map(|signature| signature.signer)
                 .collect::<Vec<_>>(),
-            vec![PartyId(2), PartyId(0)]
+            vec![PartyId(0), PartyId(2)]
         );
         assert!(matches!(
-            ContractQcSignature::decode_all(vec![signature(2), signature(2)], 4),
-            Err(ContractCodecError::DuplicateSigner { signer: 2 })
+            ContractQcSignature::decode_all(vec![signature(2), signature(0)], 4),
+            Err(ContractCodecError::NonCanonicalSigner { signer: 0 })
         ));
+        assert!(matches!(
+            ContractQcSignature::decode_all(vec![signature(2), signature(2)], 4),
+            Err(ContractCodecError::NonCanonicalSigner { signer: 2 })
+        ));
+
+        let signatures = (0..257).map(signature).collect();
+        assert_eq!(
+            ContractQcSignature::decode_all(signatures, 257)
+                .unwrap()
+                .len(),
+            257
+        );
     }
 }
 
