@@ -20,13 +20,19 @@ use crate::DkgError;
 
 type TxKey = (Epoch, ChainTxId);
 
+struct ProtocolSubmissionState {
+    context_block: Option<SeqNum>,
+    recovered: bool,
+}
+
 pub(crate) struct TxSubmitter {
     submission: TxSubmission,
     pending: BTreeMap<TxKey, ChainCall>,
     prepared: Option<(TxKey, PreparedTx)>,
     finalized: BTreeSet<TxKey>,
-    active_epochs: BTreeSet<Epoch>,
-    recovered_epochs: BTreeSet<Epoch>,
+    // The previous protocol may still be finishing while the current one runs.
+    protocols: [Option<(Epoch, ProtocolSubmissionState)>; 2],
+    registration_context: Option<(Epoch, SeqNum)>,
 }
 
 impl TxSubmitter {
@@ -46,15 +52,14 @@ impl TxSubmitter {
             },
             signer,
             chain,
-            context_blocks: BTreeMap::new(),
         };
         Ok(Self {
             submission,
             pending: BTreeMap::new(),
             prepared: None,
             finalized: BTreeSet::new(),
-            active_epochs: BTreeSet::new(),
-            recovered_epochs: BTreeSet::new(),
+            protocols: [None, None],
+            registration_context: None,
         })
     }
 
@@ -68,9 +73,8 @@ impl TxSubmitter {
         block: SeqNum,
         registration: RegistrationCall,
     ) {
-        let submission = &mut self.submission;
-        submission.context_blocks.insert(epoch, block);
-        let contract = submission.config.contract;
+        self.registration_context = Some((epoch, block));
+        let contract = self.submission.config.contract;
         self.submit(
             epoch,
             ChainCall::PostRegistration {
@@ -81,42 +85,57 @@ impl TxSubmitter {
     }
 
     pub(crate) fn start_session(&mut self, epoch: Epoch) {
-        if self.active_epochs.contains(&epoch)
+        if self.protocol(epoch).is_some()
             || self
-                .active_epochs
+                .protocols
                 .last()
-                .is_some_and(|latest| *latest > epoch)
+                .and_then(Option::as_ref)
+                .map(|(epoch, _)| *epoch)
+                .is_some_and(|latest| latest > epoch)
         {
             return;
         }
-        self.active_epochs.insert(epoch);
-        while self.active_epochs.len() > crate::MAX_RETAINED_DKG_SESSIONS {
-            self.active_epochs.pop_first();
-        }
-        let latest = *self
-            .active_epochs
-            .last()
-            .expect("started DKG transaction epoch");
+        let context_block = self
+            .registration_context
+            .take_if(|(registration_epoch, _)| *registration_epoch == epoch)
+            .map(|(_, block)| block);
+        self.protocols.rotate_left(1);
+        self.protocols[1] = Some((
+            epoch,
+            ProtocolSubmissionState {
+                context_block,
+                recovered: false,
+            },
+        ));
+        let latest = epoch;
+        let protocols = &self.protocols;
         self.pending.retain(|(pending_epoch, id), _| {
-            self.active_epochs.contains(pending_epoch)
+            protocols
+                .iter()
+                .flatten()
+                .any(|(epoch, _)| epoch == pending_epoch)
                 || (*pending_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
         });
         self.finalized.retain(|(pending_epoch, id)| {
-            self.active_epochs.contains(pending_epoch)
+            protocols
+                .iter()
+                .flatten()
+                .any(|(epoch, _)| epoch == pending_epoch)
                 || (*pending_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
         });
         self.clear_orphaned_prepared();
-        self.recovered_epochs
-            .retain(|recovered| self.active_epochs.contains(recovered));
-        self.submission
-            .context_blocks
-            .retain(|epoch, _| self.active_epochs.contains(epoch) || *epoch > latest);
+        if self
+            .registration_context
+            .is_some_and(|(registration_epoch, _)| registration_epoch <= latest)
+        {
+            self.registration_context = None;
+        }
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
         let key = (epoch, ChainTxId::from(&call));
         let immediate = matches!(&call, ChainCall::PostRegistration { .. });
-        if !immediate && !self.active_epochs.contains(&epoch) {
+        if !immediate && self.protocol(epoch).is_none() {
             return;
         }
 
@@ -124,13 +143,17 @@ impl TxSubmitter {
             return;
         }
         self.pending.insert(key.clone(), call);
-        if immediate || self.recovered_epochs.contains(&epoch) {
+        if immediate
+            || self
+                .protocol(epoch)
+                .is_some_and(|protocol| protocol.recovered)
+        {
             self.submit_keys([key]);
         }
     }
 
     pub(crate) fn retry_registration(&mut self, epoch: Epoch, block: SeqNum) {
-        self.submission.context_blocks.insert(epoch, block);
+        self.registration_context = Some((epoch, block));
         let keys = self
             .pending
             .keys()
@@ -161,18 +184,21 @@ impl TxSubmitter {
         events: Vec<ChainEvent>,
         recovery_complete_after: bool,
     ) {
-        if !self.active_epochs.contains(&epoch) {
+        let Some(protocol) = self.protocol_mut(epoch) else {
             return;
+        };
+        protocol.context_block = Some(block);
+        if recovery_complete_after {
+            protocol.recovered = true;
         }
-        self.submission.context_blocks.insert(epoch, block);
         for event in events {
             let id = ChainTxId::from(&event);
             self.confirm((epoch, id));
         }
-        if recovery_complete_after {
-            self.recovered_epochs.insert(epoch);
-        }
-        if self.recovered_epochs.contains(&epoch) {
+        if self
+            .protocol(epoch)
+            .is_some_and(|protocol| protocol.recovered)
+        {
             let keys = self
                 .pending
                 .keys()
@@ -198,7 +224,25 @@ impl TxSubmitter {
                 .pending
                 .get(&key)
                 .expect("selected DKG submission remains pending");
-            match self.submission.refresh(&key, call, &mut self.prepared) {
+            // Keep an active retry on its protocol boundary. New work uses the
+            // newest boundary so overlapping protocols observe consumed nonces.
+            let context_block = if self.prepared.is_some() {
+                self.context_block(key.0)
+            } else {
+                self.latest_context_block()
+            };
+            let Some(context_block) = context_block else {
+                warn!(
+                    epoch = key.0 .0,
+                    call_kind = chain_call_kind(call),
+                    "missing DKG transaction context block; will retry"
+                );
+                return;
+            };
+            match self
+                .submission
+                .refresh(context_block, &key, call, &mut self.prepared)
+            {
                 Ok(TxRefresh::Ready) => {
                     debug_assert!(self.prepared.is_some());
                 }
@@ -221,10 +265,6 @@ impl TxSubmitter {
                 Err(error) => {
                     let call_kind = chain_call_kind(call);
                     match error {
-                        TxSubmissionError::MissingContext => warn!(
-                            epoch = key.0 .0,
-                            call_kind, "missing DKG transaction context block; will retry"
-                        ),
                         TxSubmissionError::ChainContext { block, source } => warn!(
                             ?source,
                             block = block.0,
@@ -282,6 +322,41 @@ impl TxSubmitter {
         }
     }
 
+    fn context_block(&self, epoch: Epoch) -> Option<SeqNum> {
+        self.protocol(epoch)
+            .and_then(|protocol| protocol.context_block)
+            .or_else(|| {
+                self.registration_context
+                    .filter(|(registration_epoch, _)| *registration_epoch == epoch)
+                    .map(|(_, block)| block)
+            })
+    }
+
+    fn latest_context_block(&self) -> Option<SeqNum> {
+        self.protocols
+            .iter()
+            .flatten()
+            .filter_map(|(_, protocol)| protocol.context_block)
+            .chain(self.registration_context.map(|(_, block)| block))
+            .max()
+    }
+
+    fn protocol(&self, epoch: Epoch) -> Option<&ProtocolSubmissionState> {
+        self.protocols
+            .iter()
+            .flatten()
+            .find(|(protocol_epoch, _)| *protocol_epoch == epoch)
+            .map(|(_, protocol)| protocol)
+    }
+
+    fn protocol_mut(&mut self, epoch: Epoch) -> Option<&mut ProtocolSubmissionState> {
+        self.protocols
+            .iter_mut()
+            .flatten()
+            .find(|(protocol_epoch, _)| *protocol_epoch == epoch)
+            .map(|(_, protocol)| protocol)
+    }
+
     fn confirm(&mut self, key: TxKey) {
         self.finalized.insert(key.clone());
         self.pending.remove(&key);
@@ -309,7 +384,6 @@ struct TxSubmission {
     config: TxConfig,
     signer: PrivateKeySigner,
     chain: Arc<dyn DkgChain>,
-    context_blocks: BTreeMap<Epoch, SeqNum>,
 }
 
 struct PreparedTx {
@@ -324,7 +398,6 @@ enum TxRefresh {
 
 #[derive(Debug)]
 enum TxSubmissionError {
-    MissingContext,
     ChainContext { block: SeqNum, source: DkgError },
     Operation(DkgError),
 }
@@ -332,18 +405,11 @@ enum TxSubmissionError {
 impl TxSubmission {
     fn refresh(
         &self,
+        block: SeqNum,
         key: &TxKey,
         call: &ChainCall,
         prepared: &mut Option<(TxKey, PreparedTx)>,
     ) -> Result<TxRefresh, TxSubmissionError> {
-        // An active retry stays at its epoch's event-scan boundary. New work
-        // uses the newest boundary so overlapping sessions observe consumed nonces.
-        let block = if prepared.is_some() {
-            self.context_blocks.get(&key.0).copied()
-        } else {
-            self.context_blocks.values().copied().max()
-        }
-        .ok_or(TxSubmissionError::MissingContext)?;
         let context = self
             .chain
             .transaction_context(block, self.signer.address())

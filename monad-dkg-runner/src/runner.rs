@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, mem, path::PathBuf, sync::Arc, time::Instant};
+use std::{mem, path::PathBuf, sync::Arc, time::Instant};
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
@@ -194,7 +194,8 @@ where
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
     storage_root: PathBuf,
     pending_outbound: Vec<DeliveryOutbound<ST>>,
-    sessions: BTreeMap<Epoch, DkgSession<ST>>,
+    // The previous protocol may still be finishing while the current one runs.
+    sessions: [Option<(Epoch, DkgSession<ST>)>; 2],
     latest_started_epoch: Option<Epoch>,
     pending_registered_session: Option<(Epoch, PendingRegisteredSession<ST>)>,
     chain_session: Option<(Epoch, usize)>,
@@ -219,7 +220,7 @@ where
             self_id,
             storage_root,
             pending_outbound: Vec::new(),
-            sessions: BTreeMap::new(),
+            sessions: [None, None],
             latest_started_epoch: None,
             pending_registered_session: None,
             chain_session: None,
@@ -588,9 +589,9 @@ where
             return Ok(());
         };
         self.latest_started_epoch = Some(epoch);
-        self.sessions.insert(epoch, session);
+        self.sessions.rotate_left(1);
+        self.sessions[1] = Some((epoch, session));
         self.start_chain_session(epoch, party_count, recovery_block);
-        self.retire_old_sessions();
         Ok(())
     }
 
@@ -613,13 +614,13 @@ where
     }
 
     pub fn handle_timer(&mut self, now: Instant) {
-        let epochs = self.sessions.keys().copied().collect::<Vec<_>>();
-        for epoch in epochs {
-            if self.sessions[&epoch]
-                .next_timer()
-                .is_some_and(|deadline| deadline <= now)
-            {
-                if let Err(err) = self.sessions.get_mut(&epoch).unwrap().handle_timer(now) {
+        for index in 0..self.sessions.len() {
+            let Some((epoch, session)) = &mut self.sessions[index] else {
+                continue;
+            };
+            let epoch = *epoch;
+            if session.next_timer().is_some_and(|deadline| deadline <= now) {
+                if let Err(err) = session.handle_timer(now) {
                     error!(?err, "failed to process DKG retry timer");
                 }
                 self.collect_session_effects(epoch);
@@ -640,7 +641,12 @@ where
             }
         };
         let epoch = Epoch(wire.epoch);
-        let Some(session) = self.sessions.get_mut(&epoch) else {
+        let Some((_, session)) = self
+            .sessions
+            .iter_mut()
+            .flatten()
+            .find(|(session_epoch, _)| *session_epoch == epoch)
+        else {
             return;
         };
         if let Err(err) = session.handle_network_message(sender, wire.payload) {
@@ -651,8 +657,9 @@ where
 
     pub fn next_timer(&self) -> Option<Instant> {
         self.sessions
-            .values()
-            .filter_map(DkgSession::next_timer)
+            .iter()
+            .flatten()
+            .filter_map(|(_, session)| session.next_timer())
             .min()
     }
 
@@ -667,7 +674,12 @@ where
     }
 
     fn take_session_effects(&mut self, epoch: Epoch) -> Vec<dkg_protocol::ChainCall> {
-        let Some(session) = self.sessions.get_mut(&epoch) else {
+        let Some((_, session)) = self
+            .sessions
+            .iter_mut()
+            .flatten()
+            .find(|(session_epoch, _)| *session_epoch == epoch)
+        else {
             return Vec::new();
         };
         self.pending_outbound
@@ -720,7 +732,10 @@ where
         let epoch = batch.session.epoch;
         let session = self
             .sessions
-            .get_mut(&epoch)
+            .iter_mut()
+            .flatten()
+            .find(|(session_epoch, _)| *session_epoch == epoch)
+            .map(|(_, session)| session)
             .ok_or(DkgError::NoActiveSession { epoch: epoch.0 })?;
         for event in batch.events.iter().cloned() {
             session
@@ -743,12 +758,6 @@ where
         );
         self.submit_chain_calls(epoch, calls);
         Ok(())
-    }
-
-    fn retire_old_sessions(&mut self) {
-        while self.sessions.len() > crate::MAX_RETAINED_DKG_SESSIONS {
-            self.sessions.pop_first().expect("excess DKG session");
-        }
     }
 }
 
@@ -947,11 +956,15 @@ mod tests {
         runner
             .start_chain_registered_session(Epoch(2), validators)
             .unwrap();
-        assert!(runner.sessions.is_empty());
+        assert!(runner.sessions[1].is_none());
         runner.notify_sync_complete(SeqNum(90));
 
         assert_eq!(runner.latest_started_epoch, Some(Epoch(2)));
-        assert!(runner.sessions.contains_key(&Epoch(2)));
+        assert!(runner
+            .sessions
+            .iter()
+            .flatten()
+            .any(|(epoch, _)| *epoch == Epoch(2)));
     }
 
     #[test]

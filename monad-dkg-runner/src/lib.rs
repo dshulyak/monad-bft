@@ -25,7 +25,6 @@ mod runner;
 mod session;
 mod wal;
 
-const MAX_RETAINED_DKG_SESSIONS: usize = 2;
 const RECEIVER_KEY_DERIVATION: &str = "monad/dkg/receiver-key";
 const QC_KEY_DERIVATION: &str = "monad/dkg/qc-signing-key";
 

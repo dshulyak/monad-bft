@@ -1,7 +1,5 @@
 //! Finalized contract reads, event delivery, and transaction submission.
 
-use std::collections::BTreeMap;
-
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::sol;
@@ -425,7 +423,8 @@ impl ChainRead {
 #[derive(Default)]
 pub(crate) struct ChainEventReader {
     finalized: Option<SeqNum>,
-    scans: BTreeMap<Epoch, SessionScan>,
+    // The previous protocol may still be finishing while the current one runs.
+    scans: [Option<(Epoch, SessionScan)>; 2],
 }
 
 impl ChainEventReader {
@@ -434,11 +433,19 @@ impl ChainEventReader {
     }
 
     pub(crate) fn start_session(&mut self, session: ChainEventSession) {
-        self.scans
-            .insert(session.epoch, SessionScan::new(session, self.finalized));
-        while self.scans.len() > crate::MAX_RETAINED_DKG_SESSIONS {
-            let (epoch, _) = self.scans.pop_first().expect("excess scan");
-            info!(epoch = epoch.0, "retired old DKG chain cursor");
+        if let Some((_, scan)) = self
+            .scans
+            .iter_mut()
+            .flatten()
+            .find(|(epoch, _)| *epoch == session.epoch)
+        {
+            *scan = SessionScan::new(session, self.finalized);
+        } else {
+            if let Some((epoch, _)) = &self.scans[0] {
+                info!(epoch = epoch.0, "retired old DKG chain cursor");
+            }
+            self.scans.rotate_left(1);
+            self.scans[1] = Some((session.epoch, SessionScan::new(session, self.finalized)));
         }
         info!(
             epoch = session.epoch.0,
@@ -449,7 +456,7 @@ impl ChainEventReader {
     }
 
     pub(crate) fn next_read(&self) -> Option<ChainRead> {
-        self.scans.values().find_map(|scan| {
+        self.scans.iter().flatten().find_map(|(_, scan)| {
             let latest = self
                 .finalized
                 .unwrap_or(scan.recovery_block())
@@ -462,7 +469,10 @@ impl ChainEventReader {
         let session = read.session();
         let scan = self
             .scans
-            .get_mut(&session.epoch)
+            .iter_mut()
+            .flatten()
+            .find(|(epoch, _)| *epoch == session.epoch)
+            .map(|(_, scan)| scan)
             .expect("blocking DKG read keeps its cursor alive");
         let recovery_complete_after = scan.advance(read);
         if recovery_complete_after {
