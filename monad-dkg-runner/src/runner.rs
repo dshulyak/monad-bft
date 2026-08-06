@@ -10,11 +10,11 @@ use monad_types::{Epoch, NodeId, SeqNum};
 use tracing::{debug, error, warn};
 
 use crate::{
-    DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
     chain::{ChainEventBatch, ChainEventReader, ChainEventSession, DkgChain, TxSubmitter},
     registration::{assemble_registered_session, load_or_create_local_registration},
     reliable::ScheduledSend,
-    session::{DkgSession, start},
+    session::{start, DkgSession},
+    DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
 };
 
 pub struct DeliveryOutbound<ST: CertificateSignatureRecoverable> {
@@ -565,7 +565,7 @@ where
     fn start_session_at(
         &mut self,
         epoch: Epoch,
-        validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+        validators: Vec<DkgValidator<ST>>,
         key_material: crate::DkgRegisteredKeyMaterial,
         recovery_block: Option<SeqNum>,
     ) -> Result<(), DkgError> {
@@ -764,7 +764,7 @@ mod tests {
     use std::{sync::Mutex, time::Duration};
 
     use alloy_primitives::Address;
-    use monad_crypto::{NopKeyPair, NopSignature, certificate_signature::CertificateKeyPair};
+    use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSignature};
 
     use super::*;
 
@@ -815,6 +815,9 @@ mod tests {
             .map(|(index, node_id)| DkgValidator::<NopSignature> {
                 node_id: *node_id,
                 address: [index as u8 + 1; 20],
+                stake: monad_types::Stake(alloy_primitives::U256::from(
+                    crate::session::WEI_PER_MON,
+                )),
             })
             .collect();
 
@@ -852,6 +855,9 @@ mod tests {
             vec![DkgValidator::<NopSignature> {
                 node_id: nodes[0],
                 address: [1; 20],
+                stake: monad_types::Stake(alloy_primitives::U256::from(
+                    crate::session::WEI_PER_MON,
+                )),
             }]
         };
 
@@ -931,6 +937,9 @@ mod tests {
             .map(|(node_id, address)| DkgValidator::<NopSignature> {
                 node_id: *node_id,
                 address,
+                stake: monad_types::Stake(alloy_primitives::U256::from(
+                    crate::session::WEI_PER_MON,
+                )),
             })
             .collect();
 

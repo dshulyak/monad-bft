@@ -6,16 +6,16 @@ use std::{
 };
 
 use dkg_core::{Record, RecordId};
-use dkg_protocol::{ChainCall, ChainEvent, DkgEnginePhase, chain::adapter};
+use dkg_protocol::{chain::adapter, ChainCall, ChainEvent, DkgEnginePhase};
 use monad_crypto::{
-    NopKeyPair, NopSignature,
     certificate_signature::{CertificateKeyPair, CertificateSignaturePubKey},
+    NopKeyPair, NopSignature,
 };
 use monad_types::{Epoch, NodeId};
 use proptest::prelude::*;
 
 use super::*;
-use crate::{DeliveryOutbound, test_registered_key_material};
+use crate::{test_registered_key_material, DeliveryOutbound};
 
 const NODE_COUNT: usize = 4;
 const TEST_EPOCH: Epoch = Epoch(12);
@@ -55,11 +55,11 @@ struct ModelNode {
     stopped_steps: u8,
 }
 
-#[derive(Default)]
 struct ContractModel {
     events: Vec<ChainEvent>,
     records: BTreeSet<(Vec<u8>, Vec<u8>)>,
     result_epochs: BTreeSet<u64>,
+    party_count: usize,
 }
 
 impl ContractModel {
@@ -81,7 +81,7 @@ impl ContractModel {
             key,
             bytes,
         };
-        let event = adapter::decode_record(&record, NODE_COUNT)
+        let event = adapter::decode_record(&record, self.party_count)
             .expect("session emitted a decodable contract record");
         self.events.push(event.clone());
         Some(event)
@@ -94,8 +94,9 @@ impl ContractModel {
     }
 }
 
-struct FourNodeRecoveryModel {
+struct RecoveryModel {
     validators: Vec<NodeId<CertificateSignaturePubKey<NopSignature>>>,
+    voting_weights: Vec<NativeVotingWeight>,
     nodes: Vec<ModelNode>,
     network: VecDeque<NetworkMessage>,
     chain_messages: VecDeque<ChainMessage>,
@@ -104,9 +105,22 @@ struct FourNodeRecoveryModel {
     steps: usize,
 }
 
-impl FourNodeRecoveryModel {
+impl RecoveryModel {
     fn new(root: &Path) -> Self {
-        let mut validators = test_validators(NODE_COUNT as u8);
+        Self::new_with_count(root, NODE_COUNT)
+    }
+
+    fn new_with_count(root: &Path, node_count: usize) -> Self {
+        Self::new_with_weights(root, vec![1; node_count])
+    }
+
+    fn new_with_weights(root: &Path, voting_weights: Vec<u64>) -> Self {
+        let voting_weights = voting_weights
+            .into_iter()
+            .map(NativeVotingWeight::new)
+            .collect::<Vec<_>>();
+        let node_count = voting_weights.len();
+        let mut validators = test_validators(node_count as u8);
         validators.sort();
         let mut nodes = validators
             .iter()
@@ -119,7 +133,12 @@ impl FourNodeRecoveryModel {
             })
             .collect::<Vec<_>>();
         for node in &mut nodes {
-            node.runtime = Some(start_runtime(node.id, &validators, &node.storage_root));
+            node.runtime = Some(start_runtime(
+                node.id,
+                &validators,
+                &voting_weights,
+                &node.storage_root,
+            ));
         }
         let chain_messages = (0..nodes.len())
             .map(|target| ChainMessage {
@@ -129,10 +148,16 @@ impl FourNodeRecoveryModel {
             .collect();
         Self {
             validators,
+            voting_weights,
             nodes,
             network: VecDeque::new(),
             chain_messages,
-            chain: ContractModel::default(),
+            chain: ContractModel {
+                events: Vec::new(),
+                records: BTreeSet::new(),
+                result_epochs: BTreeSet::new(),
+                party_count: node_count,
+            },
             now: Instant::now(),
             steps: 0,
         }
@@ -247,7 +272,12 @@ impl FourNodeRecoveryModel {
 
     fn restart(&mut self, target: usize) {
         let node = &mut self.nodes[target];
-        node.runtime = Some(start_runtime(node.id, &self.validators, &node.storage_root));
+        node.runtime = Some(start_runtime(
+            node.id,
+            &self.validators,
+            &self.voting_weights,
+            &node.storage_root,
+        ));
         self.chain_messages
             .extend(self.chain.events.iter().cloned().map(|event| ChainMessage {
                 target,
@@ -279,7 +309,7 @@ impl FourNodeRecoveryModel {
             })
             .collect::<Vec<_>>();
         panic!(
-            "four-node DKG did not recover: steps={} phases={phases:?} stopped={:?} chain_events={:?} network_queue={} chain_queue={}",
+            "DKG did not recover: steps={} phases={phases:?} stopped={:?} chain_events={:?} network_queue={} chain_queue={}",
             self.steps,
             self.nodes
                 .iter()
@@ -314,6 +344,26 @@ impl FourNodeRecoveryModel {
             .position(|candidate| *candidate == id)
             .expect("DKG command targets a validator")
     }
+}
+
+#[test]
+fn one_to_three_nodes_complete_without_byzantine_tolerance() {
+    for node_count in 1..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        RecoveryModel::new_with_count(directory.path(), node_count).run_to_completion();
+    }
+}
+
+#[test]
+fn asymmetric_voting_weight_uses_independent_quantized_domains() {
+    let directory = tempfile::tempdir().unwrap();
+    RecoveryModel::new_with_weights(directory.path(), vec![4, 3, 2, 1]).run_to_completion();
+}
+
+#[test]
+fn seven_equal_stake_nodes_complete_with_quantized_dealers() {
+    let directory = tempfile::tempdir().unwrap();
+    RecoveryModel::new_with_count(directory.path(), 7).run_to_completion();
 }
 
 fn recovery_step() -> impl Strategy<Value = ModelStep> {
@@ -351,7 +401,7 @@ proptest! {
     #[test]
     fn four_nodes_finish_after_random_memory_loss(schedule in recovery_schedule()) {
         let directory = tempfile::tempdir().unwrap();
-        let mut model = FourNodeRecoveryModel::new(directory.path());
+        let mut model = RecoveryModel::new(directory.path());
         for step in &schedule {
             model.apply(step);
         }
@@ -362,7 +412,7 @@ proptest! {
 #[test]
 fn four_nodes_recover_when_one_starts_late() {
     let directory = tempfile::tempdir().unwrap();
-    let mut model = FourNodeRecoveryModel::new(directory.path());
+    let mut model = RecoveryModel::new(directory.path());
     model.nodes[0].runtime = None;
     fs::remove_dir_all(&model.nodes[0].storage_root).unwrap();
     model.nodes[0].stopped_steps = 5;
@@ -372,7 +422,7 @@ fn four_nodes_recover_when_one_starts_late() {
 #[test]
 fn fourth_node_recovers_after_other_nodes_finish() {
     let directory = tempfile::tempdir().unwrap();
-    let mut model = FourNodeRecoveryModel::new(directory.path());
+    let mut model = RecoveryModel::new(directory.path());
     model.nodes[0].runtime = None;
     fs::remove_dir_all(&model.nodes[0].storage_root).unwrap();
 
@@ -400,7 +450,7 @@ fn fourth_node_recovers_after_other_nodes_finish() {
 #[test]
 fn four_nodes_recover_after_late_memory_loss() {
     let directory = tempfile::tempdir().unwrap();
-    let mut model = FourNodeRecoveryModel::new(directory.path());
+    let mut model = RecoveryModel::new(directory.path());
     for _ in 0..27 {
         model.exchange_step();
     }
@@ -411,6 +461,7 @@ fn four_nodes_recover_after_late_memory_loss() {
 fn start_runtime(
     self_id: NodeId<CertificateSignaturePubKey<NopSignature>>,
     validators: &[NodeId<CertificateSignaturePubKey<NopSignature>>],
+    voting_weights: &[NativeVotingWeight],
     storage_root: &Path,
 ) -> NodeRuntime {
     let mapping = DkgPeerMap::<NopSignature>::new_ordered(validators.to_vec()).unwrap();
@@ -431,6 +482,7 @@ fn start_runtime(
         epoch: TEST_EPOCH,
         self_party,
         mapping,
+        voting_weights: voting_weights.to_vec(),
         engine_seed,
         key_material: test_registered_key_material(self_party, validators.len(), TEST_EPOCH),
         recovery_wal,

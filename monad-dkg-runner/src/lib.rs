@@ -6,15 +6,13 @@ use dkg_core::PartyId;
 use dkg_crypto::{
     K256SecpBackend, NonIdentitySecpPoint, NonZeroSecpScalar, SecpBackend, SecpScalarBytes,
 };
-use dkg_protocol::{
-    PartyRegistration, QcSigningKey, QcVerifier, RegistrationCall, SecretKeys,
-};
+use dkg_protocol::{PartyRegistration, QcSigningKey, QcVerifier, RegistrationCall, SecretKeys};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 #[cfg(test)]
 use monad_types::Epoch;
-use monad_types::{NodeId, SeqNum};
+use monad_types::{NodeId, SeqNum, Stake};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -49,8 +47,6 @@ pub enum DkgError {
     Unsupported(&'static str),
     #[error("DKG channel closed while {0}")]
     ChannelClosed(&'static str),
-    #[error("DKG requires at least {minimum} validators, received {actual}")]
-    InsufficientValidators { actual: usize, minimum: usize },
     #[error("registration contract {actual} does not match configured DKG contract {expected}")]
     RegistrationContractMismatch { expected: Address, actual: Address },
     #[error("DKG result epoch {actual} does not match submission epoch {expected}")]
@@ -164,6 +160,7 @@ where
 {
     pub node_id: NodeId<CertificateSignaturePubKey<ST>>,
     pub address: [u8; 20],
+    pub stake: Stake,
 }
 
 pub(crate) struct DkgRegisteredKeyMaterial {

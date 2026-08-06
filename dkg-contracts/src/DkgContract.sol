@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 interface IMonadStaking {
+    function getValidator(uint64 validatorId) external;
     function getValidatorId(address validator) external returns (uint64);
     function getEpoch() external returns (uint64 epoch, bool inEpochDelayPeriod);
     function getConsensusValidatorSet(uint32 startIndex)
@@ -19,10 +20,11 @@ interface IMonadStaking {
 /// with registrations while preserving validator-set order. The runner uses the
 /// same stable filter, so PartyId is the address's compact array index.
 ///
-/// A DKG-DONE QC is accepted only if at least `2 * floor((N - 1) / 3) + 1`
-/// distinct PartyIds carry valid secp256k1 signatures over the engine's exact
-/// SHA-256 transcript `(epoch, session_id, g2x)`. Once accepted, the epoch is
-/// terminal and no further PC or BVE QC can be appended.
+/// A DKG-DONE QC is accepted only if distinct PartyIds with strictly more than
+/// two thirds of the target epoch's boundary-frozen whole-MON voting weight
+/// carry valid secp256k1 signatures over the engine's exact SHA-256 transcript
+/// `(epoch, session_id, g2x)`. Once accepted, the epoch is terminal and no
+/// further PC or BVE QC can be appended.
 contract DkgContract {
     enum RecordKind {
         PcQc,
@@ -117,6 +119,7 @@ contract DkgContract {
     uint256 private constant SECP256K1_HALF_N = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
     uint256 private constant SECP256K1_SQRT_EXPONENT =
         0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFBFFFFF0C;
+    uint256 private constant WEI_PER_MON = 1 ether;
     uint256 private constant MAX_PARTIES = 256;
 
     IMonadStaking private immutable STAKING;
@@ -396,7 +399,7 @@ contract DkgContract {
                 break;
             }
         }
-        if (count < 4 || count > MAX_PARTIES) {
+        if (count == 0 || count > MAX_PARTIES) {
             revert PartySetUnavailable(epoch);
         }
 
@@ -495,23 +498,41 @@ contract DkgContract {
         }
     }
 
-    function _validateDkgResult(uint64 epoch, DkgResult calldata result, address[] memory parties) private view {
+    function _validateDkgResult(uint64 epoch, DkgResult calldata result, address[] memory parties) private {
         uint256 partyCount = parties.length;
-        uint256 thresholdDegree = (partyCount - 1) / 3;
-        uint256 quorum = 2 * thresholdDegree + 1;
         uint256 count = result.signatures.length;
-        if (count < quorum || count > partyCount) {
+        if (count == 0 || count > partyCount) {
             revert InvalidDkgResult();
         }
+
+        // DONE is only valid while staking still exposes this epoch. Consensus
+        // holds an upcoming/current set; after its ending boundary the same set
+        // is retained in snapshot until the following epoch begins.
+        uint256[] memory votingWeights = _votingWeights(parties, _validatorSetKind(epoch));
 
         // A quorum signs the supplied session id together with the epoch and
         // result. At most f Byzantine signers cannot authenticate a session id
         // that the honest engine did not derive for this party set.
         bytes32 digest = _doneQcDigest(epoch, result.sessionId, result.g2x);
+        if (
+            _signedResultVotingWeight(epoch, result.signatures, parties, votingWeights, digest)
+                < _votingWeightQuorum(votingWeights)
+        ) {
+            revert InvalidDkgResult();
+        }
+    }
+
+    function _signedResultVotingWeight(
+        uint64 epoch,
+        QcSignature[] calldata signatures,
+        address[] memory parties,
+        uint256[] memory votingWeights,
+        bytes32 digest
+    ) private view returns (uint256 signedVotingWeight) {
         uint256 seenSigners;
-        for (uint256 i = 0; i < count; i++) {
-            QcSignature calldata signature = result.signatures[i];
-            if (signature.signer >= partyCount) {
+        for (uint256 i = 0; i < signatures.length; i++) {
+            QcSignature calldata signature = signatures[i];
+            if (signature.signer >= parties.length) {
                 revert InvalidDkgResult();
             }
             uint256 signerBit = uint256(1) << signature.signer;
@@ -519,11 +540,66 @@ contract DkgContract {
                 revert InvalidDkgResult();
             }
             seenSigners |= signerBit;
-            address party = parties[signature.signer];
-            address expectedSigner = registrations[epoch][party].qcVerifier;
-            if (!_signatureMatches(expectedSigner, digest, signature.r, signature.s)) {
+            if (!_signatureMatches(
+                    registrations[epoch][parties[signature.signer]].qcVerifier, digest, signature.r, signature.s
+                )) {
                 revert InvalidDkgResult();
             }
+            signedVotingWeight += votingWeights[signature.signer];
+        }
+    }
+
+    function _votingWeightQuorum(uint256[] memory votingWeights) private pure returns (uint256) {
+        uint256 totalVotingWeight;
+        for (uint256 i = 0; i < votingWeights.length; i++) {
+            totalVotingWeight += votingWeights[i];
+        }
+        return totalVotingWeight - (totalVotingWeight - 1) / 3;
+    }
+
+    function _validatorStake(uint64 validatorId, ValidatorSetKind kind) private returns (uint256) {
+        (bool success, bytes memory output) =
+            address(STAKING).call(abi.encodeWithSelector(IMonadStaking.getValidator.selector, validatorId));
+        // The staking precompile returns ten fixed words followed by two dynamic
+        // key fields. Consensus and snapshot stake are fixed words 6 and 8.
+        if (!success || output.length < 320) {
+            revert StakingLookupFailed();
+        }
+        uint256 consensusStake;
+        uint256 snapshotStake;
+        assembly ("memory-safe") {
+            consensusStake := mload(add(output, 0xe0))
+            snapshotStake := mload(add(output, 0x120))
+        }
+        return kind == ValidatorSetKind.Consensus ? consensusStake : snapshotStake;
+    }
+
+    function _votingWeights(address[] memory parties, ValidatorSetKind kind)
+        private
+        returns (uint256[] memory weights)
+    {
+        weights = new uint256[](parties.length);
+        for (uint256 i = 0; i < parties.length; i++) {
+            uint64 validatorId = _validatorId(parties[i]);
+            if (validatorId == 0) {
+                revert StakingLookupFailed();
+            }
+            weights[i] = _votingWeight(_validatorStake(validatorId, kind));
+        }
+    }
+
+    function _votingWeight(uint256 stake) private pure returns (uint256 weight) {
+        if (stake == 0) {
+            revert StakingLookupFailed();
+        }
+        weight = stake / WEI_PER_MON;
+        if (stake % WEI_PER_MON >= WEI_PER_MON / 2) {
+            weight++;
+        }
+        // Active validators are far above one MON. Rejecting zero also prevents
+        // quorum arithmetic from accepting a party omitted by the Rust engine.
+        if (weight == 0) {
+            revert StakingLookupFailed();
         }
     }
 

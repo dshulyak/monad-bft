@@ -1,8 +1,9 @@
+use alloy_primitives::U256;
 use dkg_core::{PartyId, RecordId, SessionId};
 use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
-    BveQc, ChainCall, ChainEvent, DkgDoneQc, DkgMessageId, DkgMessageKey, QcSignature,
-    QcSignatureBytes, TAG_PC_ACK,
+    BveQc, ChainCall, ChainEvent, DkgDoneQc, DkgMessageId, DkgMessageKey, NativeVotingWeight,
+    QcSignature, QcSignatureBytes, TAG_PC_ACK,
 };
 use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSignature};
 use monad_types::{Epoch, NodeId};
@@ -29,6 +30,22 @@ fn retrieval_response_completes_its_request() {
             responder,
         }))
     );
+}
+
+#[test]
+fn voting_weights_round_wei_to_nearest_mon() {
+    let unit = U256::from(1_000_000_000_000_000_000_u64);
+    assert_eq!(
+        decode_voting_weights(&[
+            monad_types::Stake(unit * U256::from(4) + unit * U256::from(49) / U256::from(100)),
+            monad_types::Stake(unit * U256::from(3) + unit / U256::from(2)),
+            monad_types::Stake(unit * U256::from(2) - U256::from(1)),
+        ])
+        .unwrap(),
+        [4, 4, 2].map(NativeVotingWeight::new).to_vec()
+    );
+
+    assert!(decode_voting_weights(&[monad_types::Stake(unit / U256::from(3))]).is_err());
 }
 
 #[test]
@@ -78,7 +95,7 @@ fn session_submits_chain_call_and_processes_finalized_event() {
 }
 
 #[test]
-fn session_refuses_one_and_two_validator_sets() {
+fn session_accepts_one_and_two_validator_sets_without_fault_tolerance() {
     for count in [1, 2] {
         let temp = TempDir::new().unwrap();
         let validators = test_validators(count);
@@ -86,18 +103,20 @@ fn session_refuses_one_and_two_validator_sets() {
         let result = start::<NopSignature>(
             epoch,
             validators[0],
-            validators,
+            validators
+                .into_iter()
+                .enumerate()
+                .map(|(index, node_id)| DkgValidator {
+                    node_id,
+                    address: [index as u8 + 1; 20],
+                    stake: monad_types::Stake(U256::from(WEI_PER_MON)),
+                })
+                .collect(),
             temp.path(),
             test_registered_key_material(PartyId(0), usize::from(count), epoch),
         );
 
-        assert!(matches!(
-            result,
-            Err(DkgError::InsufficientValidators {
-                actual,
-                minimum: 4
-            }) if actual == usize::from(count)
-        ));
+        assert!(result.unwrap().is_some());
     }
 }
 
@@ -145,6 +164,7 @@ fn test_session(
         epoch,
         self_party,
         mapping,
+        voting_weights: vec![NativeVotingWeight::new(1); validators.len()],
         engine_seed,
         key_material: test_registered_key_material(self_party, 4, epoch),
         recovery_wal: wal,

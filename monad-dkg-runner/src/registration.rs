@@ -63,7 +63,7 @@ pub(crate) struct RegisteredSession<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
-    pub validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+    pub validators: Vec<DkgValidator<ST>>,
     pub key_material: DkgRegisteredKeyMaterial,
 }
 
@@ -110,10 +110,10 @@ where
         .filter_map(|validator| {
             registrations_by_address
                 .remove(&validator.address)
-                .map(|registration| (validator.node_id, registration))
+                .map(|registration| (validator, registration))
         })
-        .map(|(node_id, registration)| {
-            verify_registration(registration, epoch).map(|registration| (node_id, registration))
+        .map(|(validator, registration)| {
+            verify_registration(registration, epoch).map(|registration| (validator, registration))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if eligible.is_empty() {
@@ -121,7 +121,10 @@ where
     }
 
     let local = local_keys.decode().map_err(RegistrationError::LocalKeys)?;
-    if let Some((_, registration)) = eligible.iter().find(|(node_id, _)| *node_id == self_id) {
+    if let Some((_, registration)) = eligible
+        .iter()
+        .find(|(validator, _)| validator.node_id == self_id)
+    {
         if registration.receiver.public_key != local.receiver_public_key {
             return Err(RegistrationError::ReceiverKeyMismatch);
         }
@@ -129,7 +132,7 @@ where
             return Err(RegistrationError::QcVerifierMismatch);
         }
     }
-    let validators = eligible.iter().map(|(node_id, _)| *node_id).collect();
+    let validators = eligible.iter().map(|(validator, _)| *validator).collect();
     let registrations = eligible
         .into_iter()
         .map(|(_, registration)| registration)

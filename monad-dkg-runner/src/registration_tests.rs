@@ -26,6 +26,7 @@ fn assembles_registered_parties_in_validator_order() {
         .map(|(node_id, address)| DkgValidator::<NopSignature> {
             node_id: *node_id,
             address,
+            stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
         })
         .collect();
     let registrations = addresses
@@ -52,7 +53,14 @@ fn assembles_registered_parties_in_validator_order() {
             dkg_core::Address([2; 20])
         ]
     );
-    assert_eq!(session.validators, nodes);
+    assert_eq!(
+        session
+            .validators
+            .iter()
+            .map(|validator| validator.node_id)
+            .collect::<Vec<_>>(),
+        nodes
+    );
 }
 
 #[test]
@@ -65,6 +73,7 @@ fn intersects_registrations_with_finalized_validators() {
         .map(|index| DkgValidator::<NopSignature> {
             node_id: nodes[index],
             address: [index as u8 + 1; 20],
+            stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
         })
         .collect();
     let registrations = [0usize, 1, 3, 4]
@@ -81,7 +90,14 @@ fn intersects_registrations_with_finalized_validators() {
     let session =
         assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], registrations).unwrap();
 
-    assert_eq!(session.validators, vec![nodes[3], nodes[0], nodes[1]]);
+    assert_eq!(
+        session
+            .validators
+            .iter()
+            .map(|validator| validator.node_id)
+            .collect::<Vec<_>>(),
+        vec![nodes[3], nodes[0], nodes[1]]
+    );
     assert_eq!(
         session
             .key_material
@@ -105,6 +121,7 @@ fn rejects_invalid_proof_for_a_finalized_validator() {
     let validators = vec![DkgValidator::<NopSignature> {
         node_id: nodes[0],
         address,
+        stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
     }];
     let mut malformed = registration(address, &keys[0]);
     malformed.receiver_proof[0] ^= 1;

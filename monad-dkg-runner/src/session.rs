@@ -6,29 +6,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alloy_primitives::U256;
 use bytes::Bytes;
 use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, SessionId};
 use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
 use dkg_protocol::{
-    ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase, DkgInput,
-    DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessageKind, DkgSetupContext,
-    DkgSetupError, DkgThresholdError, DkgThresholds, VirtualTopology, VirtualTopologyError,
+    quantize, ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase,
+    DkgInput, DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessageKind,
+    DkgSetupContext, DkgSetupError, DkgThresholdError, DkgThresholds, Epsilon, NativeVotingWeight,
+    QuantizationError, VirtualTopology, VirtualTopologyError,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_types::{Epoch, NodeId};
+use monad_types::{Epoch, NodeId, Stake};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::{
-    DkgError, DkgRegisteredKeyMaterial,
     chain::chain_event_kind,
     record::{EngineSeed, IncomingRecord, OutgoingRecord, RecoveryRecord},
     recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     reliable::{EnqueueError, ObsolescencePolicy, RetryConfig, RetryScheduler},
     runner::{DeliveryEnvelope, DeliveryOutbound},
+    DkgError, DkgRegisteredKeyMaterial, DkgValidator,
 };
+
+pub(crate) const WEI_PER_MON: u64 = 1_000_000_000_000_000_000;
 
 const DKG_RETRY: RetryConfig = RetryConfig::new(
     Duration::from_secs(2),
@@ -110,6 +114,10 @@ pub(crate) enum SessionError {
     PartySet(#[source] PartySetError),
     #[error("build DKG topology failed: {0}")]
     Topology(#[source] VirtualTopologyError),
+    #[error("quantize DKG stake failed: {0}")]
+    Quantization(#[source] QuantizationError),
+    #[error("DKG validator stake does not round to a positive u64 MON weight")]
+    InvalidVotingWeights,
     #[error("assemble DKG setup failed: {0}")]
     Setup(#[source] DkgSetupError),
     #[error("initialize research DKG engine failed: {0:?}")]
@@ -136,26 +144,32 @@ pub(crate) enum SessionError {
 pub(crate) fn start<ST>(
     epoch: Epoch,
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
-    validators: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
+    validators: Vec<DkgValidator<ST>>,
     storage_root: &std::path::Path,
     key_material: DkgRegisteredKeyMaterial,
 ) -> Result<Option<DkgSession<ST>>, DkgError>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
-    let mapping =
-        DkgPeerMap::<ST>::new_ordered(validators).map_err(|_| DkgError::DuplicateValidator)?;
+    let mapping = DkgPeerMap::<ST>::new_ordered(
+        validators
+            .iter()
+            .map(|validator| validator.node_id)
+            .collect(),
+    )
+    .map_err(|_| DkgError::DuplicateValidator)?;
     let Some(self_party) = mapping.party_id(&self_id) else {
         info!(?self_id, "not starting DKG session for non-validator node");
         return Ok(None);
     };
 
-    if mapping.len() < 4 {
-        return Err(DkgError::InsufficientValidators {
-            actual: mapping.len(),
-            minimum: 4,
-        });
-    }
+    let voting_weights = decode_voting_weights(
+        &validators
+            .iter()
+            .map(|validator| validator.stake)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|err| DkgError::operation("decode DKG validator stakes", err))?;
     let (mut recovery_wal, mut recovery_state) =
         RecoveryWal::open(storage_root, epoch, RecoveryWalConfig::default())
             .map_err(|err| DkgError::operation("open DKG recovery WAL", err))?;
@@ -170,6 +184,7 @@ where
         epoch,
         self_party,
         mapping,
+        voting_weights,
         engine_seed,
         key_material,
         recovery_wal,
@@ -186,6 +201,7 @@ where
     epoch: Epoch,
     self_party: PartyId,
     mapping: DkgPeerMap<ST>,
+    voting_weights: Vec<NativeVotingWeight>,
     engine_seed: EngineSeed,
     key_material: DkgRegisteredKeyMaterial,
     recovery_wal: RecoveryWal,
@@ -251,6 +267,7 @@ where
             init.epoch,
             init.self_party,
             init.key_material,
+            init.voting_weights,
             params,
             init.engine_seed,
         )?;
@@ -816,10 +833,32 @@ fn request_completed_by_response(
     Some(DkgMessageId::single(key))
 }
 
+fn decode_voting_weights(stakes: &[Stake]) -> Result<Vec<NativeVotingWeight>, SessionError> {
+    let unit = U256::from(WEI_PER_MON);
+    let half_unit = U256::from(WEI_PER_MON / 2);
+    stakes
+        .iter()
+        .map(|stake| {
+            let whole = stake.0 / unit;
+            let rounded = if stake.0 % unit >= half_unit {
+                whole + U256::from(1)
+            } else {
+                whole
+            };
+            u64::try_from(rounded)
+                .ok()
+                .filter(|weight| *weight != 0)
+                .map(NativeVotingWeight::new)
+                .ok_or(SessionError::InvalidVotingWeights)
+        })
+        .collect()
+}
+
 fn build_engine(
     epoch: Epoch,
     self_party: PartyId,
     key_material: DkgRegisteredKeyMaterial,
+    voting_weights: Vec<NativeVotingWeight>,
     params: DkgEngineParams,
     seed: [u8; 32],
 ) -> Result<DkgEngine<BlstBackend, K256SecpBackend>, SessionError> {
@@ -837,16 +876,29 @@ fn build_engine(
             .collect(),
     )
     .map_err(SessionError::ReceiverMatrix)?;
-    let thresholds =
-        DkgThresholds::derive(party_count, params.output_count).map_err(SessionError::Threshold)?;
+    let epsilon = Epsilon::default();
+    let quantized = quantize(&voting_weights, epsilon, params.output_count)
+        .map_err(SessionError::Quantization)?;
     let party_set = PartySet::new(
         (0..party_count)
             .map(|party| PartyId(u32::try_from(party).expect("party count fits u32")))
             .collect(),
     )
     .map_err(SessionError::PartySet)?;
-    let topology =
-        VirtualTopology::new(party_set, vec![1; party_count]).map_err(SessionError::Topology)?;
+    let topology = VirtualTopology::from_weights(
+        party_set,
+        voting_weights,
+        quantized.dealer_tickets,
+        quantized.receiver_tickets,
+    )
+    .map_err(SessionError::Topology)?;
+    let thresholds = DkgThresholds::derive_quantized(
+        &topology,
+        params.output_count,
+        quantized.dealer_batch_size,
+        epsilon,
+    )
+    .map_err(SessionError::Threshold)?;
     let setup = DkgSetupContext::assemble(
         self_party,
         SessionId(epoch.0),

@@ -12,15 +12,23 @@ interface Vm {
 }
 
 contract TestValidatorLookup {
+    uint256 private constant WEI_PER_MON = 1 ether;
+
     mapping(address validator => uint64 id) private validatorIds;
+    mapping(uint64 validatorId => uint256 stake) private consensusStakes;
+    mapping(uint64 validatorId => uint256 stake) private snapshotStakes;
     uint64[] private consensus;
+    uint64[] private snapshot;
     uint64 private epoch = 6;
     bool private inDelay;
 
     function addTarget(address validator) external {
         uint64 id = uint64(consensus.length + 1);
         validatorIds[validator] = id;
+        consensusStakes[id] = WEI_PER_MON;
+        snapshotStakes[id] = WEI_PER_MON;
         consensus.push(id);
+        snapshot.push(id);
     }
 
     function addValidator(address validator) external {
@@ -33,8 +41,34 @@ contract TestValidatorLookup {
         inDelay = inDelay_;
     }
 
+    function setStake(address validator, uint256 stake) external {
+        uint64 validatorId = validatorIds[validator];
+        consensusStakes[validatorId] = stake;
+        snapshotStakes[validatorId] = stake;
+    }
+
+    function setConsensusStake(address validator, uint256 stake) external {
+        consensusStakes[validatorIds[validator]] = stake;
+    }
+
+    function setSnapshotStake(address validator, uint256 stake) external {
+        snapshotStakes[validatorIds[validator]] = stake;
+    }
+
     function getValidatorId(address validator) external view returns (uint64) {
         return validatorIds[validator];
+    }
+
+    function getValidator(uint64 validatorId) external view {
+        uint256 consensusStake = consensusStakes[validatorId];
+        uint256 snapshotStake = snapshotStakes[validatorId];
+        assembly ("memory-safe") {
+            let output := mload(0x40)
+            mstore(add(output, 0x40), consensusStake)
+            mstore(add(output, 0xc0), consensusStake)
+            mstore(add(output, 0x100), snapshotStake)
+            return(output, 0x140)
+        }
     }
 
     function getEpoch() external view returns (uint64, bool) {
@@ -51,10 +85,10 @@ contract TestValidatorLookup {
 
     function getSnapshotValidatorSet(uint32 startIndex)
         external
-        pure
+        view
         returns (bool done, uint32 nextIndex, uint64[] memory validatorIds_)
     {
-        return (true, startIndex, new uint64[](0));
+        return page(snapshot, startIndex);
     }
 
     function page(uint64[] storage source, uint32 startIndex)
@@ -418,6 +452,69 @@ contract DkgContractTest {
         VM.expectRevert();
         VM.prank(fixture.validators[0]);
         fixture.dkg.submitResult(EPOCH, result);
+    }
+
+    function testSubmitResultUsesConsensusStakeDuringTargetEpoch() external {
+        Fixture memory fixture = deploySession();
+        // The party set was already persisted, so this proves DONE reads stake
+        // at verification instead of persisting it with the party IDs.
+        postPc(fixture, pcQc(0, 0x11, 1));
+        fixture.staking.setConsensusStake(fixture.validators[0], 7 ether);
+        fixture.staking.setEpoch(EPOCH, false);
+        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+        DkgContract.QcSignature[] memory highStakeQuorum = new DkgContract.QcSignature[](1);
+        highStakeQuorum[0] = result.signatures[0];
+        result.signatures = highStakeQuorum;
+        submitResult(fixture, result);
+    }
+
+    function testSubmitResultUsesSnapshotStakeAfterTargetBoundary() external {
+        Fixture memory fixture = deploySession();
+        postPc(fixture, pcQc(0, 0x11, 1));
+        fixture.staking.setSnapshotStake(fixture.validators[0], 7 ether);
+        fixture.staking.setEpoch(EPOCH, true);
+
+        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+        DkgContract.QcSignature[] memory highStakeQuorum = new DkgContract.QcSignature[](1);
+        highStakeQuorum[0] = result.signatures[0];
+        result.signatures = highStakeQuorum;
+        submitResult(fixture, result);
+    }
+
+    function testSubmitResultRejectsAfterStakeWindowExpires() external {
+        Fixture memory fixture = deploySession();
+        postPc(fixture, pcQc(0, 0x11, 1));
+        fixture.staking.setEpoch(EPOCH + 1, false);
+        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+
+        VM.expectRevert();
+        VM.prank(fixture.validators[0]);
+        fixture.dkg.submitResult(EPOCH, result);
+    }
+
+    function testSubmitResultRoundsStakeToNearestMon() external {
+        Fixture memory fixture = deploySession();
+        fixture.staking.setStake(fixture.validators[0], 6 ether + 0.5 ether);
+        for (uint256 i = 1; i < fixture.validators.length; i++) {
+            fixture.staking.setStake(fixture.validators[i], 1 ether + 0.49 ether);
+        }
+        DkgContract.DkgResult memory result = signedResult(fixture, 0x44);
+        DkgContract.QcSignature[] memory roundedQuorum = new DkgContract.QcSignature[](1);
+        roundedQuorum[0] = result.signatures[0];
+        result.signatures = roundedQuorum;
+        submitResult(fixture, result);
+    }
+
+    function testSinglePartySetCanFreeze() external {
+        (DkgContract dkg, TestValidatorLookup staking, address validator) = deploySingleRegistrationTarget();
+        uint256 qcKey = 1;
+        DkgContract.Registration memory record = registration(validator, qcKey);
+        VM.prank(validator);
+        dkg.register(EPOCH, record);
+        staking.setEpoch(6, true);
+        VM.prank(validator);
+        dkg.postPcQc(EPOCH, pcQc(0, 0x11, 1));
+        require(dkg.frozenPartyCount(EPOCH) == 1, "singleton party set did not freeze");
     }
 
     function testSubmitResultRejectsTamperedPointAndSignature() external {

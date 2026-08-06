@@ -808,6 +808,7 @@ fn schedule_dkg_session(
         .map(|validator| monad_dkg_runner::DkgValidator {
             node_id: validator.node_id,
             address: validator.node_id.pubkey().get_eth_address().into_array(),
+            stake: validator.stake,
         })
         .collect();
     dkg_events.start_session(validator_set.epoch, validators);
