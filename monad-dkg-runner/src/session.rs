@@ -33,6 +33,7 @@ use crate::{
 };
 
 pub(crate) const WEI_PER_MON: u64 = 1_000_000_000_000_000_000;
+const DKG_BATCH_SIZE: usize = 256;
 
 const DKG_RETRY: RetryConfig = RetryConfig::new(
     Duration::from_secs(2),
@@ -261,7 +262,10 @@ where
 
     fn new(init: SessionInit<ST>) -> Result<Self, SessionError> {
         let party_count = init.mapping.len();
-        let params = DkgEngineParams::default();
+        let params = DkgEngineParams {
+            output_count: DKG_BATCH_SIZE,
+            ..DkgEngineParams::default()
+        };
         let output_count = params.output_count;
         let engine = build_engine(
             init.epoch,
