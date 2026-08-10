@@ -186,6 +186,7 @@ where
         self_party,
         mapping,
         voting_weights,
+        output_count: DKG_BATCH_SIZE,
         engine_seed,
         key_material,
         recovery_wal,
@@ -203,6 +204,7 @@ where
     self_party: PartyId,
     mapping: DkgPeerMap<ST>,
     voting_weights: Vec<NativeVotingWeight>,
+    output_count: usize,
     engine_seed: EngineSeed,
     key_material: DkgRegisteredKeyMaterial,
     recovery_wal: RecoveryWal,
@@ -263,7 +265,7 @@ where
     fn new(init: SessionInit<ST>) -> Result<Self, SessionError> {
         let party_count = init.mapping.len();
         let params = DkgEngineParams {
-            output_count: DKG_BATCH_SIZE,
+            output_count: init.output_count,
             ..DkgEngineParams::default()
         };
         let output_count = params.output_count;
@@ -273,7 +275,7 @@ where
             init.key_material,
             init.voting_weights,
             params,
-            init.engine_seed,
+            init.engine_seed.to_bytes(),
         )?;
         let max_ladder_level = output_count.trailing_zeros().into();
         let initial_phase = engine.phase();
@@ -392,7 +394,7 @@ where
     }
 
     fn handle_data_payload(&mut self, from: PartyId, payload: Bytes) -> Result<(), SessionError> {
-        let message = match DkgMessage::decode(payload.clone()) {
+        let message = match DkgMessage::decode(payload) {
             Ok(message) => message,
             Err(err) => {
                 warn!(
@@ -426,7 +428,7 @@ where
         }
         let record = IncomingRecord {
             source: from,
-            payload: payload.clone(),
+            message: message.clone(),
         };
         self.pending_inputs
             .push_back(PendingEngineInput::Peer(PendingPeerInput {
@@ -522,7 +524,7 @@ where
                     ) {
                         let record = IncomingRecord {
                             source: self.self_party,
-                            payload: payload.clone().into_bytes(),
+                            message: payload.clone(),
                         };
                         self.pending_inputs
                             .push_back(PendingEngineInput::Peer(PendingPeerInput {
@@ -555,16 +557,9 @@ where
                 );
                 continue;
             }
-            let message = match DkgMessage::decode(record.payload.clone()) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!(?err, "skipping malformed persisted DKG message");
-                    continue;
-                }
-            };
             self.pending_inputs
                 .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                    input: CoreInput::new(record.source, message),
+                    input: CoreInput::new(record.source, record.message),
                     durable: None,
                 }));
         }
@@ -595,20 +590,16 @@ where
         records: Vec<OutgoingRecord>,
     ) -> Result<(), SessionError> {
         for record in records {
-            let message = match DkgMessage::decode(record.payload.clone()) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!(?err, "skipping malformed persisted outgoing DKG message");
-                    continue;
-                }
-            };
-            let Some(first_recipient) = record.recipients.first().copied() else {
+            let OutgoingRecord {
+                recipients,
+                message,
+            } = record;
+            let Some(first_recipient) = recipients.first().copied() else {
                 warn!("skipping persisted DKG message without recipients");
                 continue;
             };
-            let message_id = self.message_id_for_recipients(&record.recipients, &message)?;
-            let recipients = record
-                .recipients
+            let message_id = self.message_id_for_recipients(&recipients, &message)?;
+            let delivery_recipients = recipients
                 .iter()
                 .map(|party| {
                     self.mapping
@@ -619,22 +610,23 @@ where
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let abort_group = delivery_abort_group_for_peer_payload(
+                message.kind(),
+                self.self_party,
+                first_recipient,
+            );
             let payload = DeliveryEnvelope {
                 epoch: self.epoch.0,
-                payload: record.payload,
+                payload: message.into_bytes(),
             }
             .into();
             self.delivery_outbound.extend(
                 self.retries
                     .enqueue(
                         message_id,
-                        recipients,
+                        delivery_recipients,
                         payload,
-                        delivery_abort_group_for_peer_payload(
-                            message.kind(),
-                            self.self_party,
-                            first_recipient,
-                        ),
+                        abort_group,
                         Instant::now(),
                     )?
                     .into_iter()
@@ -719,7 +711,7 @@ where
             return Ok(());
         }
         let message_id = self.message_id_for_recipients(&recipients, &message)?;
-        let payload = message.into_bytes();
+        let payload = message.as_bytes().clone();
         let abort_group = delivery_abort_group_for_peer_payload(
             kind,
             self.self_party,
@@ -757,7 +749,7 @@ where
         self.recovery_wal
             .append(&RecoveryRecord::Outgoing(OutgoingRecord {
                 recipients,
-                payload,
+                message,
             }))?;
         failpoint::failpoint!(
             name = "dkg.network.outgoing_persisted",

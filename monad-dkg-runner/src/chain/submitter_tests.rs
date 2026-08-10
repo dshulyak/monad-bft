@@ -62,16 +62,12 @@ fn encodes_submit_result_contract_calldata() {
 }
 
 #[test]
-fn submission_waits_for_chain_recovery_gate() {
+fn submission_waits_for_a_finalized_context() {
     let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
-    service.start_session(Epoch(2));
     service.submit(Epoch(2), pc_call(pc_qc(1, 0x11)));
 
     assert!(local_rx.try_recv().is_err());
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
-    assert!(local_rx.try_recv().is_err());
-
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     assert!(local_rx.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -84,20 +80,19 @@ fn retries_same_local_transaction_on_finalized_blocks_until_matching_event() {
         qc: qc.clone(),
     };
     let (mut service, local_rx) = test_submitter(5, Arc::clone(&nonce_reads));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
 
     service.submit(Epoch(2), pc_call(qc));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(first.is_eip1559());
-    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new());
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(first, second);
     assert_eq!(decode_nonce(&first), 5);
     assert_eq!(nonce_reads.load(Ordering::SeqCst), 2);
 
-    service.finalized_block(Epoch(2), SeqNum(12), vec![event], false);
-    service.finalized_block(Epoch(2), SeqNum(13), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(12), vec![event]);
+    service.finalized_block(Epoch(2), SeqNum(13), Vec::new());
     assert!(local_rx.try_recv().is_err());
 }
 
@@ -127,8 +122,7 @@ fn registration_retries_same_transaction_until_finalized_state_confirms_it() {
 fn nonce_read_uses_the_scanned_event_block() {
     let context_block = Arc::new(AtomicU64::new(0));
     let (mut service, local_rx) = test_submitter_with_context_block(Arc::clone(&context_block));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(42), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(42), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
 
     local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -139,8 +133,7 @@ fn nonce_read_uses_the_scanned_event_block() {
 fn serializes_artifacts_without_leaving_a_nonce_gap() {
     let nonce_reads = Arc::new(AtomicUsize::new(0));
     let (mut service, local_rx) = test_submitter(11, Arc::clone(&nonce_reads));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
 
     let first_qc = pc_qc(1, 1);
     let second_qc = pc_qc(2, 2);
@@ -158,7 +151,6 @@ fn serializes_artifacts_without_leaving_a_nonce_gap() {
             record_id: RecordId(9),
             qc: first_qc,
         }],
-        false,
     );
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(decode_nonce(&first), 11);
@@ -170,13 +162,12 @@ fn retires_active_artifact_after_finalized_nonce_advances_without_event() {
     let nonce = Arc::new(AtomicU64::new(5));
     let (mut service, local_rx) =
         test_submitter_with_nonce(Arc::clone(&nonce), Arc::new(AtomicUsize::new(0)));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
 
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     nonce.store(6, Ordering::SeqCst);
-    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new());
 
     assert_eq!(decode_nonce(&first), 5);
     assert!(local_rx.try_recv().is_err());
@@ -194,8 +185,7 @@ fn new_artifact_uses_newest_context_across_sessions() {
         Arc::new(AtomicUsize::new(0)),
         Arc::clone(&context_block),
     );
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
         .registration(service.signer_address().into_array(), 3)
         .unwrap();
@@ -215,8 +205,7 @@ fn new_artifact_uses_newest_context_across_sessions() {
 fn active_artifact_keeps_its_epoch_context() {
     let context_block = Arc::new(AtomicU64::new(0));
     let (mut service, local_rx) = test_submitter_with_context_block(Arc::clone(&context_block));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
@@ -224,7 +213,7 @@ fn active_artifact_keeps_its_epoch_context() {
         .unwrap();
     service.submit_registration(Epoch(3), SeqNum(20), registration);
 
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     let retry = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     assert_eq!(retry, first);
@@ -232,17 +221,30 @@ fn active_artifact_keeps_its_epoch_context() {
 }
 
 #[test]
+fn active_artifact_advances_with_its_epoch_context() {
+    let context_block = Arc::new(AtomicU64::new(0));
+    let (mut service, local_rx) = test_submitter_with_context_block(Arc::clone(&context_block));
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
+    service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new());
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(context_block.load(Ordering::SeqCst), 11);
+}
+
+#[test]
 fn retry_does_not_replace_with_nonce_from_older_context() {
     let nonce = Arc::new(AtomicU64::new(6));
     let (mut service, local_rx) =
         test_submitter_with_nonce(Arc::clone(&nonce), Arc::new(AtomicUsize::new(0)));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
     let prepared = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     nonce.store(5, Ordering::SeqCst);
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     let retry = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     assert_eq!(decode_nonce(&prepared), 6);
@@ -258,15 +260,14 @@ fn reprepares_active_artifact_when_buffered_base_fee_increases() {
         Arc::clone(&base_fee),
         Arc::new(AtomicUsize::new(0)),
     );
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
 
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(decode_max_fee_per_gas(&first), 151);
 
     base_fee.store(200, Ordering::SeqCst);
-    service.finalized_block(Epoch(2), SeqNum(11), Vec::new(), false);
+    service.finalized_block(Epoch(2), SeqNum(11), Vec::new());
     let second = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     assert_eq!(decode_nonce(&second), 5);
@@ -277,7 +278,6 @@ fn reprepares_active_artifact_when_buffered_base_fee_increases() {
 #[test]
 fn recovered_finalized_event_suppresses_late_submission() {
     let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
-    service.start_session(Epoch(2));
     let qc = pc_qc(3, 0x77);
     service.finalized_block(
         Epoch(2),
@@ -286,7 +286,6 @@ fn recovered_finalized_event_suppresses_late_submission() {
             record_id: RecordId(9),
             qc: qc.clone(),
         }],
-        true,
     );
     service.submit(Epoch(2), pc_call(qc));
 
@@ -296,10 +295,8 @@ fn recovered_finalized_event_suppresses_late_submission() {
 #[test]
 fn overlapping_session_accepts_late_calls_from_previous_epoch() {
     let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
-    service.start_session(Epoch(2));
-    service.finalized_block(Epoch(2), SeqNum(10), Vec::new(), true);
-    service.start_session(Epoch(3));
-    service.finalized_block(Epoch(3), SeqNum(20), Vec::new(), true);
+    service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
+    service.finalized_block(Epoch(3), SeqNum(20), Vec::new());
     let previous = pc_call(pc_qc(2, 2));
     service.submit(Epoch(2), previous.clone());
 
@@ -314,14 +311,17 @@ fn overlapping_session_accepts_late_calls_from_previous_epoch() {
 }
 
 #[test]
-fn third_session_evicts_oldest_epoch_and_rejects_its_late_calls() {
+fn retiring_epoch_discards_its_active_retry() {
     let (mut service, local_rx) = test_submitter(5, Arc::new(AtomicUsize::new(0)));
-    for epoch in [Epoch(2), Epoch(3), Epoch(4)] {
-        service.start_session(epoch);
-        service.finalized_block(epoch, SeqNum(epoch.0 * 10), Vec::new(), true);
-    }
-
+    service.finalized_block(Epoch(2), SeqNum(20), Vec::new());
     service.submit(Epoch(2), pc_call(pc_qc(2, 2)));
+    local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    service.retire_epoch(Epoch(2));
+    service.finalized_block(Epoch(2), SeqNum(21), Vec::new());
+    assert!(local_rx.try_recv().is_err());
+
+    service.finalized_block(Epoch(4), SeqNum(40), Vec::new());
     let current = pc_call(pc_qc(4, 4));
     service.submit(Epoch(4), current.clone());
 

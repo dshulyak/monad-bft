@@ -142,17 +142,17 @@ impl RecoveryState {
         &mut self,
         wal: &mut RecoveryWal,
     ) -> Result<EngineSeed, RecoveryWalError> {
-        if let Some(seed) = self.engine_seed {
-            return Ok(seed);
+        if let Some(seed) = &self.engine_seed {
+            return Ok(seed.clone());
         }
         if !self.outgoing.is_empty() || !self.incoming.is_empty() {
             return Err(RecoveryWalError::MissingSeed);
         }
 
-        let mut seed = [0; ENGINE_SEED_BYTES];
-        getrandom::getrandom(&mut seed).map_err(RecoveryWalError::Random)?;
-        wal.append(&RecoveryRecord::Seed(seed))?;
-        self.engine_seed = Some(seed);
+        let mut seed = EngineSeed::new([0; ENGINE_SEED_BYTES]);
+        getrandom::getrandom(seed.as_mut()).map_err(RecoveryWalError::Random)?;
+        wal.append(&RecoveryRecord::Seed(seed.clone()))?;
+        self.engine_seed = Some(seed.clone());
         Ok(seed)
     }
 
@@ -175,8 +175,8 @@ impl RecoveryState {
     }
 
     fn insert_engine_seed(&mut self, seed: EngineSeed) -> Result<(), RecoveryWalError> {
-        match self.engine_seed {
-            Some(existing) if existing != seed => Err(RecoveryWalError::ConflictingSeed),
+        match &self.engine_seed {
+            Some(existing) if existing != &seed => Err(RecoveryWalError::ConflictingSeed),
             Some(_) => Ok(()),
             None => {
                 self.engine_seed = Some(seed);

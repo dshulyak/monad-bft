@@ -20,19 +20,12 @@ use crate::DkgError;
 
 type TxKey = (Epoch, ChainTxId);
 
-struct ProtocolSubmissionState {
-    context_block: Option<SeqNum>,
-    recovered: bool,
-}
-
 pub(crate) struct TxSubmitter {
     submission: TxSubmission,
     pending: BTreeMap<TxKey, ChainCall>,
     prepared: Option<(TxKey, PreparedTx)>,
     finalized: BTreeSet<TxKey>,
-    // The previous protocol may still be finishing while the current one runs.
-    protocols: [Option<(Epoch, ProtocolSubmissionState)>; 2],
-    registration_context: Option<(Epoch, SeqNum)>,
+    latest_context_block: Option<SeqNum>,
 }
 
 impl TxSubmitter {
@@ -58,8 +51,7 @@ impl TxSubmitter {
             pending: BTreeMap::new(),
             prepared: None,
             finalized: BTreeSet::new(),
-            protocols: [None, None],
-            registration_context: None,
+            latest_context_block: None,
         })
     }
 
@@ -73,87 +65,28 @@ impl TxSubmitter {
         block: SeqNum,
         registration: RegistrationCall,
     ) {
-        self.registration_context = Some((epoch, block));
+        self.observe_context(block);
         let contract = self.submission.config.contract;
-        self.submit(
+        let key = self.enqueue(
             epoch,
             ChainCall::PostRegistration {
                 registration,
                 dkg: dkg_core::Address(contract.into_array()),
             },
         );
-    }
-
-    pub(crate) fn start_session(&mut self, epoch: Epoch) {
-        if self.protocol(epoch).is_some()
-            || self
-                .protocols
-                .last()
-                .and_then(Option::as_ref)
-                .map(|(epoch, _)| *epoch)
-                .is_some_and(|latest| latest > epoch)
-        {
-            return;
-        }
-        let context_block = self
-            .registration_context
-            .take_if(|(registration_epoch, _)| *registration_epoch == epoch)
-            .map(|(_, block)| block);
-        self.protocols.rotate_left(1);
-        self.protocols[1] = Some((
-            epoch,
-            ProtocolSubmissionState {
-                context_block,
-                recovered: false,
-            },
-        ));
-        let latest = epoch;
-        let protocols = &self.protocols;
-        self.pending.retain(|(pending_epoch, id), _| {
-            protocols
-                .iter()
-                .flatten()
-                .any(|(epoch, _)| epoch == pending_epoch)
-                || (*pending_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
-        });
-        self.finalized.retain(|(pending_epoch, id)| {
-            protocols
-                .iter()
-                .flatten()
-                .any(|(epoch, _)| epoch == pending_epoch)
-                || (*pending_epoch > latest && matches!(id, ChainTxId::Registration { .. }))
-        });
-        self.clear_orphaned_prepared();
-        if self
-            .registration_context
-            .is_some_and(|(registration_epoch, _)| registration_epoch <= latest)
-        {
-            self.registration_context = None;
-        }
+        self.submit_keys(key, block);
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
-        let key = (epoch, ChainTxId::from(&call));
-        let immediate = matches!(&call, ChainCall::PostRegistration { .. });
-        if !immediate && self.protocol(epoch).is_none() {
+        let key = self.enqueue(epoch, call);
+        let Some(block) = self.latest_context_block else {
             return;
-        }
-
-        if self.finalized.contains(&key) || self.pending.contains_key(&key) {
-            return;
-        }
-        self.pending.insert(key.clone(), call);
-        if immediate
-            || self
-                .protocol(epoch)
-                .is_some_and(|protocol| protocol.recovered)
-        {
-            self.submit_keys([key]);
-        }
+        };
+        self.submit_keys(key, block);
     }
 
     pub(crate) fn retry_registration(&mut self, epoch: Epoch, block: SeqNum) {
-        self.registration_context = Some((epoch, block));
+        self.observe_context(block);
         let keys = self
             .pending
             .keys()
@@ -162,7 +95,7 @@ impl TxSubmitter {
             })
             .cloned()
             .collect::<Vec<_>>();
-        self.submit_keys(keys);
+        self.submit_keys(keys, block);
     }
 
     pub(crate) fn confirm_registration(&mut self, epoch: Epoch, registration: &RegistrationCall) {
@@ -177,39 +110,41 @@ impl TxSubmitter {
         self.clear_orphaned_prepared();
     }
 
-    pub(crate) fn finalized_block(
-        &mut self,
-        epoch: Epoch,
-        block: SeqNum,
-        events: Vec<ChainEvent>,
-        recovery_complete_after: bool,
-    ) {
-        let Some(protocol) = self.protocol_mut(epoch) else {
-            return;
-        };
-        protocol.context_block = Some(block);
-        if recovery_complete_after {
-            protocol.recovered = true;
-        }
+    pub(crate) fn retire_epoch(&mut self, epoch: Epoch) {
+        self.pending
+            .retain(|(pending_epoch, _), _| *pending_epoch != epoch);
+        self.finalized
+            .retain(|(finalized_epoch, _)| *finalized_epoch != epoch);
+        self.clear_orphaned_prepared();
+    }
+
+    pub(crate) fn finalized_block(&mut self, epoch: Epoch, block: SeqNum, events: Vec<ChainEvent>) {
+        self.observe_context(block);
         for event in events {
             let id = ChainTxId::from(&event);
             self.confirm((epoch, id));
         }
-        if self
-            .protocol(epoch)
-            .is_some_and(|protocol| protocol.recovered)
-        {
-            let keys = self
-                .pending
-                .keys()
-                .filter(|(pending_epoch, _)| *pending_epoch == epoch)
-                .cloned()
-                .collect::<Vec<_>>();
-            self.submit_keys(keys);
-        }
+        let keys = self
+            .pending
+            .keys()
+            .filter(|(pending_epoch, _)| *pending_epoch == epoch)
+            .cloned()
+            .collect::<Vec<_>>();
+        // Advance an active retry with its own epoch's scan. A newer overlapping
+        // epoch must not make it read a nonce from the wrong chain boundary.
+        self.submit_keys(keys, block);
     }
 
-    fn submit_keys(&mut self, keys: impl IntoIterator<Item = TxKey>) {
+    fn enqueue(&mut self, epoch: Epoch, call: ChainCall) -> Option<TxKey> {
+        let key = (epoch, ChainTxId::from(&call));
+        if self.finalized.contains(&key) || self.pending.contains_key(&key) {
+            return None;
+        }
+        self.pending.insert(key.clone(), call);
+        Some(key)
+    }
+
+    fn submit_keys(&mut self, keys: impl IntoIterator<Item = TxKey>, context_block: SeqNum) {
         let keys = keys.into_iter().collect::<Vec<_>>();
         loop {
             let key = match &self.prepared {
@@ -224,21 +159,6 @@ impl TxSubmitter {
                 .pending
                 .get(&key)
                 .expect("selected DKG submission remains pending");
-            // Keep an active retry on its protocol boundary. New work uses the
-            // newest boundary so overlapping protocols observe consumed nonces.
-            let context_block = if self.prepared.is_some() {
-                self.context_block(key.0)
-            } else {
-                self.latest_context_block()
-            };
-            let Some(context_block) = context_block else {
-                warn!(
-                    epoch = key.0 .0,
-                    call_kind = chain_call_kind(call),
-                    "missing DKG transaction context block; will retry"
-                );
-                return;
-            };
             match self
                 .submission
                 .refresh(context_block, &key, call, &mut self.prepared)
@@ -322,39 +242,11 @@ impl TxSubmitter {
         }
     }
 
-    fn context_block(&self, epoch: Epoch) -> Option<SeqNum> {
-        self.protocol(epoch)
-            .and_then(|protocol| protocol.context_block)
-            .or_else(|| {
-                self.registration_context
-                    .filter(|(registration_epoch, _)| *registration_epoch == epoch)
-                    .map(|(_, block)| block)
-            })
-    }
-
-    fn latest_context_block(&self) -> Option<SeqNum> {
-        self.protocols
-            .iter()
-            .flatten()
-            .filter_map(|(_, protocol)| protocol.context_block)
-            .chain(self.registration_context.map(|(_, block)| block))
-            .max()
-    }
-
-    fn protocol(&self, epoch: Epoch) -> Option<&ProtocolSubmissionState> {
-        self.protocols
-            .iter()
-            .flatten()
-            .find(|(protocol_epoch, _)| *protocol_epoch == epoch)
-            .map(|(_, protocol)| protocol)
-    }
-
-    fn protocol_mut(&mut self, epoch: Epoch) -> Option<&mut ProtocolSubmissionState> {
-        self.protocols
-            .iter_mut()
-            .flatten()
-            .find(|(protocol_epoch, _)| *protocol_epoch == epoch)
-            .map(|(_, protocol)| protocol)
+    fn observe_context(&mut self, block: SeqNum) {
+        self.latest_context_block = Some(
+            self.latest_context_block
+                .map_or(block, |latest| latest.max(block)),
+        );
     }
 
     fn confirm(&mut self, key: TxKey) {

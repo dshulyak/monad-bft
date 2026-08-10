@@ -1,11 +1,13 @@
 use dkg_core::PartyId;
+use dkg_protocol::{DkgMessage, TAG_PC_PROPOSAL};
+use zeroize::Zeroize;
 
 use super::*;
 
 fn incoming(value: u8) -> IncomingRecord {
     IncomingRecord {
         source: PartyId(value.into()),
-        payload: vec![value].into(),
+        message: DkgMessage::PcProposal(vec![TAG_PC_PROPOSAL, value].into()),
     }
 }
 
@@ -40,13 +42,26 @@ fn default_preallocation_covers_one_maximum_record() {
 fn wal_rejects_conflicting_engine_seed_records() {
     let dir = tempfile::tempdir().unwrap();
     let mut wal = open_wal(dir.path(), 8);
-    wal.append(&RecoveryRecord::Seed([0x11; ENGINE_SEED_BYTES]))
-        .unwrap();
-    wal.append(&RecoveryRecord::Seed([0x22; ENGINE_SEED_BYTES]))
-        .unwrap();
+    wal.append(&RecoveryRecord::Seed(EngineSeed::new(
+        [0x11; ENGINE_SEED_BYTES],
+    )))
+    .unwrap();
+    wal.append(&RecoveryRecord::Seed(EngineSeed::new(
+        [0x22; ENGINE_SEED_BYTES],
+    )))
+    .unwrap();
 
     let err = RecoveryState::load(wal.path()).unwrap_err();
     assert!(matches!(err, RecoveryWalError::ConflictingSeed));
+}
+
+#[test]
+fn engine_seed_is_zeroizable_and_redacted() {
+    let mut seed = EngineSeed::new([0x11; ENGINE_SEED_BYTES]);
+    assert_eq!(format!("{seed:?}"), "EngineSeed([REDACTED])");
+
+    seed.zeroize();
+    assert_eq!(seed.as_ref(), &[0; ENGINE_SEED_BYTES]);
 }
 
 #[test]
@@ -64,7 +79,7 @@ fn wal_creates_and_reuses_one_engine_seed() {
         .unwrap();
 
     assert_eq!(first, second);
-    assert_ne!(first, [0; ENGINE_SEED_BYTES]);
+    assert_ne!(first.as_ref(), &[0; ENGINE_SEED_BYTES]);
     assert_eq!(
         DurableWal::<RecoveryRecord>::read(&path, MAX_RECOVERY_RECORD_BYTES)
             .unwrap()
@@ -130,7 +145,7 @@ fn wal_loads_outgoing_message_records() {
 
     let record = OutgoingRecord {
         recipients: [PartyId(2), PartyId(3)].into_iter().collect(),
-        payload: vec![0xAA, 0xBB, 0xCC].into(),
+        message: DkgMessage::PcProposal(vec![TAG_PC_PROPOSAL, 0xAA, 0xBB, 0xCC].into()),
     };
     wal.append(&RecoveryRecord::Outgoing(record.clone()))
         .unwrap();

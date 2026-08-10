@@ -20,6 +20,7 @@ use crate::{test_registered_key_material, DeliveryOutbound};
 const NODE_COUNT: usize = 4;
 const TEST_EPOCH: Epoch = Epoch(12);
 const DEFAULT_RECOVERY_SCHEDULES: u32 = 16;
+const PROPERTY_OUTPUT_COUNT: usize = 2;
 const QUIET_RECOVERY_STEPS: usize = 1_000;
 const MODEL_STEP: Duration = Duration::from_secs(31);
 
@@ -101,20 +102,47 @@ struct RecoveryModel {
     network: VecDeque<NetworkMessage>,
     chain_messages: VecDeque<ChainMessage>,
     chain: ContractModel,
+    output_count: usize,
     now: Instant,
     steps: usize,
 }
 
-impl RecoveryModel {
-    fn new(root: &Path) -> Self {
-        Self::new_with_count(root, NODE_COUNT)
+struct RecoveryModelBuilder<'a> {
+    root: &'a Path,
+    voting_weights: Vec<u64>,
+    output_count: usize,
+}
+
+impl<'a> RecoveryModelBuilder<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            voting_weights: vec![1; NODE_COUNT],
+            output_count: DKG_BATCH_SIZE,
+        }
     }
 
-    fn new_with_count(root: &Path, node_count: usize) -> Self {
-        Self::new_with_weights(root, vec![1; node_count])
+    fn node_count(mut self, node_count: usize) -> Self {
+        self.voting_weights = vec![1; node_count];
+        self
     }
 
-    fn new_with_weights(root: &Path, voting_weights: Vec<u64>) -> Self {
+    fn voting_weights(mut self, voting_weights: Vec<u64>) -> Self {
+        self.voting_weights = voting_weights;
+        self
+    }
+
+    fn output_count(mut self, output_count: usize) -> Self {
+        self.output_count = output_count;
+        self
+    }
+
+    fn build(self) -> RecoveryModel {
+        let Self {
+            root,
+            voting_weights,
+            output_count,
+        } = self;
         let voting_weights = voting_weights
             .into_iter()
             .map(NativeVotingWeight::new)
@@ -138,6 +166,7 @@ impl RecoveryModel {
                 &validators,
                 &voting_weights,
                 &node.storage_root,
+                output_count,
             ));
         }
         let chain_messages = (0..nodes.len())
@@ -146,7 +175,7 @@ impl RecoveryModel {
                 input: ChainInput::RecoveryComplete,
             })
             .collect();
-        Self {
+        RecoveryModel {
             validators,
             voting_weights,
             nodes,
@@ -158,9 +187,16 @@ impl RecoveryModel {
                 result_epochs: BTreeSet::new(),
                 party_count: node_count,
             },
+            output_count,
             now: Instant::now(),
             steps: 0,
         }
+    }
+}
+
+impl RecoveryModel {
+    fn new(root: &Path) -> Self {
+        RecoveryModelBuilder::new(root).build()
     }
 
     fn apply(&mut self, step: &ModelStep) {
@@ -277,6 +313,7 @@ impl RecoveryModel {
             &self.validators,
             &self.voting_weights,
             &node.storage_root,
+            self.output_count,
         ));
         self.chain_messages
             .extend(self.chain.events.iter().cloned().map(|event| ChainMessage {
@@ -350,20 +387,29 @@ impl RecoveryModel {
 fn one_to_three_nodes_complete_without_byzantine_tolerance() {
     for node_count in 1..=3 {
         let directory = tempfile::tempdir().unwrap();
-        RecoveryModel::new_with_count(directory.path(), node_count).run_to_completion();
+        RecoveryModelBuilder::new(directory.path())
+            .node_count(node_count)
+            .build()
+            .run_to_completion();
     }
 }
 
 #[test]
 fn asymmetric_voting_weight_uses_independent_quantized_domains() {
     let directory = tempfile::tempdir().unwrap();
-    RecoveryModel::new_with_weights(directory.path(), vec![4, 3, 2, 1]).run_to_completion();
+    RecoveryModelBuilder::new(directory.path())
+        .voting_weights(vec![4, 3, 2, 1])
+        .build()
+        .run_to_completion();
 }
 
 #[test]
 fn seven_equal_stake_nodes_complete_with_quantized_dealers() {
     let directory = tempfile::tempdir().unwrap();
-    RecoveryModel::new_with_count(directory.path(), 7).run_to_completion();
+    RecoveryModelBuilder::new(directory.path())
+        .node_count(7)
+        .build()
+        .run_to_completion();
 }
 
 fn recovery_step() -> impl Strategy<Value = ModelStep> {
@@ -401,7 +447,9 @@ proptest! {
     #[test]
     fn four_nodes_finish_after_random_memory_loss(schedule in recovery_schedule()) {
         let directory = tempfile::tempdir().unwrap();
-        let mut model = RecoveryModel::new(directory.path());
+        let mut model = RecoveryModelBuilder::new(directory.path())
+            .output_count(PROPERTY_OUTPUT_COUNT)
+            .build();
         for step in &schedule {
             model.apply(step);
         }
@@ -463,6 +511,7 @@ fn start_runtime(
     validators: &[NodeId<CertificateSignaturePubKey<NopSignature>>],
     voting_weights: &[NativeVotingWeight],
     storage_root: &Path,
+    output_count: usize,
 ) -> NodeRuntime {
     let mapping = DkgPeerMap::<NopSignature>::new_ordered(validators.to_vec()).unwrap();
     let self_party = mapping.party_id(&self_id).unwrap();
@@ -483,6 +532,7 @@ fn start_runtime(
         self_party,
         mapping,
         voting_weights: voting_weights.to_vec(),
+        output_count,
         engine_seed,
         key_material: test_registered_key_material(self_party, validators.len(), TEST_EPOCH),
         recovery_wal,

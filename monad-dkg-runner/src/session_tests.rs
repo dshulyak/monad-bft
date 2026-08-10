@@ -165,6 +165,7 @@ fn test_session(
         self_party,
         mapping,
         voting_weights: vec![NativeVotingWeight::new(1); validators.len()],
+        output_count: DKG_BATCH_SIZE,
         engine_seed,
         key_material: test_registered_key_material(self_party, 4, epoch),
         recovery_wal: wal,

@@ -292,18 +292,15 @@ where
             self.chain.submitter.cancel_registration(previous);
         }
         self.chain.registration.start_epoch(epoch);
-        self.schedule_local_registration_read();
+        self.settle_chain();
     }
 
     /// Makes one more finalized block available to the active chain cursor.
     /// This never establishes or changes the recovery snapshot boundary.
     pub fn notify_finalized(&mut self, block: SeqNum) {
-        if self.record_finalized_head(block) {
-            self.schedule_pending_registration_reads();
-            self.schedule_local_registration_read();
-        }
+        self.record_finalized_head(block);
         self.chain.event_reader.notify_finalized(block);
-        self.schedule_chain_read();
+        self.settle_chain();
     }
 
     /// Establishes the exact chain-state boundary used for DKG recovery.
@@ -318,21 +315,18 @@ where
         self.record_finalized_head(block);
         self.chain.event_reader.notify_finalized(block);
         if let Some((epoch, party_count)) = self.chain_session {
-            self.chain.submitter.start_session(epoch);
             self.chain.event_reader.start_session(ChainEventSession {
                 epoch,
                 party_count,
                 recovery_block: block,
             });
         }
-        self.schedule_chain_read();
-        self.schedule_pending_registration_reads();
-        self.schedule_local_registration_read();
+        self.settle_chain();
     }
 
-    fn record_finalized_head(&mut self, block: SeqNum) -> bool {
+    fn record_finalized_head(&mut self, block: SeqNum) {
         if self.latest_finalized.is_some_and(|latest| block <= latest) {
-            return false;
+            return;
         }
         self.latest_finalized = Some(block);
         if let Some((_, pending)) = self.pending_registered_session.as_mut() {
@@ -340,7 +334,6 @@ where
                 pending.registration_block = Some(block);
             }
         }
-        true
     }
 
     /// Begins a production DKG session whose public key material is loaded from
@@ -368,7 +361,7 @@ where
                 registration_block: self.latest_finalized,
             },
         ));
-        self.schedule_pending_registration_reads();
+        self.settle_chain();
         Ok(())
     }
 
@@ -379,7 +372,13 @@ where
         }
     }
 
-    fn schedule_local_registration_read(&mut self) {
+    fn settle_chain(&mut self) {
+        self.reconcile_local_registration();
+        self.start_pending_registered_session();
+        self.read_chain_events();
+    }
+
+    fn reconcile_local_registration(&mut self) {
         if self.sync_block.is_none() {
             return;
         }
@@ -485,12 +484,10 @@ where
                 LocalRegistrationPhase::Done => {}
             }
         }
-
-        self.schedule_pending_registration_reads();
         Ok(())
     }
 
-    fn schedule_pending_registration_reads(&mut self) {
+    fn start_pending_registered_session(&mut self) {
         if self.sync_block.is_none() {
             return;
         }
@@ -589,6 +586,9 @@ where
             return Ok(());
         };
         self.latest_started_epoch = Some(epoch);
+        if let Some((retired_epoch, _)) = self.sessions[0].as_ref() {
+            self.chain.submitter.retire_epoch(*retired_epoch);
+        }
         self.sessions.rotate_left(1);
         self.sessions[1] = Some((epoch, session));
         self.start_chain_session(epoch, party_count, recovery_block);
@@ -602,7 +602,6 @@ where
         recovery_block: Option<SeqNum>,
     ) {
         self.chain_session = Some((epoch, party_count));
-        self.chain.submitter.start_session(epoch);
         if let Some(recovery_block) = recovery_block {
             self.chain.event_reader.start_session(ChainEventSession {
                 epoch,
@@ -610,7 +609,6 @@ where
                 recovery_block,
             });
         }
-        self.schedule_chain_read();
     }
 
     pub fn handle_timer(&mut self, now: Instant) {
@@ -688,6 +686,8 @@ where
     }
 
     fn submit_chain_calls(&mut self, epoch: Epoch, calls: Vec<dkg_protocol::ChainCall>) {
+        // DkgSession exposes no engine effects until chain recovery finishes,
+        // so transaction submission does not need a second recovery gate.
         for call in calls {
             failpoint::failpoint!(
                 name = "dkg.chain.call_buffered",
@@ -698,7 +698,7 @@ where
         }
     }
 
-    fn schedule_chain_read(&mut self) {
+    fn read_chain_events(&mut self) {
         loop {
             let Some(read) = self.chain.event_reader.next_read() else {
                 return;
@@ -750,12 +750,9 @@ where
         let calls = self.take_session_effects(epoch);
         // Apply the observed events before their engine-generated calls so
         // recovery cannot resubmit an effect that this same batch finalized.
-        self.chain.submitter.finalized_block(
-            epoch,
-            batch.block,
-            batch.events,
-            batch.recovery_complete_after,
-        );
+        self.chain
+            .submitter
+            .finalized_block(epoch, batch.block, batch.events);
         self.submit_chain_calls(epoch, calls);
         Ok(())
     }
