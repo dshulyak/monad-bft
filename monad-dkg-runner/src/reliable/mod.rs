@@ -216,6 +216,20 @@ where
                 .remove(&(recipient.deadline, message_id.clone(), to));
         }
     }
+
+    pub(crate) fn acknowledge(&mut self, message_id: &MessageId, from: Peer) {
+        let Some(message) = self.messages.get_mut(message_id) else {
+            return;
+        };
+        let Some(recipient) = message.recipients.remove(&from) else {
+            return;
+        };
+        self.deadlines
+            .remove(&(recipient.deadline, message_id.clone(), from));
+        if message.recipients.is_empty() {
+            self.messages.remove(message_id);
+        }
+    }
 }
 
 struct PendingMessage<Peer, Payload, Scope> {

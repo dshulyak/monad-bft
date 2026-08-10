@@ -135,7 +135,16 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
 
     for _ in 0..2 {
         session
-            .handle_network_message(sender, payload.clone())
+            .handle_network_message(
+                sender,
+                DeliveryMessage::Data {
+                    message_id: DkgMessageId::single(DkgMessageKey::PcAck {
+                        dealer: PartyId(0),
+                        signer: PartyId(1),
+                    }),
+                    payload: payload.clone(),
+                },
+            )
             .unwrap();
     }
 

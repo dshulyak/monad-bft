@@ -1,5 +1,5 @@
 use dkg_protocol::DkgMessageKind;
-use monad_crypto::{NopPubKey, NopSignature, certificate_signature::PubKey};
+use monad_crypto::{certificate_signature::PubKey, NopPubKey, NopSignature};
 
 use super::*;
 
@@ -22,15 +22,41 @@ fn peer_map_authenticates_configured_validators() {
 
 #[test]
 fn delivery_envelope_round_trips() {
-    let encoded: Bytes = DeliveryEnvelope {
-        epoch: 8,
-        payload: Bytes::from_static(b"message"),
-    }
-    .into();
+    let message_id = DkgMessageId::single(DkgMessageKey::BveProposal { dealer: PartyId(1) });
+    let encoded: Bytes =
+        DeliveryEnvelope::data(Epoch(8), message_id.clone(), Bytes::from_static(b"message")).into();
 
     let decoded: DeliveryEnvelope = encoded.as_ref().try_into().unwrap();
-    assert_eq!(decoded.epoch, 8);
-    assert_eq!(decoded.payload, Bytes::from_static(b"message"));
+    assert_eq!(decoded.epoch, Epoch(8));
+    let DeliveryMessage::Data {
+        message_id: decoded_id,
+        payload,
+    } = decoded.message
+    else {
+        panic!("expected reliable DKG data");
+    };
+    assert_eq!(decoded_id, message_id);
+    assert_eq!(payload, Bytes::from_static(b"message"));
+}
+
+#[test]
+fn acknowledgement_envelope_is_one_shot_control_traffic() {
+    let message_id = DkgMessageId::single(DkgMessageKey::BveProposal { dealer: PartyId(1) });
+    let encoded: Bytes = DeliveryEnvelope::ack(Epoch(8), message_id.clone()).into();
+
+    let decoded: DeliveryEnvelope = encoded.as_ref().try_into().unwrap();
+    assert_eq!(decoded.epoch, Epoch(8));
+    let DeliveryMessage::Ack(decoded_id) = decoded.message else {
+        panic!("expected DKG acknowledgement");
+    };
+    assert_eq!(decoded_id, message_id);
+}
+
+#[test]
+fn transport_acknowledgements_do_not_replace_sync_responses() {
+    assert!(requires_transport_ack(DkgDeliveryPolicy::Durable));
+    assert!(!requires_transport_ack(DkgDeliveryPolicy::Retry));
+    assert!(!requires_transport_ack(DkgDeliveryPolicy::Once));
 }
 
 #[test]

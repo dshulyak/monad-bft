@@ -2,12 +2,13 @@ use std::{mem, path::PathBuf, sync::Arc, time::Instant};
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
-use dkg_protocol::{ChainEvent, RegistrationCall};
+use dkg_protocol::{ChainEvent, DkgMessageCodecError, DkgMessageId, RegistrationCall};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_executor::ExecutorMetrics;
 use monad_types::{Epoch, NodeId, SeqNum};
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -44,24 +45,113 @@ impl<ST: CertificateSignatureRecoverable>
     }
 }
 
+const DELIVERY_DATA: u8 = 1;
+const DELIVERY_UNACKNOWLEDGED: u8 = 2;
+const DELIVERY_ACK: u8 = 3;
+
 #[derive(RlpEncodable, RlpDecodable)]
+struct DeliveryWire {
+    epoch: u64,
+    kind: u8,
+    message_id: Bytes,
+    payload: Bytes,
+}
+
+pub(crate) enum DeliveryMessage {
+    Data {
+        message_id: DkgMessageId,
+        payload: Bytes,
+    },
+    Unacknowledged(Bytes),
+    Ack(DkgMessageId),
+}
+
 pub(crate) struct DeliveryEnvelope {
-    pub(crate) epoch: u64,
-    pub(crate) payload: Bytes,
+    pub(crate) epoch: Epoch,
+    pub(crate) message: DeliveryMessage,
+}
+
+impl DeliveryEnvelope {
+    pub(crate) fn data(epoch: Epoch, message_id: DkgMessageId, payload: Bytes) -> Self {
+        Self {
+            epoch,
+            message: DeliveryMessage::Data {
+                message_id,
+                payload,
+            },
+        }
+    }
+
+    pub(crate) fn unacknowledged(epoch: Epoch, payload: Bytes) -> Self {
+        Self {
+            epoch,
+            message: DeliveryMessage::Unacknowledged(payload),
+        }
+    }
+
+    pub(crate) fn ack(epoch: Epoch, message_id: DkgMessageId) -> Self {
+        Self {
+            epoch,
+            message: DeliveryMessage::Ack(message_id),
+        }
+    }
 }
 
 impl From<DeliveryEnvelope> for Bytes {
     fn from(wire: DeliveryEnvelope) -> Self {
-        alloy_rlp::encode(wire).into()
+        let (kind, message_id, payload) = match wire.message {
+            DeliveryMessage::Data {
+                message_id,
+                payload,
+            } => (DELIVERY_DATA, message_id.encode(), payload),
+            DeliveryMessage::Unacknowledged(payload) => {
+                (DELIVERY_UNACKNOWLEDGED, Bytes::new(), payload)
+            }
+            DeliveryMessage::Ack(message_id) => (DELIVERY_ACK, message_id.encode(), Bytes::new()),
+        };
+        alloy_rlp::encode(DeliveryWire {
+            epoch: wire.epoch.0,
+            kind,
+            message_id,
+            payload,
+        })
+        .into()
     }
 }
 
 impl TryFrom<&[u8]> for DeliveryEnvelope {
-    type Error = alloy_rlp::Error;
+    type Error = DeliveryEnvelopeError;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        alloy_rlp::decode_exact(data)
+        let wire = alloy_rlp::decode_exact::<DeliveryWire>(data)?;
+        let message = match wire.kind {
+            DELIVERY_DATA if !wire.payload.is_empty() => DeliveryMessage::Data {
+                message_id: DkgMessageId::decode(&wire.message_id)?,
+                payload: wire.payload,
+            },
+            DELIVERY_UNACKNOWLEDGED if wire.message_id.is_empty() && !wire.payload.is_empty() => {
+                DeliveryMessage::Unacknowledged(wire.payload)
+            }
+            DELIVERY_ACK if wire.payload.is_empty() => {
+                DeliveryMessage::Ack(DkgMessageId::decode(&wire.message_id)?)
+            }
+            _ => return Err(DeliveryEnvelopeError::InvalidKind(wire.kind)),
+        };
+        Ok(Self {
+            epoch: Epoch(wire.epoch),
+            message,
+        })
     }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum DeliveryEnvelopeError {
+    #[error("invalid RLP: {0}")]
+    Rlp(#[from] alloy_rlp::Error),
+    #[error("invalid DKG message ID: {0}")]
+    MessageId(#[from] DkgMessageCodecError),
+    #[error("invalid DKG delivery kind {0}")]
+    InvalidKind(u8),
 }
 
 struct ManagedChain {
@@ -703,7 +793,7 @@ where
                 return;
             }
         };
-        let epoch = Epoch(wire.epoch);
+        let epoch = wire.epoch;
         let Some(session) = self
             .sessions
             .iter_mut()
@@ -712,12 +802,15 @@ where
         else {
             return;
         };
+        let is_acknowledgement = matches!(&wire.message, DeliveryMessage::Ack(_));
         if let Err(err) = session
             .protocol
-            .handle_network_message(sender, wire.payload)
+            .handle_network_message(sender, wire.message)
         {
             self.metrics.protocol_error();
             error!(?err, ?sender, "failed to process DKG network message");
+        } else if is_acknowledgement {
+            self.metrics.acknowledgements_received.inc();
         }
         self.collect_session_effects(epoch);
         self.update_session_metrics();
@@ -759,6 +852,10 @@ where
         for effect in effects {
             match effect {
                 SessionEffect::Network(delivery) => self.pending_outbound.push(delivery),
+                SessionEffect::Acknowledgement(delivery) => {
+                    self.metrics.acknowledgements_sent.inc();
+                    self.pending_outbound.push(delivery);
+                }
                 SessionEffect::Chain(call) => {
                     failpoint::failpoint!(
                         name = "dkg.chain.call_buffered",

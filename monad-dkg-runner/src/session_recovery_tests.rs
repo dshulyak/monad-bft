@@ -240,7 +240,7 @@ impl RecoveryModel {
             };
             for effect in runtime.session.take_effects() {
                 match effect {
-                    SessionEffect::Network(outbound) => {
+                    SessionEffect::Network(outbound) | SessionEffect::Acknowledgement(outbound) => {
                         self.network.push_back(NetworkMessage { source, outbound });
                     }
                     SessionEffect::Chain(call) => {
@@ -276,7 +276,7 @@ impl RecoveryModel {
             let envelope: DeliveryEnvelope = message.outbound.payload.as_ref().try_into().unwrap();
             runtime
                 .session
-                .handle_network_message(self.validators[message.source], envelope.payload)
+                .handle_network_message(self.validators[message.source], envelope.message)
                 .unwrap();
         }
     }

@@ -32,7 +32,7 @@ use crate::{
     recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
     registration::RegisteredSession,
     reliable::{EnqueueError, ObsolescencePolicy, RetryConfig, RetryScheduler},
-    runner::{DeliveryEnvelope, DeliveryOutbound},
+    runner::{DeliveryEnvelope, DeliveryMessage, DeliveryOutbound},
     DkgError,
 };
 
@@ -283,6 +283,7 @@ where
     ST: CertificateSignatureRecoverable,
 {
     Network(DeliveryOutbound<ST>),
+    Acknowledgement(DeliveryOutbound<ST>),
     Chain(Box<ChainCall>),
 }
 
@@ -292,10 +293,14 @@ enum PendingEngineInput {
 }
 
 enum PendingPeerInput {
-    WithoutWalWrite(CoreInput<DkgMessage>),
+    WithoutWalWrite {
+        input: CoreInput<DkgMessage>,
+        acknowledgement: Option<DkgMessageId>,
+    },
     PersistAfterApply {
         input: CoreInput<DkgMessage>,
         record: IncomingRecord,
+        acknowledgement: Option<DkgMessageId>,
     },
 }
 
@@ -371,7 +376,7 @@ where
     pub(crate) fn handle_network_message(
         &mut self,
         sender: NodeId<CertificateSignaturePubKey<ST>>,
-        payload: Bytes,
+        message: DeliveryMessage,
     ) -> Result<(), SessionError> {
         let Some(from) = self.mapping.party_id(&sender) else {
             warn!(
@@ -381,7 +386,18 @@ where
             );
             return Ok(());
         };
-        self.handle_data_payload(from, payload)?;
+        match message {
+            DeliveryMessage::Data {
+                message_id,
+                payload,
+            } => self.handle_data_payload(from, payload, Some(message_id))?,
+            DeliveryMessage::Unacknowledged(payload) => {
+                self.handle_data_payload(from, payload, None)?
+            }
+            DeliveryMessage::Ack(message_id) => {
+                self.retries.acknowledge(&message_id, sender);
+            }
+        }
         self.settle()?;
         Ok(())
     }
@@ -456,7 +472,12 @@ where
         Ok(())
     }
 
-    fn handle_data_payload(&mut self, from: PartyId, payload: Bytes) -> Result<(), SessionError> {
+    fn handle_data_payload(
+        &mut self,
+        from: PartyId,
+        payload: Bytes,
+        acknowledgement: Option<DkgMessageId>,
+    ) -> Result<(), SessionError> {
         let message = match DkgMessage::decode(payload) {
             Ok(message) => message,
             Err(err) => {
@@ -468,22 +489,52 @@ where
                 return Ok(());
             }
         };
-        if message.kind().is_sync() {
-            if let Err(err) = message.identity(
-                from,
-                self.self_party,
-                self.party_count,
-                self.max_ladder_level,
-            ) {
+        let identity = match message.identity(
+            from,
+            self.self_party,
+            self.party_count,
+            self.max_ladder_level,
+        ) {
+            Ok(identity) => identity,
+            Err(err) => {
                 warn!(
                     ?err,
                     from_party = from.0,
-                    "rejected invalid DKG sync message identity"
+                    "rejected invalid DKG message identity"
                 );
                 return Ok(());
             }
+        };
+        // Sync requests are completed by their application response, not their
+        // transport ACK: otherwise a lost one-shot response would strand them.
+        let requires_ack = requires_transport_ack(message.delivery_policy());
+        if requires_ack != acknowledgement.is_some() {
+            warn!(
+                from_party = from.0,
+                kind = ?message.kind(),
+                "rejected DKG message with inconsistent delivery policy"
+            );
+            return Ok(());
+        }
+        if acknowledgement.as_ref().is_some_and(|message_id| {
+            !identity
+                .keys
+                .iter()
+                .all(|key| message_id.keys().contains(key))
+        }) {
+            warn!(
+                from_party = from.0,
+                kind = ?message.kind(),
+                "rejected DKG message with inconsistent delivery ID"
+            );
+            return Ok(());
+        }
+        if message.kind().is_sync() {
             self.pending_inputs.push_back(PendingEngineInput::Peer(
-                PendingPeerInput::WithoutWalWrite(CoreInput::new(from, message)),
+                PendingPeerInput::WithoutWalWrite {
+                    input: CoreInput::new(from, message),
+                    acknowledgement,
+                },
             ));
             return Ok(());
         }
@@ -495,6 +546,7 @@ where
             PendingPeerInput::PersistAfterApply {
                 input: CoreInput::new(from, message),
                 record,
+                acknowledgement,
             },
         ));
         Ok(())
@@ -524,9 +576,16 @@ where
     }
 
     fn process_peer_input(&mut self, peer: PendingPeerInput) -> Result<bool, SessionError> {
-        let (input, record) = match peer {
-            PendingPeerInput::WithoutWalWrite(input) => (input, None),
-            PendingPeerInput::PersistAfterApply { input, record } => (input, Some(record)),
+        let (input, record, acknowledgement) = match peer {
+            PendingPeerInput::WithoutWalWrite {
+                input,
+                acknowledgement,
+            } => (input, None, acknowledgement),
+            PendingPeerInput::PersistAfterApply {
+                input,
+                record,
+                acknowledgement,
+            } => (input, Some(record), acknowledgement),
         };
         let source = input.source;
         let completed_request =
@@ -534,6 +593,9 @@ where
         let effects = match self.engine.handle_peer_event(input) {
             Ok(effects) => effects,
             Err(DkgEngineError::Duplicate) => {
+                if let Some(message_id) = acknowledgement {
+                    self.send_ack(source, message_id)?;
+                }
                 debug!(source = source.0, "ignored duplicate DKG peer input");
                 return Ok(false);
             }
@@ -570,7 +632,26 @@ where
             );
         }
         self.dispatch_effects(effects)?;
+        if let Some(message_id) = acknowledgement {
+            self.send_ack(source, message_id)?;
+        }
         Ok(true)
+    }
+
+    fn send_ack(&mut self, target: PartyId, message_id: DkgMessageId) -> Result<(), SessionError> {
+        let to = self
+            .mapping
+            .member_id(target)
+            .ok_or(SessionError::UnknownParty {
+                action: "acknowledge message to",
+                party: target.0,
+            })?;
+        self.effects
+            .push(SessionEffect::Acknowledgement(DeliveryOutbound {
+                to,
+                payload: DeliveryEnvelope::ack(self.epoch, message_id).into(),
+            }));
+        Ok(())
     }
 
     fn dispatch_effects(
@@ -595,6 +676,7 @@ where
                             PendingPeerInput::PersistAfterApply {
                                 input: CoreInput::new(self.self_party, payload.clone()),
                                 record,
+                                acknowledgement: None,
                             },
                         ));
                     }
@@ -624,10 +706,10 @@ where
                 continue;
             }
             self.pending_inputs.push_back(PendingEngineInput::Peer(
-                PendingPeerInput::WithoutWalWrite(CoreInput::new(
-                    record.source,
-                    record.message.into_message(),
-                )),
+                PendingPeerInput::WithoutWalWrite {
+                    input: CoreInput::new(record.source, record.message.into_message()),
+                    acknowledgement: None,
+                },
             ));
         }
     }
@@ -682,10 +764,11 @@ where
                 self.self_party,
                 first_recipient,
             );
-            let payload = DeliveryEnvelope {
-                epoch: self.epoch.0,
-                payload: message.into_message().into_bytes(),
-            }
+            let payload = DeliveryEnvelope::data(
+                self.epoch,
+                message_id.clone(),
+                message.into_message().into_bytes(),
+            )
             .into();
             self.effects.extend(
                 self.retries
@@ -736,19 +819,17 @@ where
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let delivery_payload = DeliveryEnvelope {
-            epoch: self.epoch.0,
-            payload: message.as_bytes().clone(),
-        }
-        .into();
         match policy {
             DkgDeliveryPolicy::Once => {
                 self.effects.push(SessionEffect::Network(DeliveryOutbound {
                     to: delivery_recipients[0],
-                    payload: delivery_payload,
+                    payload: DeliveryEnvelope::unacknowledged(self.epoch, message.into_bytes())
+                        .into(),
                 }));
             }
             DkgDeliveryPolicy::Retry => {
+                let delivery_payload =
+                    DeliveryEnvelope::unacknowledged(self.epoch, message.into_bytes()).into();
                 self.effects.extend(
                     self.retries
                         .enqueue(
@@ -763,6 +844,12 @@ where
                 );
             }
             DkgDeliveryPolicy::Durable => {
+                let delivery_payload = DeliveryEnvelope::data(
+                    self.epoch,
+                    message_id.clone(),
+                    message.as_bytes().clone(),
+                )
+                .into();
                 let abort_group = delivery_abort_group_for_peer_payload(
                     message.kind(),
                     self.self_party,
@@ -923,6 +1010,10 @@ fn delivery_abort_group_for_chain_call(call: &ChainCall) -> Option<DeliveryAbort
         ChainCall::PostDkgResult { .. } => Some(DeliveryAbortGroup::DoneQc),
         ChainCall::PostRegistration { .. } => None,
     }
+}
+
+fn requires_transport_ack(policy: DkgDeliveryPolicy) -> bool {
+    policy == DkgDeliveryPolicy::Durable
 }
 
 fn delivery_abort_group_for_chain_event(event: &ChainEvent) -> DeliveryAbortGroup {

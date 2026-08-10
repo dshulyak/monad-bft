@@ -36,6 +36,8 @@ define_metrics! {
     results_finalized => RESULTS_FINALIZED("monad.dkg.results_finalized_total", "DKG result epochs first observed finalized since process start"),
     pending_network_retries => PENDING_NETWORK_RETRIES("monad.dkg.pending_network_retries", "DKG peer deliveries currently scheduled for retry"),
     network_retries => NETWORK_RETRIES("monad.dkg.network_retries_total", "DKG peer delivery retries sent since process start"),
+    acknowledgements_sent => ACKNOWLEDGEMENTS_SENT("monad.dkg.acknowledgements_sent_total", "One-shot DKG delivery acknowledgements sent since process start"),
+    acknowledgements_received => ACKNOWLEDGEMENTS_RECEIVED("monad.dkg.acknowledgements_received_total", "Authenticated DKG delivery acknowledgements received since process start"),
     pending_transactions => PENDING_TRANSACTIONS("monad.dkg.pending_transactions", "DKG contract transactions awaiting finalization"),
     transaction_retries => TRANSACTION_RETRIES("monad.dkg.transaction_retries_total", "DKG contract transaction retry attempts since process start"),
     errors => ERRORS("monad.dkg.errors_total", "DKG runner errors since process start"),
@@ -142,6 +144,8 @@ mod tests {
         let metrics = DkgRunnerMetrics::new();
         metrics.set_session_state(2, 7);
         metrics.network_retries(3);
+        metrics.acknowledgements_sent.inc();
+        metrics.acknowledgements_received.inc();
         let transactions = metrics.transaction();
         transactions.set_pending(4);
         transactions.retry();
@@ -156,6 +160,8 @@ mod tests {
         assert_eq!(value(RETAINED_SESSIONS.name), 2);
         assert_eq!(value(PENDING_NETWORK_RETRIES.name), 7);
         assert_eq!(value(NETWORK_RETRIES.name), 3);
+        assert_eq!(value(ACKNOWLEDGEMENTS_SENT.name), 1);
+        assert_eq!(value(ACKNOWLEDGEMENTS_RECEIVED.name), 1);
         assert_eq!(value(PENDING_TRANSACTIONS.name), 4);
         assert_eq!(value(TRANSACTION_RETRIES.name), 1);
     }

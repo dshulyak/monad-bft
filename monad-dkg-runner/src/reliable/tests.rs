@@ -158,3 +158,22 @@ fn completed_message_has_no_more_retries() {
     assert!(outbox.deadlines.is_empty());
     assert!(outbox.next_timer().is_none());
 }
+
+#[test]
+fn acknowledgement_completes_only_the_confirming_recipient() {
+    let now = Instant::now();
+    let mut outbox = outbox();
+    outbox
+        .enqueue(1, [2, 3], "message", Some(Scope::Item(1)), now)
+        .unwrap();
+
+    outbox.acknowledge(&1, 2);
+
+    assert_eq!(outbox.pending_count(), 1);
+    assert!(!outbox.messages[&1].recipients.contains_key(&2));
+    assert!(outbox.messages[&1].recipients.contains_key(&3));
+
+    outbox.acknowledge(&1, 3);
+    assert!(!outbox.messages.contains_key(&1));
+    assert!(outbox.next_timer().is_none());
+}
