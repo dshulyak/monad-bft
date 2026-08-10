@@ -10,13 +10,19 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use dkg_crypto::BLS_G2_SERIALIZED_BYTES;
 use dkg_protocol::{encode_registration, ChainCall, ChainEvent, RegistrationCall};
-use monad_eth_types::buffered_base_fee_per_gas;
 use monad_types::{Epoch, Nonce, SeqNum};
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
-use super::{chain_call_kind, ContractRegistration, DkgChain, DkgChainConfig, DkgContract};
+use super::{
+    chain_call_kind, ContractRegistration, DkgChain, DkgChainConfig, DkgContract,
+    DkgTransactionContext,
+};
 use crate::DkgError;
+
+mod logic;
+
+use logic::{decide_refresh, PreparedTransaction, RefreshDecision};
 
 type TxKey = (Epoch, ChainTxId);
 
@@ -159,9 +165,22 @@ impl TxSubmitter {
                 .pending
                 .get(&key)
                 .expect("selected DKG submission remains pending");
+            let context = match self.submission.read_context(context_block) {
+                Ok(context) => context,
+                Err(source) => {
+                    let call_kind = chain_call_kind(call);
+                    warn!(
+                        ?source,
+                        block = context_block.0,
+                        call_kind,
+                        "failed to read DKG transaction context; will retry"
+                    );
+                    return;
+                }
+            };
             match self
                 .submission
-                .refresh(context_block, &key, call, &mut self.prepared)
+                .refresh(context, &key, call, &mut self.prepared)
             {
                 Ok(TxRefresh::Ready) => {
                     debug_assert!(self.prepared.is_some());
@@ -182,22 +201,14 @@ impl TxSubmitter {
                     );
                     continue;
                 }
-                Err(error) => {
+                Err(source) => {
                     let call_kind = chain_call_kind(call);
-                    match error {
-                        TxSubmissionError::ChainContext { block, source } => warn!(
-                            ?source,
-                            block = block.0,
-                            call_kind,
-                            "failed to read DKG transaction context; will retry"
-                        ),
-                        TxSubmissionError::Operation(source) => warn!(
-                            ?source,
-                            epoch = key.0 .0,
-                            call_kind,
-                            "failed to prepare DKG chain tx; will retry"
-                        ),
-                    }
+                    warn!(
+                        ?source,
+                        epoch = key.0 .0,
+                        call_kind,
+                        "failed to prepare DKG chain tx; will retry"
+                    );
                     return;
                 }
             }
@@ -288,44 +299,35 @@ enum TxRefresh {
     Obsolete,
 }
 
-#[derive(Debug)]
-enum TxSubmissionError {
-    ChainContext { block: SeqNum, source: DkgError },
-    Operation(DkgError),
-}
-
 impl TxSubmission {
+    fn read_context(&self, block: SeqNum) -> Result<DkgTransactionContext, DkgError> {
+        self.chain.transaction_context(block, self.signer.address())
+    }
+
     fn refresh(
         &self,
-        block: SeqNum,
+        context: DkgTransactionContext,
         key: &TxKey,
         call: &ChainCall,
         prepared: &mut Option<(TxKey, PreparedTx)>,
-    ) -> Result<TxRefresh, TxSubmissionError> {
-        let context = self
-            .chain
-            .transaction_context(block, self.signer.address())
-            .map_err(|source| TxSubmissionError::ChainContext { block, source })?;
-        let max_fee_per_gas = buffered_base_fee_per_gas(u128::from(context.base_fee_per_gas))
-            .saturating_add(self.config.max_priority_fee_per_gas);
+    ) -> Result<TxRefresh, DkgError> {
+        let prepared_transaction = prepared.as_ref().map(|(_, prepared)| PreparedTransaction {
+            nonce: prepared.transaction.nonce(),
+            max_fee_per_gas: prepared.transaction.max_fee_per_gas(),
+        });
+        let max_fee_per_gas = match decide_refresh(
+            prepared_transaction,
+            context,
+            self.config.max_priority_fee_per_gas,
+        ) {
+            RefreshDecision::Obsolete => return Ok(TxRefresh::Obsolete),
+            RefreshDecision::Keep => return Ok(TxRefresh::Ready),
+            RefreshDecision::Prepare { max_fee_per_gas } => max_fee_per_gas,
+        };
 
-        if let Some((_, prepared)) = prepared.as_ref() {
-            if prepared.transaction.nonce() < context.nonce {
-                return Ok(TxRefresh::Obsolete);
-            }
-            // An overlapping epoch may retry against an older context block;
-            // do not replace its prepared transaction with a stale lower nonce.
-            if prepared.transaction.nonce() != context.nonce
-                || prepared.transaction.max_fee_per_gas() >= max_fee_per_gas
-            {
-                return Ok(TxRefresh::Ready);
-            }
-        }
-
-        let transaction = self
-            .config
-            .prepare(&self.signer, context.nonce, max_fee_per_gas, key.0, call)
-            .map_err(TxSubmissionError::Operation)?;
+        let transaction =
+            self.config
+                .prepare(&self.signer, context.nonce, max_fee_per_gas, key.0, call)?;
         *prepared = Some((
             key.clone(),
             PreparedTx {
@@ -336,10 +338,8 @@ impl TxSubmission {
         Ok(TxRefresh::Ready)
     }
 
-    fn submit(&self, prepared: &PreparedTx) -> Result<(), TxSubmissionError> {
-        self.chain
-            .submit_transaction(prepared.transaction.clone())
-            .map_err(TxSubmissionError::Operation)
+    fn submit(&self, prepared: &PreparedTx) -> Result<(), DkgError> {
+        self.chain.submit_transaction(prepared.transaction.clone())
     }
 }
 

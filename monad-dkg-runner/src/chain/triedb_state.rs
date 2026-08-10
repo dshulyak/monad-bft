@@ -3,6 +3,8 @@
 //! Recovery orchestration lives in `monad-dkg-runner`; this module only maps
 //! one requested finalized state boundary to protocol chain events.
 
+use std::marker::PhantomData;
+
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_primitives::{Address, Signature, TxKind, U256};
 use alloy_sol_types::SolCall;
@@ -82,90 +84,212 @@ pub(super) struct TriedbDkgStateReader {
     execution_delay: SeqNum,
 }
 
-#[derive(Default)]
-struct RecordSnapshot {
-    total: Option<u64>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VmStateObservation {
+    latest_finalized: Option<SeqNum>,
+    block_gas_limit: u64,
+    contract_exists: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DkgVmContext {
+    block: SeqNum,
+    gas_limit: u64,
+}
+
+impl VmStateObservation {
+    fn validate(
+        self,
+        block: SeqNum,
+        execution_delay: SeqNum,
+        contract: Address,
+    ) -> Result<DkgVmContext, TriedbStateError> {
+        let required_head = SeqNum(block.0.saturating_add(execution_delay.0));
+        if self
+            .latest_finalized
+            .is_none_or(|latest| latest < required_head)
+        {
+            return Err(TriedbStateError::NotAvailable { block: block.0 });
+        }
+        if !self.contract_exists {
+            return Err(TriedbStateError::ContractMissing {
+                contract,
+                block: block.0,
+            });
+        }
+        Ok(DkgVmContext {
+            block,
+            gas_limit: DKG_ETH_CALL_GAS_LIMIT.min(self.block_gas_limit),
+        })
+    }
+}
+
+struct ExecutedCall<C> {
+    block: SeqNum,
+    result: CallResult,
+    call: PhantomData<fn() -> C>,
+}
+
+impl<C: SolCall> ExecutedCall<C> {
+    fn decode(self) -> Result<C::Return, TriedbStateError> {
+        match self.result {
+            CallResult::Success(success) => {
+                C::abi_decode_returns(&success.output_data).map_err(|source| {
+                    TriedbStateError::CallDecode {
+                        signature: C::SIGNATURE,
+                        block: self.block.0,
+                        source,
+                    }
+                })
+            }
+            CallResult::Failure(failure) => Err(TriedbStateError::CallFailed {
+                block: self.block.0,
+                message: failure.message,
+                error_code: failure.error_code,
+            }),
+            CallResult::Revert(revert) => Err(TriedbStateError::CallReverted {
+                block: self.block.0,
+                trace_len: revert.trace.len(),
+            }),
+        }
+    }
+}
+
+struct FirstRecordPage;
+
+struct RemainingRecordPages {
+    total: u64,
     next: u64,
     events: Vec<ChainEvent>,
 }
 
-impl RecordSnapshot {
+enum RecordPageProgress {
+    More(RemainingRecordPages),
+    Complete(Vec<ChainEvent>),
+}
+
+impl FirstRecordPage {
     fn accept(
-        &mut self,
         page: ContractRecordPage,
         epoch: Epoch,
         party_count: usize,
         limit: u32,
-    ) -> Result<bool, TriedbStateError> {
-        let start = self.next;
-        let ContractRecordPage {
+    ) -> Result<RecordPageProgress, TriedbStateError> {
+        let total = page.total;
+        let capacity = usize::try_from(total)
+            .map_err(|_| TriedbStateError::CountOverflow { kind: "record" })?;
+        let (next, events) = decode_record_page(page, epoch, party_count, limit, 0, None)?;
+        Ok(finish_record_page(
             total,
             next,
-            pcQcs,
-            bveQcs,
-            results,
-        } = page;
-        if let Some(expected) = self.total {
-            if total != expected {
-                return Err(TriedbStateError::RecordTotalChanged {
-                    expected,
-                    actual: total,
-                });
-            }
-        } else {
-            let count = usize::try_from(total)
-                .map_err(|_| TriedbStateError::CountOverflow { kind: "record" })?;
-            self.events.reserve(count);
-            self.total = Some(total);
-        }
-        if next < start
-            || next > total
-            || next - start > u64::from(limit)
-            || (next == start && start != total)
-        {
-            return Err(TriedbStateError::InvalidRecordPage { start, next, total });
-        }
+            Vec::with_capacity(capacity),
+            events,
+        ))
+    }
+}
 
-        let expected_count =
-            usize::try_from(next - start).map_err(|_| TriedbStateError::CountOverflow {
-                kind: "record page",
-            })?;
-        let mut page_events = Vec::with_capacity(expected_count);
-        for record in pcQcs {
-            page_events.push(
-                record
-                    .qc
-                    .into_chain_event(RecordId(record.sequence), party_count)
-                    .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?,
-            );
-        }
-        for record in bveQcs {
-            page_events.push(
-                record
-                    .qc
-                    .into_chain_event(RecordId(record.sequence), party_count)
-                    .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?,
-            );
-        }
-        for record in results {
-            let event = record
-                .result
-                .into_chain_event(RecordId(record.sequence), SessionId(epoch.0), party_count)
-                .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?;
-            page_events.push(event);
-        }
-        page_events.sort_unstable_by_key(|event| event.record_id());
-        if page_events.len() != expected_count
-            || page_events.iter().enumerate().any(|(offset, event)| {
-                event.record_id().0
-                    != start + u64::try_from(offset).expect("record page length fits in u64")
-            })
-        {
-            return Err(TriedbStateError::InvalidRecordPage { start, next, total });
-        }
-        self.events.extend(page_events);
-        self.next = next;
-        Ok(next == total)
+impl RemainingRecordPages {
+    fn next(&self) -> u64 {
+        self.next
+    }
+
+    fn accept(
+        self,
+        page: ContractRecordPage,
+        epoch: Epoch,
+        party_count: usize,
+        limit: u32,
+    ) -> Result<RecordPageProgress, TriedbStateError> {
+        let (next, events) =
+            decode_record_page(page, epoch, party_count, limit, self.next, Some(self.total))?;
+        Ok(finish_record_page(self.total, next, self.events, events))
+    }
+}
+
+fn decode_record_page(
+    page: ContractRecordPage,
+    epoch: Epoch,
+    party_count: usize,
+    limit: u32,
+    start: u64,
+    expected_total: Option<u64>,
+) -> Result<(u64, Vec<ChainEvent>), TriedbStateError> {
+    let ContractRecordPage {
+        total,
+        next,
+        pcQcs,
+        bveQcs,
+        results,
+    } = page;
+    if let Some(expected) = expected_total.filter(|expected| *expected != total) {
+        return Err(TriedbStateError::RecordTotalChanged {
+            expected,
+            actual: total,
+        });
+    }
+    if next < start
+        || next > total
+        || next - start > u64::from(limit)
+        || (next == start && start != total)
+    {
+        return Err(TriedbStateError::InvalidRecordPage { start, next, total });
+    }
+
+    let expected_count =
+        usize::try_from(next - start).map_err(|_| TriedbStateError::CountOverflow {
+            kind: "record page",
+        })?;
+    let mut page_events = Vec::with_capacity(expected_count);
+    for record in pcQcs {
+        page_events.push(
+            record
+                .qc
+                .into_chain_event(RecordId(record.sequence), party_count)
+                .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?,
+        );
+    }
+    for record in bveQcs {
+        page_events.push(
+            record
+                .qc
+                .into_chain_event(RecordId(record.sequence), party_count)
+                .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?,
+        );
+    }
+    for record in results {
+        let event = record
+            .result
+            .into_chain_event(RecordId(record.sequence), SessionId(epoch.0), party_count)
+            .map_err(|_| TriedbStateError::InvalidRecordPage { start, next, total })?;
+        page_events.push(event);
+    }
+    page_events.sort_unstable_by_key(|event| event.record_id());
+    if page_events.len() != expected_count
+        || page_events.iter().enumerate().any(|(offset, event)| {
+            event.record_id().0
+                != start + u64::try_from(offset).expect("record page length fits in u64")
+        })
+    {
+        return Err(TriedbStateError::InvalidRecordPage { start, next, total });
+    }
+    Ok((next, page_events))
+}
+
+fn finish_record_page(
+    total: u64,
+    next: u64,
+    mut accumulated: Vec<ChainEvent>,
+    page: Vec<ChainEvent>,
+) -> RecordPageProgress {
+    accumulated.extend(page);
+    if next == total {
+        RecordPageProgress::Complete(accumulated)
+    } else {
+        RecordPageProgress::More(RemainingRecordPages {
+            total,
+            next,
+            events: accumulated,
+        })
     }
 }
 
@@ -187,18 +311,12 @@ impl TriedbDkgStateReader {
         state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
         block: SeqNum,
         contract: Address,
-    ) -> Result<u64, TriedbStateError>
+    ) -> Result<DkgVmContext, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        let required_head = SeqNum(block.0.saturating_add(self.execution_delay.0));
-        if state_read
-            .raw_read_latest_finalized_block()
-            .is_none_or(|latest| latest < required_head)
-        {
-            return Err(TriedbStateError::NotAvailable { block: block.0 });
-        }
+        let latest_finalized = state_read.raw_read_latest_finalized_block();
         let header = match state_read.get_finalized_block_header(block) {
             Ok(header) => header,
             Err(ExecutionStateReadExtError::NotAvailableYet) => {
@@ -213,13 +331,12 @@ impl TriedbDkgStateReader {
             }
             Err(err) => return Err(err.into()),
         };
-        if account.is_none_or(|account| account.code_hash.is_none()) {
-            return Err(TriedbStateError::ContractMissing {
-                contract,
-                block: block.0,
-            });
+        VmStateObservation {
+            latest_finalized,
+            block_gas_limit: header.0.gas_limit,
+            contract_exists: account.is_some_and(|account| account.code_hash.is_some()),
         }
-        Ok(DKG_ETH_CALL_GAS_LIMIT.min(header.0.gas_limit))
+        .validate(block, self.execution_delay, contract)
     }
 
     pub(super) fn read_registrations<ST, SCT>(
@@ -234,20 +351,21 @@ impl TriedbDkgStateReader {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        let gas_limit = self.state_context(state_read, block, contract)?;
+        let context = self.state_context(state_read, block, contract)?;
 
         let mut registrations = Vec::with_capacity(parties.len());
         for &party in parties {
-            let registration = self.call(
-                state_read,
-                block,
-                contract,
-                gas_limit,
-                DkgContract::registrationOfCall {
-                    epoch: epoch.0,
-                    party,
-                },
-            )?;
+            let registration = self
+                .execute_call(
+                    state_read,
+                    context,
+                    contract,
+                    DkgContract::registrationOfCall {
+                        epoch: epoch.0,
+                        party,
+                    },
+                )?
+                .decode()?;
             registrations.push(
                 registration
                     .exists
@@ -271,8 +389,8 @@ impl TriedbDkgStateReader {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     {
-        let gas_limit = match self.state_context(state_read, block, contract) {
-            Ok(gas_limit) => gas_limit,
+        let context = match self.state_context(state_read, block, contract) {
+            Ok(context) => context,
             Err(TriedbStateError::ContractMissing { .. }) => {
                 return Ok(Vec::new());
             }
@@ -283,34 +401,48 @@ impl TriedbDkgStateReader {
             (RECORD_PAGE_SIGNATURE_BUDGET / party_count.max(1)).clamp(1, MAX_RECORD_PAGE_SIZE),
         )
         .expect("record page size fits in u32");
-        let mut snapshot = RecordSnapshot::default();
-        loop {
-            let page = self.call(
+        let first = self
+            .execute_call(
                 state_read,
-                block,
+                context,
                 contract,
-                gas_limit,
                 DkgContract::recordsCall {
                     epoch: epoch.0,
-                    start: snapshot.next,
+                    start: 0,
                     limit,
                 },
-            )?;
-            if snapshot.accept(page, epoch, party_count, limit)? {
-                break;
-            }
+            )?
+            .decode()?;
+        let mut progress = FirstRecordPage::accept(first, epoch, party_count, limit)?;
+        loop {
+            progress = match progress {
+                RecordPageProgress::Complete(events) => return Ok(events),
+                RecordPageProgress::More(snapshot) => {
+                    let page = self
+                        .execute_call(
+                            state_read,
+                            context,
+                            contract,
+                            DkgContract::recordsCall {
+                                epoch: epoch.0,
+                                start: snapshot.next(),
+                                limit,
+                            },
+                        )?
+                        .decode()?;
+                    snapshot.accept(page, epoch, party_count, limit)?
+                }
+            };
         }
-        Ok(snapshot.events)
     }
 
-    fn call<ST, SCT, C: SolCall>(
+    fn execute_call<ST, SCT, C: SolCall>(
         &self,
         state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
-        block: SeqNum,
+        context: DkgVmContext,
         contract: Address,
-        gas_limit: u64,
         call: C,
-    ) -> Result<C::Return, TriedbStateError>
+    ) -> Result<ExecutedCall<C>, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -318,7 +450,7 @@ impl TriedbDkgStateReader {
         let transaction = TxEip1559 {
             chain_id: self.numeric_chain_id,
             nonce: 0,
-            gas_limit,
+            gas_limit: context.gas_limit,
             max_fee_per_gas: 0,
             max_priority_fee_per_gas: 0,
             to: TxKind::Call(contract),
@@ -329,32 +461,18 @@ impl TriedbDkgStateReader {
         let transaction: TxEnvelope = transaction
             .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
             .into();
-        match state_read.eth_call(FinalizedEthCallRequest {
+        let result = state_read.eth_call(FinalizedEthCallRequest {
             chain_id: self.chain_id,
             transaction,
             sender: Address::ZERO,
-            block,
+            block: context.block,
             gas_specified: false,
-        })? {
-            CallResult::Success(success) => {
-                C::abi_decode_returns(&success.output_data).map_err(|source| {
-                    TriedbStateError::CallDecode {
-                        signature: C::SIGNATURE,
-                        block: block.0,
-                        source,
-                    }
-                })
-            }
-            CallResult::Failure(failure) => Err(TriedbStateError::CallFailed {
-                block: block.0,
-                message: failure.message,
-                error_code: failure.error_code,
-            }),
-            CallResult::Revert(revert) => Err(TriedbStateError::CallReverted {
-                block: block.0,
-                trace_len: revert.trace.len(),
-            }),
-        }
+        })?;
+        Ok(ExecutedCall {
+            block: context.block,
+            result,
+            call: PhantomData,
+        })
     }
 }
 
@@ -386,22 +504,23 @@ mod tests {
 
     #[test]
     fn record_snapshot_accepts_typed_pages_in_sequence_order() {
-        let mut snapshot = RecordSnapshot::default();
-        assert!(!snapshot
-            .accept(
-                ContractRecordPage {
-                    total: 3,
-                    next: 2,
-                    pcQcs: vec![pc_record(1)],
-                    bveQcs: vec![bve_record(0)],
-                    results: Vec::new(),
-                },
-                Epoch(7),
-                4,
-                2,
-            )
-            .unwrap());
-        assert!(snapshot
+        let progress = FirstRecordPage::accept(
+            ContractRecordPage {
+                total: 3,
+                next: 2,
+                pcQcs: vec![pc_record(1)],
+                bveQcs: vec![bve_record(0)],
+                results: Vec::new(),
+            },
+            Epoch(7),
+            4,
+            2,
+        )
+        .unwrap();
+        let RecordPageProgress::More(snapshot) = progress else {
+            panic!("first page unexpectedly completed the snapshot")
+        };
+        let progress = snapshot
             .accept(
                 ContractRecordPage {
                     total: 3,
@@ -414,41 +533,40 @@ mod tests {
                 4,
                 2,
             )
-            .unwrap());
+            .unwrap();
+        let RecordPageProgress::Complete(events) = progress else {
+            panic!("second page did not complete the snapshot")
+        };
         assert_eq!(
-            snapshot
-                .events
-                .iter()
-                .map(ChainEvent::record_id)
-                .collect::<Vec<_>>(),
+            events.iter().map(ChainEvent::record_id).collect::<Vec<_>>(),
             vec![RecordId(0), RecordId(1), RecordId(2)]
         );
     }
 
     #[test]
     fn record_snapshot_accepts_an_empty_first_page() {
-        let mut snapshot = RecordSnapshot::default();
-        assert!(snapshot
-            .accept(
-                ContractRecordPage {
-                    total: 0,
-                    next: 0,
-                    pcQcs: Vec::new(),
-                    bveQcs: Vec::new(),
-                    results: Vec::new(),
-                },
-                Epoch(7),
-                4,
-                1,
-            )
-            .unwrap());
-        assert!(snapshot.events.is_empty());
+        let progress = FirstRecordPage::accept(
+            ContractRecordPage {
+                total: 0,
+                next: 0,
+                pcQcs: Vec::new(),
+                bveQcs: Vec::new(),
+                results: Vec::new(),
+            },
+            Epoch(7),
+            4,
+            1,
+        )
+        .unwrap();
+        let RecordPageProgress::Complete(events) = progress else {
+            panic!("empty first page did not complete the snapshot")
+        };
+        assert!(events.is_empty());
     }
 
     #[test]
     fn record_snapshot_rejects_gaps_and_changed_totals() {
-        let mut snapshot = RecordSnapshot::default();
-        let gap = snapshot.accept(
+        let gap = FirstRecordPage::accept(
             ContractRecordPage {
                 total: 2,
                 next: 2,
@@ -465,21 +583,22 @@ mod tests {
             Err(TriedbStateError::InvalidRecordPage { .. })
         ));
 
-        let mut snapshot = RecordSnapshot::default();
-        snapshot
-            .accept(
-                ContractRecordPage {
-                    total: 2,
-                    next: 1,
-                    pcQcs: vec![pc_record(0)],
-                    bveQcs: Vec::new(),
-                    results: Vec::new(),
-                },
-                Epoch(7),
-                4,
-                1,
-            )
-            .unwrap();
+        let progress = FirstRecordPage::accept(
+            ContractRecordPage {
+                total: 2,
+                next: 1,
+                pcQcs: vec![pc_record(0)],
+                bveQcs: Vec::new(),
+                results: Vec::new(),
+            },
+            Epoch(7),
+            4,
+            1,
+        )
+        .unwrap();
+        let RecordPageProgress::More(snapshot) = progress else {
+            panic!("first page unexpectedly completed the snapshot")
+        };
         let changed = snapshot.accept(
             ContractRecordPage {
                 total: 3,
@@ -498,6 +617,30 @@ mod tests {
                 expected: 2,
                 actual: 3
             })
+        ));
+    }
+
+    #[test]
+    fn vm_context_validation_uses_only_observed_state() {
+        let contract = Address::repeat_byte(0x44);
+        let observation = VmStateObservation {
+            latest_finalized: Some(SeqNum(12)),
+            block_gas_limit: 7_000_000,
+            contract_exists: true,
+        };
+
+        assert_eq!(
+            observation
+                .validate(SeqNum(10), SeqNum(2), contract)
+                .unwrap(),
+            DkgVmContext {
+                block: SeqNum(10),
+                gas_limit: DKG_ETH_CALL_GAS_LIMIT,
+            }
+        );
+        assert!(matches!(
+            observation.validate(SeqNum(11), SeqNum(2), contract),
+            Err(TriedbStateError::NotAvailable { block: 11 })
         ));
     }
 

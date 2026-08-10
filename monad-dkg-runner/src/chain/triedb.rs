@@ -104,18 +104,7 @@ where
         block: SeqNum,
         address: Address,
     ) -> Result<DkgTransactionContext, DkgError> {
-        let mut state_read = self.state_read.clone();
-        let latest_header = state_read.get_latest_block_header().map_err(|source| {
-            DkgError::operation("read latest DKG transaction base fee", source)
-        })?;
-        let nonce = state_read
-            .get_finalized_account(block, address)
-            .map_err(|source| DkgError::operation("read finalized DKG nonce", source))?
-            .map_or(0, |account| account.nonce);
-        Ok(DkgTransactionContext {
-            nonce,
-            base_fee_per_gas: latest_header.0.base_fee_per_gas.unwrap_or_default(),
-        })
+        read_transaction_context(&mut self.state_read.clone(), block, address)
     }
 
     fn submit_transaction(&self, transaction: TxEnvelope) -> Result<(), DkgError> {
@@ -136,6 +125,19 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
 {
+    let logs = read_candidate_logs(state_read, block, matcher)?;
+    matcher.decode_logs(logs.iter(), epoch, party_count)
+}
+
+fn read_candidate_logs<ST, SCT>(
+    state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
+    block: SeqNum,
+    matcher: &DkgLogMatcher,
+) -> Result<Vec<Log>, DkgError>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+{
     let read_error = |source| match source {
         ExecutionStateReadExtError::NotAvailableYet => DkgError::ChainDataUnavailable { block },
         source => DkgError::operation("read finalized DKG events", source),
@@ -149,21 +151,53 @@ where
     let receipts = state_read
         .get_finalized_receipts(block)
         .map_err(read_error)?;
-    let mut events = Vec::new();
+    let mut logs = Vec::new();
     for receipt in receipts {
         if !matcher.maybe_matches_bloom(*receipt.receipt.logs_bloom()) {
             continue;
         }
         for log in receipt.receipt.logs() {
-            if let Some(event) = matcher
-                .match_log(log, epoch, party_count)
-                .map_err(|source| DkgError::operation("decode DKG chain event", source))?
-            {
-                events.push(event);
-            }
+            logs.push(log.clone());
         }
     }
-    Ok(events)
+    Ok(logs)
+}
+
+fn read_transaction_context<ST, SCT>(
+    state_read: &mut impl ExecutionStateReadExt<ST, SCT>,
+    block: SeqNum,
+    address: Address,
+) -> Result<DkgTransactionContext, DkgError>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+{
+    let latest_header = state_read
+        .get_latest_block_header()
+        .map_err(|source| DkgError::operation("read latest DKG transaction base fee", source))?;
+    let account = state_read
+        .get_finalized_account(block, address)
+        .map_err(|source| DkgError::operation("read finalized DKG nonce", source))?;
+    Ok(TransactionContextData {
+        nonce: account.map_or(0, |account| account.nonce),
+        base_fee_per_gas: latest_header.0.base_fee_per_gas.unwrap_or_default(),
+    }
+    .into_context())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransactionContextData {
+    nonce: monad_types::Nonce,
+    base_fee_per_gas: u64,
+}
+
+impl TransactionContextData {
+    fn into_context(self) -> DkgTransactionContext {
+        DkgTransactionContext {
+            nonce: self.nonce,
+            base_fee_per_gas: self.base_fee_per_gas,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -199,6 +233,20 @@ impl DkgLogMatcher {
 
     fn maybe_matches_bloom(&self, bloom: Bloom) -> bool {
         self.blooms.iter().any(|expected| bloom.contains(expected))
+    }
+
+    fn decode_logs<'a>(
+        &self,
+        logs: impl IntoIterator<Item = &'a Log>,
+        epoch: Epoch,
+        party_count: usize,
+    ) -> Result<Vec<ChainEvent>, DkgError> {
+        logs.into_iter()
+            .filter_map(|log| match self.match_log(log, epoch, party_count) {
+                Ok(event) => event.map(Ok),
+                Err(source) => Some(Err(DkgError::operation("decode DKG chain event", source))),
+            })
+            .collect()
     }
 
     fn match_log(
