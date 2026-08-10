@@ -21,6 +21,12 @@ use monad_types::SeqNum;
 use super::{ChainEventSession, ChainRead};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryTransition {
+    None,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SessionScan {
     session: ChainEventSession,
     phase: SessionPhase,
@@ -51,10 +57,10 @@ impl SessionScan {
         );
     }
 
-    pub(crate) fn advance(&mut self, read: ChainRead) -> bool {
-        let (phase, recovery_complete) = self.phase.complete(self.session, read);
+    pub(crate) fn advance(&mut self, read: ChainRead) -> RecoveryTransition {
+        let (phase, transition) = self.phase.complete(self.session, read);
         self.phase = phase;
-        recovery_complete
+        transition
     }
 }
 
@@ -78,7 +84,7 @@ impl SessionPhase {
         }
     }
 
-    fn complete(self, session: ChainEventSession, read: ChainRead) -> (Self, bool) {
+    fn complete(self, session: ChainEventSession, read: ChainRead) -> (Self, RecoveryTransition) {
         assert_eq!(
             read.session(),
             session,
@@ -88,7 +94,7 @@ impl SessionPhase {
             (Self::Snapshot(phase), ChainRead::Snapshot(_)) => phase.complete(session),
             (Self::Catchup(phase), ChainRead::Block(block, _)) => phase.complete(block),
             (Self::Live(phase), ChainRead::Block(block, _)) => {
-                (Self::Live(phase.complete(block)), false)
+                (Self::Live(phase.complete(block)), RecoveryTransition::None)
             }
             _ => panic!("completed DKG chain read matches its recovery phase"),
         }
@@ -102,17 +108,20 @@ struct SnapshotPhase {
 }
 
 impl SnapshotPhase {
-    fn complete(self, session: ChainEventSession) -> (SessionPhase, bool) {
+    fn complete(self, session: ChainEventSession) -> (SessionPhase, RecoveryTransition) {
         let blocks = BlockCursor::after(session.recovery_block);
         if session.recovery_block >= self.recovery_through {
-            (SessionPhase::Live(LivePhase { blocks }), true)
+            (
+                SessionPhase::Live(LivePhase { blocks }),
+                RecoveryTransition::Completed,
+            )
         } else {
             (
                 SessionPhase::Catchup(CatchupPhase {
                     blocks,
                     recovery_through: self.recovery_through,
                 }),
-                false,
+                RecoveryTransition::None,
             )
         }
     }
@@ -130,17 +139,20 @@ impl CatchupPhase {
         self.blocks.next(latest)
     }
 
-    fn complete(self, block: SeqNum) -> (SessionPhase, bool) {
+    fn complete(self, block: SeqNum) -> (SessionPhase, RecoveryTransition) {
         let blocks = self.blocks.complete(block);
         if block >= self.recovery_through {
-            (SessionPhase::Live(LivePhase { blocks }), true)
+            (
+                SessionPhase::Live(LivePhase { blocks }),
+                RecoveryTransition::Completed,
+            )
         } else {
             (
                 SessionPhase::Catchup(Self {
                     blocks,
                     recovery_through: self.recovery_through,
                 }),
-                false,
+                RecoveryTransition::None,
             )
         }
     }

@@ -3,11 +3,15 @@ use dkg_protocol::{DkgMessage, TAG_PC_PROPOSAL};
 use zeroize::Zeroize;
 
 use super::*;
+use crate::record::DurableDkgMessage;
 
 fn incoming(value: u8) -> IncomingRecord {
     IncomingRecord {
         source: PartyId(value.into()),
-        message: DkgMessage::PcProposal(vec![TAG_PC_PROPOSAL, value].into()),
+        message: DurableDkgMessage::try_from(DkgMessage::PcProposal(
+            vec![TAG_PC_PROPOSAL, value].into(),
+        ))
+        .unwrap(),
     }
 }
 
@@ -145,7 +149,10 @@ fn wal_loads_outgoing_message_records() {
 
     let record = OutgoingRecord {
         recipients: [PartyId(2), PartyId(3)].into_iter().collect(),
-        message: DkgMessage::PcProposal(vec![TAG_PC_PROPOSAL, 0xAA, 0xBB, 0xCC].into()),
+        message: DurableDkgMessage::try_from(DkgMessage::PcProposal(
+            vec![TAG_PC_PROPOSAL, 0xAA, 0xBB, 0xCC].into(),
+        ))
+        .unwrap(),
     };
     wal.append(&RecoveryRecord::Outgoing(record.clone()))
         .unwrap();

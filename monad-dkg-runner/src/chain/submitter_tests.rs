@@ -101,7 +101,7 @@ fn registration_retries_same_transaction_until_finalized_state_confirms_it() {
     let nonce_reads = Arc::new(AtomicUsize::new(0));
     let (mut service, local_rx) = test_submitter(5, Arc::clone(&nonce_reads));
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration(service.signer_address().into_array(), 2)
+        .registration(service.signer_address(), Epoch(2))
         .unwrap();
 
     service.submit_registration(Epoch(2), SeqNum(10), registration);
@@ -187,7 +187,7 @@ fn new_artifact_uses_newest_context_across_sessions() {
     );
     service.finalized_block(Epoch(2), SeqNum(10), Vec::new());
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration(service.signer_address().into_array(), 3)
+        .registration(service.signer_address(), Epoch(3))
         .unwrap();
     service.submit_registration(Epoch(3), SeqNum(20), registration);
     local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -209,7 +209,7 @@ fn active_artifact_keeps_its_epoch_context() {
     service.submit(Epoch(2), pc_call(pc_qc(1, 1)));
     let first = local_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let registration = DkgLocalKeyMaterial::derive([0x01; 32])
-        .registration(service.signer_address().into_array(), 3)
+        .registration(service.signer_address(), Epoch(3))
         .unwrap();
     service.submit_registration(Epoch(3), SeqNum(20), registration);
 
@@ -349,7 +349,7 @@ impl DkgChain for TestChain {
         _block: SeqNum,
         _epoch: Epoch,
         _parties: &[Address],
-    ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+    ) -> Result<Vec<Option<RegistrationCall>>, crate::DkgError> {
         unreachable!()
     }
 

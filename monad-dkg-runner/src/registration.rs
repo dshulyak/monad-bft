@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{collections::HashSet, path::Path};
 
 use alloy_primitives::Address;
 use dkg_crypto::{secp::signature::SignatureError, K256SecpBackend};
@@ -12,22 +9,22 @@ use dkg_protocol::{
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_types::{Epoch, NodeId};
+use monad_types::{Epoch, NodeId, Stake};
 use thiserror::Error;
 
 use crate::{
     recovery::{RecoveryWal, RecoveryWalConfig, RecoveryWalError},
-    DkgLocalKeyMaterial, DkgRegisteredKeyMaterial, DkgValidator,
+    DkgLocalKeyMaterial, DkgValidator,
 };
 
 #[derive(Debug, Error)]
 pub(crate) enum RegistrationError {
     #[error("multiple validators map to DKG address {address}")]
     DuplicateValidatorAddress { address: Address },
-    #[error("duplicate DKG registration for {address}")]
-    DuplicateRegistration { address: Address },
     #[error("no finalized validator has a DKG registration")]
     NoEligibleValidator,
+    #[error("registration snapshot has {actual} entries for {expected} validators")]
+    RegistrationCountMismatch { expected: usize, actual: usize },
     #[error(transparent)]
     Wal(#[from] RecoveryWalError),
     #[error("decode local DKG keys failed: {0}")]
@@ -56,15 +53,24 @@ pub(crate) enum RegistrationError {
         source: SignatureError,
     },
     #[error("invalid DKG receiver proof for {address} at epoch {epoch}")]
-    InvalidReceiverProof { address: Address, epoch: u64 },
+    InvalidReceiverProof { address: Address, epoch: Epoch },
 }
 
 pub(crate) struct RegisteredSession<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
-    pub validators: Vec<DkgValidator<ST>>,
-    pub key_material: DkgRegisteredKeyMaterial,
+    pub parties: Vec<RegisteredParty<ST>>,
+    pub local_keys: dkg_protocol::SecretKeys<K256SecpBackend>,
+}
+
+pub(crate) struct RegisteredParty<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    pub node_id: NodeId<CertificateSignaturePubKey<ST>>,
+    pub stake: Stake,
+    pub registration: PartyRegistration<K256SecpBackend>,
 }
 
 pub(crate) fn assemble_registered_session<ST>(
@@ -72,7 +78,7 @@ pub(crate) fn assemble_registered_session<ST>(
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
     validators: Vec<DkgValidator<ST>>,
     local_keys: &DkgLocalKeyMaterial,
-    registrations: Vec<RegistrationCall>,
+    registrations: Vec<Option<RegistrationCall>>,
 ) -> Result<RegisteredSession<ST>, RegistrationError>
 where
     ST: CertificateSignatureRecoverable,
@@ -81,39 +87,26 @@ where
     for validator in &validators {
         if !validator_addresses.insert(validator.address) {
             return Err(RegistrationError::DuplicateValidatorAddress {
-                address: Address::from(validator.address),
+                address: validator.address,
             });
         }
     }
-
-    let mut registrations_by_address = HashMap::new();
-    for record in registrations {
-        let address = record.address.0;
-        // Registrations outside the finalized validator set cannot participate
-        // in this session. Ignore them before decoding so unrelated malformed
-        // records cannot abort bootstrap for the selected validators.
-        if !validator_addresses.contains(&address) {
-            continue;
-        }
-        if registrations_by_address.contains_key(&address) {
-            return Err(RegistrationError::DuplicateRegistration {
-                address: Address::from(address),
-            });
-        }
-        registrations_by_address.insert(address, record);
+    if registrations.len() != validators.len() {
+        return Err(RegistrationError::RegistrationCountMismatch {
+            expected: validators.len(),
+            actual: registrations.len(),
+        });
     }
 
     // Party IDs are compact ranks in the finalized validator-set order. Missing
     // registrations are filtered without changing the relative validator order.
     let eligible = validators
         .into_iter()
-        .filter_map(|validator| {
-            registrations_by_address
-                .remove(&validator.address)
-                .map(|registration| (validator, registration))
-        })
+        .zip(registrations)
+        .filter_map(|(validator, registration)| registration.map(|record| (validator, record)))
         .map(|(validator, registration)| {
-            verify_registration(registration, epoch).map(|registration| (validator, registration))
+            verify_registration(validator.address, registration, epoch)
+                .map(|registration| (validator, registration))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if eligible.is_empty() {
@@ -132,24 +125,24 @@ where
             return Err(RegistrationError::QcVerifierMismatch);
         }
     }
-    let validators = eligible.iter().map(|(validator, _)| *validator).collect();
-    let registrations = eligible
+    let parties = eligible
         .into_iter()
-        .map(|(_, registration)| registration)
+        .map(|(validator, registration)| RegisteredParty {
+            node_id: validator.node_id,
+            stake: validator.stake,
+            registration,
+        })
         .collect();
     Ok(RegisteredSession {
-        validators,
-        key_material: DkgRegisteredKeyMaterial {
-            local_keys: local.secret_keys,
-            registrations,
-        },
+        parties,
+        local_keys: local.secret_keys,
     })
 }
 
 pub(crate) fn load_or_create_local_registration(
     storage_root: &Path,
     epoch: Epoch,
-    address: [u8; 20],
+    address: Address,
     local_keys: &DkgLocalKeyMaterial,
     finalized: Option<&RegistrationCall>,
 ) -> Result<RegistrationCall, RegistrationError> {
@@ -158,7 +151,7 @@ pub(crate) fn load_or_create_local_registration(
     let bytes = recovery.load_or_create_registration(&mut wal, || match finalized {
         Some(registration) => Ok(encode_registration(registration)),
         None => local_keys
-            .registration(address, epoch.0)
+            .registration(address, epoch)
             .map(|registration| encode_registration(&registration)),
     })?;
     let registration = decode_verified_registration(address, epoch, &bytes)?;
@@ -175,25 +168,25 @@ pub(crate) fn load_or_create_local_registration(
 }
 
 fn verify_registration(
+    expected_address: Address,
     registration: RegistrationCall,
     epoch: Epoch,
 ) -> Result<PartyRegistration<K256SecpBackend>, RegistrationError> {
-    let address = registration.address.0;
     let registration = registration
         .into_party()
         .map_err(|source| RegistrationError::Decode {
-            address: Address::from(address),
+            address: expected_address,
             source,
         })?;
-    verify_decoded_registration(address, epoch, registration)
+    verify_decoded_registration(expected_address, epoch, registration)
 }
 
 fn decode_verified_registration(
-    address: [u8; 20],
+    address: Address,
     epoch: Epoch,
     bytes: &[u8],
 ) -> Result<PartyRegistration<K256SecpBackend>, RegistrationError> {
-    let requested = Address::from(address);
+    let requested = address;
     let registration = decode_registration::<K256SecpBackend>(bytes).map_err(|source| {
         RegistrationError::Decode {
             address: requested,
@@ -204,12 +197,12 @@ fn decode_verified_registration(
 }
 
 fn verify_decoded_registration(
-    address: [u8; 20],
+    address: Address,
     epoch: Epoch,
     registration: PartyRegistration<K256SecpBackend>,
 ) -> Result<PartyRegistration<K256SecpBackend>, RegistrationError> {
-    let requested = Address::from(address);
-    if registration.address.0 != address {
+    let requested = address;
+    if Address::from(registration.address.0) != address {
         return Err(RegistrationError::AddressMismatch {
             requested,
             encoded: Address::from(registration.address.0),
@@ -223,7 +216,7 @@ fn verify_decoded_registration(
     })? {
         return Err(RegistrationError::InvalidReceiverProof {
             address: requested,
-            epoch: epoch.0,
+            epoch,
         });
     }
     Ok(registration)

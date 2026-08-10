@@ -1,3 +1,4 @@
+use alloy_primitives::Address;
 use dkg_protocol::RegistrationCall;
 use monad_crypto::{
     certificate_signature::{CertificateKeyPair, CertificateSignaturePubKey},
@@ -25,15 +26,14 @@ fn assembles_registered_parties_in_validator_order() {
         .zip(addresses)
         .map(|(node_id, address)| DkgValidator::<NopSignature> {
             node_id: *node_id,
-            address,
+            address: Address::from(address),
             stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
         })
         .collect();
     let registrations = addresses
         .into_iter()
         .zip(keys.iter())
-        .rev()
-        .map(|(address, keys)| registration(address, keys))
+        .map(|(address, keys)| Some(registration(address, keys)))
         .collect();
 
     let session =
@@ -41,10 +41,9 @@ fn assembles_registered_parties_in_validator_order() {
 
     assert_eq!(
         session
-            .key_material
-            .registrations
+            .parties
             .iter()
-            .map(|registration| registration.address)
+            .map(|party| party.registration.address)
             .collect::<Vec<_>>(),
         vec![
             dkg_core::Address([4; 20]),
@@ -55,9 +54,9 @@ fn assembles_registered_parties_in_validator_order() {
     );
     assert_eq!(
         session
-            .validators
+            .parties
             .iter()
-            .map(|validator| validator.node_id)
+            .map(|party| party.node_id)
             .collect::<Vec<_>>(),
         nodes
     );
@@ -72,18 +71,16 @@ fn intersects_registrations_with_finalized_validators() {
         .into_iter()
         .map(|index| DkgValidator::<NopSignature> {
             node_id: nodes[index],
-            address: [index as u8 + 1; 20],
+            address: Address::from([index as u8 + 1; 20]),
             stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
         })
         .collect();
-    let registrations = [0usize, 1, 3, 4]
+    let registrations = order
         .into_iter()
         .map(|index| {
-            let mut registration = registration([index as u8 + 1; 20], &keys[index]);
-            if index == 4 {
-                registration.receiver_public_key.0 = [0; 33];
-            }
-            registration
+            [0usize, 1, 3]
+                .contains(&index)
+                .then(|| registration([index as u8 + 1; 20], &keys[index]))
         })
         .collect();
 
@@ -92,18 +89,17 @@ fn intersects_registrations_with_finalized_validators() {
 
     assert_eq!(
         session
-            .validators
+            .parties
             .iter()
-            .map(|validator| validator.node_id)
+            .map(|party| party.node_id)
             .collect::<Vec<_>>(),
         vec![nodes[3], nodes[0], nodes[1]]
     );
     assert_eq!(
         session
-            .key_material
-            .registrations
+            .parties
             .iter()
-            .map(|registration| registration.address)
+            .map(|party| party.registration.address)
             .collect::<Vec<_>>(),
         vec![
             dkg_core::Address([4; 20]),
@@ -120,15 +116,44 @@ fn rejects_invalid_proof_for_a_finalized_validator() {
     let address = [1; 20];
     let validators = vec![DkgValidator::<NopSignature> {
         node_id: nodes[0],
-        address,
+        address: Address::from(address),
         stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
     }];
     let mut malformed = registration(address, &keys[0]);
     malformed.receiver_proof[0] ^= 1;
 
     assert!(matches!(
-        assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], vec![malformed]),
+        assemble_registered_session(EPOCH, nodes[0], validators, &keys[0], vec![Some(malformed)]),
         Err(RegistrationError::InvalidReceiverProof { .. })
+    ));
+}
+
+#[test]
+fn rejects_registration_snapshot_with_wrong_length() {
+    let nodes = test_nodes(2);
+    let keys = test_keys(2);
+    let validators = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node_id)| DkgValidator::<NopSignature> {
+            node_id: *node_id,
+            address: Address::from([index as u8 + 1; 20]),
+            stake: monad_types::Stake(alloy_primitives::U256::from(crate::session::WEI_PER_MON)),
+        })
+        .collect();
+
+    assert!(matches!(
+        assemble_registered_session(
+            EPOCH,
+            nodes[0],
+            validators,
+            &keys[0],
+            vec![Some(registration([1; 20], &keys[0]))]
+        ),
+        Err(RegistrationError::RegistrationCountMismatch {
+            expected: 2,
+            actual: 1
+        })
     ));
 }
 
@@ -153,16 +178,28 @@ fn local_key_material_zeroizes() {
 fn encoded_registration_is_reused_from_recovery_wal() {
     let directory = tempfile::tempdir().unwrap();
     let keys = DkgLocalKeyMaterial::derive([7; 32]);
-    let first =
-        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], &keys, None).unwrap();
-    let second =
-        load_or_create_local_registration(directory.path(), EPOCH, [1; 20], &keys, None).unwrap();
+    let first = load_or_create_local_registration(
+        directory.path(),
+        EPOCH,
+        Address::from([1; 20]),
+        &keys,
+        None,
+    )
+    .unwrap();
+    let second = load_or_create_local_registration(
+        directory.path(),
+        EPOCH,
+        Address::from([1; 20]),
+        &keys,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(first, second);
 }
 
 fn registration(address: [u8; 20], keys: &DkgLocalKeyMaterial) -> RegistrationCall {
-    keys.registration(address, EPOCH.0).unwrap()
+    keys.registration(Address::from(address), EPOCH).unwrap()
 }
 
 fn test_keys(count: usize) -> Vec<DkgLocalKeyMaterial> {

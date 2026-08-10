@@ -1,4 +1,4 @@
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use dkg_core::{PartyId, RecordId, SessionId};
 use dkg_crypto::{BlsG2SerializedBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
@@ -10,7 +10,7 @@ use monad_types::{Epoch, NodeId};
 use tempfile::TempDir;
 
 use super::*;
-use crate::test_registered_key_material;
+use crate::{test_registered_key_material, test_registered_session, DkgValidator};
 
 #[test]
 fn retrieval_response_completes_its_request() {
@@ -105,21 +105,18 @@ fn session_accepts_one_and_two_validator_sets_without_fault_tolerance() {
         let temp = TempDir::new().unwrap();
         let validators = test_validators(count);
         let epoch = Epoch(u64::from(count));
-        let result = start::<NopSignature>(
-            epoch,
-            validators[0],
-            validators
-                .into_iter()
-                .enumerate()
-                .map(|(index, node_id)| DkgValidator {
-                    node_id,
-                    address: [index as u8 + 1; 20],
-                    stake: monad_types::Stake(U256::from(WEI_PER_MON)),
-                })
-                .collect(),
-            temp.path(),
-            test_registered_key_material(PartyId(0), usize::from(count), epoch),
-        );
+        let self_id = validators[0];
+        let validators = validators
+            .into_iter()
+            .enumerate()
+            .map(|(index, node_id)| DkgValidator {
+                node_id,
+                address: Address::from([index as u8 + 1; 20]),
+                stake: monad_types::Stake(U256::from(WEI_PER_MON)),
+            })
+            .collect();
+        let registered = test_registered_session(PartyId(0), validators, epoch);
+        let result = start::<NopSignature>(epoch, self_id, temp.path(), registered);
 
         assert!(result.unwrap().is_some());
     }
@@ -165,14 +162,20 @@ fn test_session(
     let wal_path = wal.path().to_path_buf();
     let mut recovery = RecoveryState::default();
     let engine_seed = recovery.load_or_create_engine_seed(&mut wal).unwrap();
+    let (local_keys, parties) = test_registered_key_material(
+        self_party,
+        4,
+        epoch,
+        vec![NativeVotingWeight::new(1); validators.len()],
+    );
     let mut session = DkgSession::new(SessionInit {
         epoch,
         self_party,
         mapping,
-        voting_weights: vec![NativeVotingWeight::new(1); validators.len()],
-        output_count: DKG_BATCH_SIZE,
+        parties,
+        output_count: DKG_OUTPUT_COUNT,
         engine_seed,
-        key_material: test_registered_key_material(self_party, 4, epoch),
+        local_keys,
         recovery_wal: wal,
         recovery_state: recovery,
     })

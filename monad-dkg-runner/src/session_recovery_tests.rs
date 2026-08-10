@@ -118,7 +118,7 @@ impl<'a> RecoveryModelBuilder<'a> {
         Self {
             root,
             voting_weights: vec![1; NODE_COUNT],
-            output_count: DKG_BATCH_SIZE,
+            output_count: DKG_OUTPUT_COUNT.get(),
         }
     }
 
@@ -527,14 +527,20 @@ fn start_runtime(
     let engine_seed = recovery_state
         .load_or_create_engine_seed(&mut recovery_wal)
         .unwrap();
+    let (local_keys, parties) = test_registered_key_material(
+        self_party,
+        validators.len(),
+        TEST_EPOCH,
+        voting_weights.iter().copied(),
+    );
     let session = DkgSession::new(SessionInit {
         epoch: TEST_EPOCH,
         self_party,
         mapping,
-        voting_weights: voting_weights.to_vec(),
-        output_count,
+        parties,
+        output_count: DkgOutputCount::new(output_count),
         engine_seed,
-        key_material: test_registered_key_material(self_party, validators.len(), TEST_EPOCH),
+        local_keys,
         recovery_wal,
         recovery_state,
     })

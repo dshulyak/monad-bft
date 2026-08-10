@@ -10,9 +10,7 @@ use dkg_protocol::{PartyRegistration, QcSigningKey, QcVerifier, RegistrationCall
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-#[cfg(test)]
-use monad_types::Epoch;
-use monad_types::{NodeId, SeqNum, Stake};
+use monad_types::{Epoch, NodeId, SeqNum, Stake};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -49,13 +47,13 @@ pub enum DkgError {
     #[error("registration contract {actual} does not match configured DKG contract {expected}")]
     RegistrationContractMismatch { expected: Address, actual: Address },
     #[error("DKG result epoch {actual} does not match submission epoch {expected}")]
-    ResultEpochMismatch { expected: u64, actual: u64 },
+    ResultEpochMismatch { expected: Epoch, actual: Epoch },
     #[error("duplicate validator in DKG party map")]
     DuplicateValidator,
     #[error("finalized DKG registration for {address} conflicts with the recovery WAL")]
     FinalizedRegistrationConflict { address: Address },
     #[error("no active DKG session for epoch {epoch}")]
-    NoActiveSession { epoch: u64 },
+    NoActiveSession { epoch: Epoch },
     #[error("DKG chain data at block {block:?} is not available yet")]
     ChainDataUnavailable { block: SeqNum },
 }
@@ -97,13 +95,13 @@ impl DkgLocalKeyMaterial {
     /// Encodes the public registration corresponding to these local keys.
     pub fn registration(
         &self,
-        address: [u8; 20],
-        epoch: u64,
+        address: Address,
+        epoch: Epoch,
     ) -> Result<RegistrationCall, DkgError> {
         let local = self.decode()?;
         let registration = PartyRegistration::from_local_keys(
-            dkg_core::Address(address),
-            epoch,
+            dkg_core::Address(address.into_array()),
+            epoch.0,
             &local.secret_keys,
         )
         .map_err(|err| DkgError::operation("build DKG registration", err))?;
@@ -158,13 +156,8 @@ where
     ST: CertificateSignatureRecoverable,
 {
     pub node_id: NodeId<CertificateSignaturePubKey<ST>>,
-    pub address: [u8; 20],
+    pub address: Address,
     pub stake: Stake,
-}
-
-pub(crate) struct DkgRegisteredKeyMaterial {
-    pub(crate) local_keys: SecretKeys<K256SecpBackend>,
-    pub(crate) registrations: Vec<PartyRegistration<K256SecpBackend>>,
 }
 
 pub(crate) struct DecodedLocalKeyMaterial {
@@ -178,7 +171,11 @@ pub(crate) fn test_registered_key_material(
     self_party: PartyId,
     party_count: usize,
     epoch: Epoch,
-) -> DkgRegisteredKeyMaterial {
+    voting_weights: impl IntoIterator<Item = dkg_protocol::NativeVotingWeight>,
+) -> (
+    SecretKeys<K256SecpBackend>,
+    Vec<crate::session::RegisteredEngineParty>,
+) {
     let keys = (0..party_count)
         .map(|index| DkgLocalKeyMaterial::derive([index as u8 + 1; 32]))
         .collect::<Vec<_>>();
@@ -186,16 +183,63 @@ pub(crate) fn test_registered_key_material(
         .iter()
         .enumerate()
         .map(|(index, keys)| {
-            keys.registration([index as u8 + 1; 20], epoch.0)
+            keys.registration(Address::from([index as u8 + 1; 20]), epoch)
                 .expect("test DKG registration")
                 .into_party::<K256SecpBackend>()
                 .expect("test DKG registration validates")
         })
         .collect::<Vec<_>>();
     let local = &keys[self_party.0 as usize];
-    DkgRegisteredKeyMaterial {
-        local_keys: local.decode().expect("test DKG keys decode").secret_keys,
-        registrations,
+    let parties = voting_weights
+        .into_iter()
+        .zip(registrations)
+        .map(|(voting_weight, registration)| {
+            crate::session::RegisteredEngineParty::new(voting_weight, registration)
+        })
+        .collect();
+    (
+        local.decode().expect("test DKG keys decode").secret_keys,
+        parties,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_registered_session<ST>(
+    self_party: PartyId,
+    validators: Vec<DkgValidator<ST>>,
+    epoch: Epoch,
+) -> registration::RegisteredSession<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    let keys = (0..validators.len())
+        .map(|index| DkgLocalKeyMaterial::derive([index as u8 + 1; 32]))
+        .collect::<Vec<_>>();
+    let registrations = validators
+        .iter()
+        .zip(&keys)
+        .map(|(validator, keys)| {
+            keys.registration(validator.address, epoch)
+                .expect("test DKG registration")
+                .into_party::<K256SecpBackend>()
+                .expect("test DKG registration validates")
+        })
+        .collect::<Vec<_>>();
+    let parties = validators
+        .into_iter()
+        .zip(registrations)
+        .map(|(validator, registration)| registration::RegisteredParty {
+            node_id: validator.node_id,
+            stake: validator.stake,
+            registration,
+        })
+        .collect();
+    registration::RegisteredSession {
+        parties,
+        local_keys: keys[self_party.0 as usize]
+            .decode()
+            .expect("test DKG keys decode")
+            .secret_keys,
     }
 }
 

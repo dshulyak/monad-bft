@@ -14,6 +14,7 @@ use dkg_protocol::{
     ChainCall, ChainEvent, DkgDeliveryPolicy, DkgEngine, DkgEngineError, DkgEngineParams,
     DkgEnginePhase, DkgInput, DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey,
     DkgMessageKind, DkgRegisteredSetupError, DkgSetupContext, Epsilon, NativeVotingWeight,
+    PartyRegistration, SecretKeys,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -24,15 +25,37 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::chain_event_kind,
-    record::{EngineSeed, IncomingRecord, OutgoingRecord, RecoveryRecord},
+    record::{
+        DurableDkgMessage, DurableMessageError, EngineSeed, IncomingRecord, OutgoingRecord,
+        RecoveryRecord,
+    },
     recovery::{RecoveryState, RecoveryWal, RecoveryWalConfig, RecoveryWalError},
+    registration::RegisteredSession,
     reliable::{EnqueueError, ObsolescencePolicy, RetryConfig, RetryScheduler},
     runner::{DeliveryEnvelope, DeliveryOutbound},
-    DkgError, DkgRegisteredKeyMaterial, DkgValidator,
+    DkgError,
 };
 
 pub(crate) const WEI_PER_MON: u64 = 1_000_000_000_000_000_000;
-const DKG_BATCH_SIZE: usize = 256;
+const DKG_OUTPUT_COUNT: DkgOutputCount = DkgOutputCount::new(256);
+
+#[derive(Clone, Copy)]
+struct DkgOutputCount(usize);
+
+impl DkgOutputCount {
+    const fn new(count: usize) -> Self {
+        assert!(count >= 2 && count.is_power_of_two());
+        Self(count)
+    }
+
+    const fn get(self) -> usize {
+        self.0
+    }
+
+    const fn max_ladder_level(self) -> u64 {
+        self.0.trailing_zeros() as u64
+    }
+}
 
 const DKG_RETRY: RetryConfig = RetryConfig::new(
     Duration::from_secs(2),
@@ -118,6 +141,8 @@ pub(crate) enum SessionError {
     RecoveryWal(#[from] RecoveryWalError),
     #[error("classify DKG message failed: {0}")]
     Message(#[from] DkgMessageError),
+    #[error("classify durable DKG message failed: {0}")]
+    DurableMessage(#[from] DurableMessageError),
     #[error("research DKG engine {action} failed: {error:?}")]
     Engine {
         action: &'static str,
@@ -134,17 +159,17 @@ pub(crate) enum SessionError {
 pub(crate) fn start<ST>(
     epoch: Epoch,
     self_id: NodeId<CertificateSignaturePubKey<ST>>,
-    validators: Vec<DkgValidator<ST>>,
     storage_root: &std::path::Path,
-    key_material: DkgRegisteredKeyMaterial,
+    registered: RegisteredSession<ST>,
 ) -> Result<Option<DkgSession<ST>>, DkgError>
 where
     ST: CertificateSignatureRecoverable + Send + Sync + 'static,
 {
     let mapping = DkgPeerMap::<ST>::new_ordered(
-        validators
+        registered
+            .parties
             .iter()
-            .map(|validator| validator.node_id)
+            .map(|party| party.node_id)
             .collect(),
     )
     .map_err(|_| DkgError::DuplicateValidator)?;
@@ -154,9 +179,10 @@ where
     };
 
     let voting_weights = decode_voting_weights(
-        &validators
+        &registered
+            .parties
             .iter()
-            .map(|validator| validator.stake)
+            .map(|party| party.stake)
             .collect::<Vec<_>>(),
     )
     .map_err(|err| DkgError::operation("decode DKG validator stakes", err))?;
@@ -174,10 +200,17 @@ where
         epoch,
         self_party,
         mapping,
-        voting_weights,
-        output_count: DKG_BATCH_SIZE,
+        parties: registered
+            .parties
+            .into_iter()
+            .zip(voting_weights)
+            .map(|(party, voting_weight)| {
+                RegisteredEngineParty::new(voting_weight, party.registration)
+            })
+            .collect(),
+        output_count: DKG_OUTPUT_COUNT,
         engine_seed,
-        key_material,
+        local_keys: registered.local_keys,
         recovery_wal,
         recovery_state,
     })
@@ -192,12 +225,29 @@ where
     epoch: Epoch,
     self_party: PartyId,
     mapping: DkgPeerMap<ST>,
-    voting_weights: Vec<NativeVotingWeight>,
-    output_count: usize,
+    parties: Vec<RegisteredEngineParty>,
+    output_count: DkgOutputCount,
     engine_seed: EngineSeed,
-    key_material: DkgRegisteredKeyMaterial,
+    local_keys: SecretKeys<K256SecpBackend>,
     recovery_wal: RecoveryWal,
     recovery_state: RecoveryState,
+}
+
+pub(crate) struct RegisteredEngineParty {
+    voting_weight: NativeVotingWeight,
+    registration: PartyRegistration<K256SecpBackend>,
+}
+
+impl RegisteredEngineParty {
+    pub(crate) fn new(
+        voting_weight: NativeVotingWeight,
+        registration: PartyRegistration<K256SecpBackend>,
+    ) -> Self {
+        Self {
+            voting_weight,
+            registration,
+        }
+    }
 }
 
 pub(crate) struct DkgSession<ST>
@@ -219,9 +269,13 @@ where
     effects: Vec<SessionEffect<ST>>,
     pending_inputs: VecDeque<PendingEngineInput>,
     recovery_wal: RecoveryWal,
-    recovered_outgoing: Vec<OutgoingRecord>,
+    recovery: SessionRecovery,
     last_phase: DkgEnginePhase,
-    awaiting_chain_recovery: bool,
+}
+
+enum SessionRecovery {
+    AwaitingChain { outgoing: Vec<OutgoingRecord> },
+    Complete,
 }
 
 pub(crate) enum SessionEffect<ST>
@@ -237,9 +291,12 @@ enum PendingEngineInput {
     Chain(ChainEvent),
 }
 
-struct PendingPeerInput {
-    input: CoreInput<DkgMessage>,
-    durable: Option<IncomingRecord>,
+enum PendingPeerInput {
+    WithoutWalWrite(CoreInput<DkgMessage>),
+    PersistAfterApply {
+        input: CoreInput<DkgMessage>,
+        record: IncomingRecord,
+    },
 }
 
 impl<ST> DkgSession<ST>
@@ -257,30 +314,31 @@ where
     fn new(init: SessionInit<ST>) -> Result<Self, SessionError> {
         let party_count = init.mapping.len();
         let params = DkgEngineParams {
-            output_count: init.output_count,
+            output_count: init.output_count.get(),
             ..DkgEngineParams::default()
         };
-        let output_count = params.output_count;
+        let output_count = init.output_count;
         let engine = build_engine(
             init.epoch,
             init.self_party,
-            init.key_material,
-            init.voting_weights,
+            init.local_keys,
+            init.parties,
             params,
             init.engine_seed.to_bytes(),
         )?;
-        let max_ladder_level = output_count.trailing_zeros().into();
+        let max_ladder_level = output_count.max_ladder_level();
         let initial_phase = engine.phase();
         let RecoveryState {
             outgoing: recovered_outgoing,
             incoming: recovered_incoming,
             ..
         } = init.recovery_state;
+        let recovered_outgoing_count = recovered_outgoing.len();
         info!(
             epoch = init.epoch.0,
             party = init.self_party.0,
             party_count = init.mapping.len(),
-            output_count,
+            output_count = output_count.get(),
             phase = ?initial_phase,
             "initialized DKG session"
         );
@@ -296,14 +354,15 @@ where
             effects: Vec::new(),
             pending_inputs: VecDeque::new(),
             recovery_wal: init.recovery_wal,
-            recovered_outgoing,
+            recovery: SessionRecovery::AwaitingChain {
+                outgoing: recovered_outgoing,
+            },
             last_phase: initial_phase,
-            awaiting_chain_recovery: true,
         };
         session.replay_persisted_incoming_messages(recovered_incoming);
         info!(
             pending_inputs = session.pending_inputs.len(),
-            recovered_outgoing = session.recovered_outgoing.len(),
+            recovered_outgoing = recovered_outgoing_count,
             "waiting for DKG chain recovery before starting engine"
         );
         Ok(session)
@@ -348,14 +407,14 @@ where
     }
 
     fn settle(&mut self) -> Result<(), SessionError> {
-        if self.awaiting_chain_recovery {
+        if matches!(self.recovery, SessionRecovery::AwaitingChain { .. }) {
             return Ok(());
         }
         self.drain_engine_inputs()
     }
 
     fn complete_chain_recovery(&mut self) -> Result<(), SessionError> {
-        if !self.awaiting_chain_recovery {
+        if matches!(self.recovery, SessionRecovery::Complete) {
             return Ok(());
         }
 
@@ -366,7 +425,10 @@ where
         self.drain_engine_inputs()?;
         // Chain evidence is applied before recovery so the scheduler discards
         // obsolete WAL entries as they are restored.
-        let recovered_outgoing = mem::take(&mut self.recovered_outgoing);
+        let SessionRecovery::AwaitingChain { outgoing } = &mut self.recovery else {
+            unreachable!("checked recovery state above")
+        };
+        let recovered_outgoing = mem::take(outgoing);
         self.restore_persisted_outgoing_messages(recovered_outgoing)?;
         let effects = self.engine.start().map_err(|error| SessionError::Engine {
             action: "start",
@@ -374,7 +436,7 @@ where
         })?;
         // Once start succeeds, recovery must not start the same engine twice if
         // dispatching one of its initial effects fails.
-        self.awaiting_chain_recovery = false;
+        self.recovery = SessionRecovery::Complete;
         // Recovered inputs must precede start effects that loop back locally.
         // Otherwise every restart would persist the regenerated local message
         // once more before the replay taught the engine that it is a duplicate.
@@ -414,22 +476,21 @@ where
                 );
                 return Ok(());
             }
-            self.pending_inputs
-                .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                    input: CoreInput::new(from, message),
-                    durable: None,
-                }));
+            self.pending_inputs.push_back(PendingEngineInput::Peer(
+                PendingPeerInput::WithoutWalWrite(CoreInput::new(from, message)),
+            ));
             return Ok(());
         }
         let record = IncomingRecord {
             source: from,
-            message: message.clone(),
+            message: DurableDkgMessage::try_from(message.clone())?,
         };
-        self.pending_inputs
-            .push_back(PendingEngineInput::Peer(PendingPeerInput {
+        self.pending_inputs.push_back(PendingEngineInput::Peer(
+            PendingPeerInput::PersistAfterApply {
                 input: CoreInput::new(from, message),
-                durable: Some(record),
-            }));
+                record,
+            },
+        ));
         Ok(())
     }
 
@@ -457,11 +518,14 @@ where
     }
 
     fn process_peer_input(&mut self, peer: PendingPeerInput) -> Result<bool, SessionError> {
-        let source = peer.input.source;
+        let (input, record) = match peer {
+            PendingPeerInput::WithoutWalWrite(input) => (input, None),
+            PendingPeerInput::PersistAfterApply { input, record } => (input, Some(record)),
+        };
+        let source = input.source;
         let completed_request =
-            request_completed_by_response(&peer.input.message, self.self_party, source);
-        let durable = peer.durable;
-        let effects = match self.engine.handle_peer_event(peer.input) {
+            request_completed_by_response(&input.message, self.self_party, source);
+        let effects = match self.engine.handle_peer_event(input) {
             Ok(effects) => effects,
             Err(DkgEngineError::Duplicate) => {
                 debug!(source = source.0, "ignored duplicate DKG peer input");
@@ -487,7 +551,7 @@ where
             // signers keep retrying until they contribute or extraction ends.
             self.retries.complete(&message_id);
         }
-        if let Some(record) = durable {
+        if let Some(record) = record {
             failpoint::failpoint!(
                 name = "dkg.peer.engine_applied",
                 description = "after the engine applies a peer input and before durable ingress",
@@ -519,13 +583,14 @@ where
                     ) {
                         let record = IncomingRecord {
                             source: self.self_party,
-                            message: payload.clone(),
+                            message: DurableDkgMessage::try_from(payload.clone())?,
                         };
-                        self.pending_inputs
-                            .push_back(PendingEngineInput::Peer(PendingPeerInput {
+                        self.pending_inputs.push_back(PendingEngineInput::Peer(
+                            PendingPeerInput::PersistAfterApply {
                                 input: CoreInput::new(self.self_party, payload.clone()),
-                                durable: Some(record),
-                            }));
+                                record,
+                            },
+                        ));
                     }
                     let self_party = self.self_party;
                     let recipients = self
@@ -552,11 +617,12 @@ where
                 );
                 continue;
             }
-            self.pending_inputs
-                .push_back(PendingEngineInput::Peer(PendingPeerInput {
-                    input: CoreInput::new(record.source, record.message),
-                    durable: None,
-                }));
+            self.pending_inputs.push_back(PendingEngineInput::Peer(
+                PendingPeerInput::WithoutWalWrite(CoreInput::new(
+                    record.source,
+                    record.message.into_message(),
+                )),
+            ));
         }
     }
 
@@ -589,18 +655,11 @@ where
                 recipients,
                 message,
             } = record;
-            if message.delivery_policy() != DkgDeliveryPolicy::Durable {
-                warn!(
-                    kind = ?message.kind(),
-                    "skipping non-durable DKG message found in recovery WAL"
-                );
-                continue;
-            }
             let Some(first_recipient) = recipients.first().copied() else {
                 warn!("skipping persisted DKG message without recipients");
                 continue;
             };
-            let message_id = self.message_id_for_recipients(&recipients, &message)?;
+            let message_id = self.message_id_for_recipients(&recipients, message.as_message())?;
             let delivery_recipients = recipients
                 .iter()
                 .map(|party| {
@@ -613,13 +672,13 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let abort_group = delivery_abort_group_for_peer_payload(
-                message.kind(),
+                message.as_message().kind(),
                 self.self_party,
                 first_recipient,
             );
             let payload = DeliveryEnvelope {
                 epoch: self.epoch.0,
-                payload: message.into_bytes(),
+                payload: message.into_message().into_bytes(),
             }
             .into();
             self.effects.extend(
@@ -719,7 +778,7 @@ where
                 self.recovery_wal
                     .append(&RecoveryRecord::Outgoing(OutgoingRecord {
                         recipients,
-                        message,
+                        message: DurableDkgMessage::try_from(message)?,
                     }))?;
                 failpoint::failpoint!(
                     name = "dkg.network.outgoing_persisted",
@@ -828,15 +887,17 @@ fn decode_voting_weights(stakes: &[Stake]) -> Result<Vec<NativeVotingWeight>, Se
 fn build_engine(
     epoch: Epoch,
     self_party: PartyId,
-    key_material: DkgRegisteredKeyMaterial,
-    voting_weights: Vec<NativeVotingWeight>,
+    local_keys: SecretKeys<K256SecpBackend>,
+    parties: Vec<RegisteredEngineParty>,
     params: DkgEngineParams,
     seed: [u8; 32],
 ) -> Result<DkgEngine<BlstBackend, K256SecpBackend>, SessionError> {
-    let DkgRegisteredKeyMaterial {
-        local_keys,
-        registrations,
-    } = key_material;
+    // The research API accepts parallel vectors. Split the paired runner type
+    // only at this boundary so registration and weight cannot drift internally.
+    let (voting_weights, registrations) = parties
+        .into_iter()
+        .map(|party| (party.voting_weight, party.registration))
+        .unzip::<_, _, Vec<_>, Vec<_>>();
     let setup = DkgSetupContext::from_registrations(
         self_party,
         SessionId(epoch.0),

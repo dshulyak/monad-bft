@@ -15,15 +15,15 @@ fn cursor_reads_snapshot_then_finalized_blocks_in_order() {
 
     let snapshot = scan.next(SeqNum(12)).unwrap();
     assert_eq!(snapshot, ChainRead::Snapshot(session));
-    assert!(!scan.advance(snapshot));
+    assert_eq!(scan.advance(snapshot), RecoveryTransition::None);
 
     let block_11 = scan.next(SeqNum(12)).unwrap();
     assert_eq!(block_11, ChainRead::Block(SeqNum(11), session));
-    assert!(!scan.advance(block_11));
+    assert_eq!(scan.advance(block_11), RecoveryTransition::None);
 
     let block_12 = scan.next(SeqNum(12)).unwrap();
     assert_eq!(block_12, ChainRead::Block(SeqNum(12), session));
-    assert!(scan.advance(block_12));
+    assert_eq!(scan.advance(block_12), RecoveryTransition::Completed);
     assert!(scan.next(SeqNum(12)).is_none());
 }
 
@@ -33,11 +33,11 @@ fn cursor_enters_live_phase_after_snapshot() {
     let mut scan = SessionScan::new(session, session.recovery_block);
 
     let snapshot = scan.next(SeqNum(10)).unwrap();
-    assert!(scan.advance(snapshot));
+    assert_eq!(scan.advance(snapshot), RecoveryTransition::Completed);
 
     let block = scan.next(SeqNum(11)).unwrap();
     assert_eq!(block, ChainRead::Block(SeqNum(11), session));
-    assert!(!scan.advance(block));
+    assert_eq!(scan.advance(block), RecoveryTransition::None);
     assert!(scan.next(SeqNum(11)).is_none());
 }
 
@@ -90,7 +90,7 @@ impl DkgChain for RecordingChain {
         _block: SeqNum,
         _epoch: Epoch,
         _parties: &[Address],
-    ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+    ) -> Result<Vec<Option<RegistrationCall>>, crate::DkgError> {
         unreachable!()
     }
 

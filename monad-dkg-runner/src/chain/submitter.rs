@@ -11,7 +11,7 @@ use alloy_sol_types::SolCall;
 use dkg_crypto::BLS_G2_SERIALIZED_BYTES;
 use dkg_protocol::{encode_registration, ChainCall, ChainEvent, RegistrationCall};
 use monad_eth_types::buffered_base_fee_per_gas;
-use monad_types::{Epoch, SeqNum};
+use monad_types::{Epoch, Nonce, SeqNum};
 use tracing::{info, warn};
 use zeroize::Zeroize;
 
@@ -423,7 +423,7 @@ impl TxConfig {
     fn prepare(
         &self,
         signer: &PrivateKeySigner,
-        nonce: u64,
+        nonce: Nonce,
         max_fee_per_gas: u128,
         epoch: Epoch,
         call: &ChainCall,
@@ -479,8 +479,8 @@ impl TxConfig {
                 .abi_encode())
             }
             ChainCall::PostDkgResult { qc } => Err(DkgError::ResultEpochMismatch {
-                expected: epoch.0,
-                actual: qc.epoch.0,
+                expected: epoch,
+                actual: Epoch(qc.epoch.0),
             }),
             ChainCall::PostRegistration { registration, .. } => Ok(DkgContract::registerCall {
                 epoch: epoch.0,

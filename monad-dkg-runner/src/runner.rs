@@ -10,8 +10,10 @@ use monad_types::{Epoch, NodeId, SeqNum};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    chain::{ChainEventSession, ChainRead, DkgChain, SessionScan, TxSubmitter},
-    registration::{assemble_registered_session, load_or_create_local_registration},
+    chain::{ChainEventSession, ChainRead, DkgChain, RecoveryTransition, SessionScan, TxSubmitter},
+    registration::{
+        assemble_registered_session, load_or_create_local_registration, RegisteredSession,
+    },
     reliable::ScheduledSend,
     session::{start, DkgSession, SessionEffect},
     DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
@@ -111,47 +113,90 @@ where
         );
     }
 
-    fn complete_read(&mut self, read: ChainRead) -> bool {
-        let recovery_complete_after = self.scan.advance(read);
-        if recovery_complete_after {
+    fn complete_read(&mut self, read: ChainRead) -> RecoveryTransition {
+        let transition = self.scan.advance(read);
+        if transition == RecoveryTransition::Completed {
             info!(
                 epoch = self.epoch.0,
                 through_block = read.block().0,
                 "completed DKG chain recovery"
             );
         }
-        recovery_complete_after
+        transition
     }
 }
 
 struct LocalRegistration {
     address: alloy_primitives::Address,
-    epoch: Option<Epoch>,
-    unavailable_block: Option<SeqNum>,
-    phase: LocalRegistrationPhase,
+    state: LocalRegistrationState,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum LocalRegistrationPhase {
-    Open,
-    Submitted,
-    Done,
+enum LocalRegistrationState {
+    Idle,
+    Open {
+        epoch: Epoch,
+        unavailable_block: Option<SeqNum>,
+    },
+    Submitted {
+        epoch: Epoch,
+        unavailable_block: Option<SeqNum>,
+    },
+    Done {
+        epoch: Epoch,
+    },
 }
 
 impl LocalRegistration {
     fn new(address: alloy_primitives::Address) -> Self {
         Self {
             address,
-            epoch: None,
-            unavailable_block: None,
-            phase: LocalRegistrationPhase::Done,
+            state: LocalRegistrationState::Idle,
         }
     }
 
     fn start_epoch(&mut self, epoch: Epoch) {
-        self.epoch = Some(epoch);
-        self.unavailable_block = None;
-        self.phase = LocalRegistrationPhase::Open;
+        self.state = LocalRegistrationState::Open {
+            epoch,
+            unavailable_block: None,
+        };
+    }
+}
+
+impl LocalRegistrationState {
+    fn epoch(self) -> Option<Epoch> {
+        match self {
+            Self::Idle => None,
+            Self::Open { epoch, .. } | Self::Submitted { epoch, .. } | Self::Done { epoch } => {
+                Some(epoch)
+            }
+        }
+    }
+
+    fn active(self) -> Option<(Epoch, Option<SeqNum>)> {
+        match self {
+            Self::Open {
+                epoch,
+                unavailable_block,
+            }
+            | Self::Submitted {
+                epoch,
+                unavailable_block,
+            } => Some((epoch, unavailable_block)),
+            Self::Idle | Self::Done { .. } => None,
+        }
+    }
+
+    fn set_unavailable_block(&mut self, block: Option<SeqNum>) {
+        match self {
+            Self::Open {
+                unavailable_block, ..
+            }
+            | Self::Submitted {
+                unavailable_block, ..
+            } => *unavailable_block = block,
+            Self::Idle | Self::Done { .. } => {}
+        }
     }
 }
 
@@ -159,18 +204,28 @@ struct PendingRegisteredSession<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
+    epoch: Epoch,
     validators: Vec<DkgValidator<ST>>,
-    registration_block: Option<SeqNum>,
+    boundary: RegistrationBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationBoundary {
+    AwaitingFinalizedBlock,
+    Finalized(SeqNum),
 }
 
 enum DkgRunnerEvent<ST>
 where
     ST: CertificateSignatureRecoverable,
 {
-    ChainProgress {
+    Finalized {
         block: SeqNum,
         next_epoch: Epoch,
-        sync_complete: bool,
+    },
+    SyncComplete {
+        block: SeqNum,
+        next_epoch: Epoch,
     },
     StartSession {
         epoch: Epoch,
@@ -226,18 +281,16 @@ where
     }
 
     pub fn finalized(&self, block: SeqNum, epoch_length: SeqNum) {
-        self.chain_progress(block, epoch_length, false);
+        self.send(DkgRunnerEvent::Finalized {
+            block,
+            next_epoch: block.to_epoch(epoch_length) + Epoch(1),
+        });
     }
 
     pub fn sync_complete(&self, block: SeqNum, epoch_length: SeqNum) {
-        self.chain_progress(block, epoch_length, true);
-    }
-
-    fn chain_progress(&self, block: SeqNum, epoch_length: SeqNum, sync_complete: bool) {
-        self.send(DkgRunnerEvent::ChainProgress {
+        self.send(DkgRunnerEvent::SyncComplete {
             block,
             next_epoch: block.to_epoch(epoch_length) + Epoch(1),
-            sync_complete,
         });
     }
 
@@ -260,7 +313,7 @@ where
     // The previous protocol may still be finishing while the current one runs.
     sessions: [Option<ActiveSession<ST>>; 2],
     latest_started_epoch: Option<Epoch>,
-    pending_registered_session: Option<(Epoch, PendingRegisteredSession<ST>)>,
+    pending_registered_session: Option<PendingRegisteredSession<ST>>,
     sync_block: Option<SeqNum>,
     latest_finalized: Option<SeqNum>,
     chain: ManagedChain,
@@ -306,13 +359,13 @@ where
             let timer = self.next_timer();
             tokio::select! {
                 event = events.recv_async() => match event {
-                    Ok(DkgRunnerEvent::ChainProgress { block, next_epoch, sync_complete }) => {
+                    Ok(DkgRunnerEvent::Finalized { block, next_epoch }) => {
                         self.prepare_registration(next_epoch);
-                        if sync_complete {
-                            self.notify_sync_complete(block);
-                        } else {
-                            self.notify_finalized(block);
-                        }
+                        self.notify_finalized(block);
+                    }
+                    Ok(DkgRunnerEvent::SyncComplete { block, next_epoch }) => {
+                        self.prepare_registration(next_epoch);
+                        self.notify_sync_complete(block);
                     }
                     Ok(DkgRunnerEvent::StartSession { epoch, validators }) => {
                         if let Err(err) = self.start_chain_registered_session(epoch, validators) {
@@ -343,12 +396,13 @@ where
         if self
             .chain
             .registration
-            .epoch
+            .state
+            .epoch()
             .is_some_and(|current| current >= epoch)
         {
             return;
         }
-        if let Some(previous) = self.chain.registration.epoch {
+        if let Some(previous) = self.chain.registration.state.epoch() {
             self.chain.submitter.cancel_registration(previous);
         }
         self.chain.registration.start_epoch(epoch);
@@ -389,9 +443,9 @@ where
             return;
         }
         self.latest_finalized = Some(block);
-        if let Some((_, pending)) = self.pending_registered_session.as_mut() {
-            if pending.registration_block.is_none() {
-                pending.registration_block = Some(block);
+        if let Some(pending) = self.pending_registered_session.as_mut() {
+            if pending.boundary == RegistrationBoundary::AwaitingFinalizedBlock {
+                pending.boundary = RegistrationBoundary::Finalized(block);
             }
         }
     }
@@ -410,25 +464,26 @@ where
             || self
                 .pending_registered_session
                 .as_ref()
-                .is_some_and(|(pending, _)| *pending >= epoch)
+                .is_some_and(|pending| pending.epoch >= epoch)
         {
             return Ok(());
         }
-        self.pending_registered_session = Some((
+        self.pending_registered_session = Some(PendingRegisteredSession {
             epoch,
-            PendingRegisteredSession {
-                validators,
-                registration_block: self.latest_finalized,
-            },
-        ));
+            validators,
+            boundary: self.latest_finalized.map_or(
+                RegistrationBoundary::AwaitingFinalizedBlock,
+                RegistrationBoundary::Finalized,
+            ),
+        });
         self.settle_chain();
         Ok(())
     }
 
     fn close_registration_window(&mut self, epoch: Epoch) {
-        if self.chain.registration.epoch == Some(epoch) {
+        if self.chain.registration.state.epoch() == Some(epoch) {
             self.chain.submitter.cancel_registration(epoch);
-            self.chain.registration.phase = LocalRegistrationPhase::Done;
+            self.chain.registration.state = LocalRegistrationState::Done { epoch };
         }
     }
 
@@ -446,25 +501,23 @@ where
             let Some(latest) = self.latest_finalized else {
                 return;
             };
-            let registration = &self.chain.registration;
-            let Some(epoch) = registration.epoch else {
+            let Some((epoch, unavailable_block)) = self.chain.registration.state.active() else {
                 return;
             };
-            if registration.phase == LocalRegistrationPhase::Done {
-                return;
-            }
-            let block = registration.unavailable_block.unwrap_or(latest);
+            let block = unavailable_block.unwrap_or(latest);
             let result =
                 self.chain
                     .io
                     .read_registrations(block, epoch, &[self.chain.registration.address]);
             match result {
                 Ok(mut registrations) => {
-                    self.chain.registration.unavailable_block = None;
-                    debug_assert!(registrations.len() <= 1);
-                    if let Err(err) =
-                        self.accept_local_registration_read(epoch, block, registrations.pop())
-                    {
+                    self.chain.registration.state.set_unavailable_block(None);
+                    debug_assert_eq!(registrations.len(), 1);
+                    if let Err(err) = self.accept_local_registration_read(
+                        epoch,
+                        block,
+                        registrations.pop().flatten(),
+                    ) {
                         error!(
                             ?err,
                             epoch = epoch.0,
@@ -478,13 +531,18 @@ where
                     }
                 }
                 Err(DkgError::ChainDataUnavailable { .. }) => {
-                    self.chain.registration.unavailable_block = Some(block);
+                    self.chain
+                        .registration
+                        .state
+                        .set_unavailable_block(Some(block));
                     return;
                 }
                 Err(err) => {
-                    let registration = &mut self.chain.registration;
-                    registration.unavailable_block = Some(block);
-                    debug!(?err, epoch = epoch.0, block = block.0, party = %registration.address, "failed to read local DKG registration from finalized state");
+                    self.chain
+                        .registration
+                        .state
+                        .set_unavailable_block(Some(block));
+                    debug!(?err, epoch = epoch.0, block = block.0, party = %self.chain.registration.address, "failed to read local DKG registration from finalized state");
                     return;
                 }
             }
@@ -498,19 +556,19 @@ where
         observed: Option<RegistrationCall>,
     ) -> Result<(), DkgError> {
         let storage_root = self.storage_root.clone();
-        if self.chain.registration.epoch != Some(epoch) {
+        if self.chain.registration.state.epoch() != Some(epoch) {
             return Ok(());
         }
         let local_bytes = match load_or_create_local_registration(
             &storage_root,
             epoch,
-            self.chain.registration.address.into_array(),
+            self.chain.registration.address,
             &self.chain.local_keys,
             observed.as_ref(),
         ) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.chain.registration.phase = LocalRegistrationPhase::Done;
+                self.chain.registration.state = LocalRegistrationState::Done { epoch };
                 return Err(DkgError::operation("load local DKG registration", err));
             }
         };
@@ -521,7 +579,7 @@ where
         );
 
         if let Some(bytes) = observed {
-            self.chain.registration.phase = LocalRegistrationPhase::Done;
+            self.chain.registration.state = LocalRegistrationState::Done { epoch };
             if bytes != local_bytes {
                 return Err(DkgError::FinalizedRegistrationConflict {
                     address: self.chain.registration.address,
@@ -531,17 +589,20 @@ where
                 .submitter
                 .confirm_registration(epoch, &local_bytes);
         } else {
-            match self.chain.registration.phase {
-                LocalRegistrationPhase::Submitted => {
+            match self.chain.registration.state {
+                LocalRegistrationState::Submitted { .. } => {
                     self.chain.submitter.retry_registration(epoch, block);
                 }
-                LocalRegistrationPhase::Open => {
+                LocalRegistrationState::Open { .. } => {
                     self.chain
                         .submitter
                         .submit_registration(epoch, block, local_bytes);
-                    self.chain.registration.phase = LocalRegistrationPhase::Submitted;
+                    self.chain.registration.state = LocalRegistrationState::Submitted {
+                        epoch,
+                        unavailable_block: None,
+                    };
                 }
-                LocalRegistrationPhase::Done => {}
+                LocalRegistrationState::Idle | LocalRegistrationState::Done { .. } => {}
             }
         }
         Ok(())
@@ -555,22 +616,24 @@ where
         let Some((epoch, block, parties)) =
             self.pending_registered_session
                 .as_ref()
-                .and_then(|(epoch, pending)| {
-                    pending.registration_block.map(|block| {
-                        let parties = pending
+                .and_then(|pending| match pending.boundary {
+                    RegistrationBoundary::Finalized(block) => Some((
+                        pending.epoch,
+                        block,
+                        pending
                             .validators
                             .iter()
-                            .map(|validator| alloy_primitives::Address::from(validator.address))
-                            .collect::<Vec<_>>();
-                        (*epoch, block, parties)
-                    })
+                            .map(|validator| validator.address)
+                            .collect::<Vec<_>>(),
+                    )),
+                    RegistrationBoundary::AwaitingFinalizedBlock => None,
                 })
         else {
             return;
         };
         match io.read_registrations(block, epoch, &parties) {
             Ok(state) => {
-                if let Err(err) = self.accept_registration_snapshot(epoch, state) {
+                if let Err(err) = self.accept_registration_snapshot(epoch, block, state) {
                     error!(
                         ?err,
                         epoch = epoch.0,
@@ -592,17 +655,16 @@ where
     fn accept_registration_snapshot(
         &mut self,
         epoch: Epoch,
-        registrations: Vec<RegistrationCall>,
+        recovery_block: SeqNum,
+        registrations: Vec<Option<RegistrationCall>>,
     ) -> Result<(), DkgError> {
-        let Some((_, pending)) = self
+        let Some(pending) = self
             .pending_registered_session
-            .take_if(|(pending_epoch, _)| *pending_epoch == epoch)
+            .take_if(|pending| pending.epoch == epoch)
         else {
             return Ok(());
         };
-        let recovery_block = pending
-            .registration_block
-            .expect("registration read has a finalized block");
+        debug_assert!(pending.boundary == RegistrationBoundary::Finalized(recovery_block));
         let local_keys = &self.chain.local_keys;
         let registered = assemble_registered_session(
             epoch,
@@ -612,36 +674,23 @@ where
             registrations,
         )
         .map_err(|err| DkgError::operation("assemble registered DKG session", err))?;
-        self.start_session_at(
-            epoch,
-            registered.validators,
-            registered.key_material,
-            recovery_block,
-        )
+        self.start_session_at(epoch, registered, recovery_block)
     }
 
     fn start_session_at(
         &mut self,
         epoch: Epoch,
-        validators: Vec<DkgValidator<ST>>,
-        key_material: crate::DkgRegisteredKeyMaterial,
+        registered: RegisteredSession<ST>,
         recovery_block: SeqNum,
     ) -> Result<(), DkgError> {
-        let party_count = validators.len();
+        let party_count = registered.parties.len();
         if self
             .latest_started_epoch
             .is_some_and(|started| started >= epoch)
         {
             return Ok(());
         }
-        let Some(session) = start(
-            epoch,
-            self.self_id,
-            validators,
-            &self.storage_root,
-            key_material,
-        )?
-        else {
+        let Some(session) = start(epoch, self.self_id, &self.storage_root, registered)? else {
             self.latest_started_epoch = Some(epoch);
             return Ok(());
         };
@@ -784,14 +833,14 @@ where
                     return;
                 }
             };
-            let recovery_complete = self
+            let recovery_transition = self
                 .sessions
                 .iter_mut()
                 .flatten()
                 .find(|session| session.epoch == read.session().epoch)
                 .expect("blocking DKG read keeps its session alive")
                 .complete_read(read);
-            if let Err(err) = self.accept_chain_read(read, events, recovery_complete) {
+            if let Err(err) = self.accept_chain_read(read, events, recovery_transition) {
                 error!(
                     ?err,
                     epoch = read.session().epoch.0,
@@ -806,7 +855,7 @@ where
         &mut self,
         read: ChainRead,
         events: Vec<ChainEvent>,
-        recovery_complete: bool,
+        recovery_transition: RecoveryTransition,
     ) -> Result<(), DkgError> {
         let epoch = read.session().epoch;
         let session = self
@@ -814,14 +863,14 @@ where
             .iter_mut()
             .flatten()
             .find(|session| session.epoch == epoch)
-            .ok_or(DkgError::NoActiveSession { epoch: epoch.0 })?;
+            .ok_or(DkgError::NoActiveSession { epoch })?;
         for event in events.iter().cloned() {
             session
                 .protocol
                 .handle_chain_event(event)
                 .map_err(|err| DkgError::operation("handle DKG chain event", err))?;
         }
-        if recovery_complete {
+        if recovery_transition == RecoveryTransition::Completed {
             session
                 .protocol
                 .finish_chain_recovery()
@@ -900,7 +949,7 @@ mod tests {
             .enumerate()
             .map(|(index, node_id)| DkgValidator::<NopSignature> {
                 node_id: *node_id,
-                address: [index as u8 + 1; 20],
+                address: Address::from([index as u8 + 1; 20]),
                 stake: monad_types::Stake(alloy_primitives::U256::from(
                     crate::session::WEI_PER_MON,
                 )),
@@ -911,18 +960,13 @@ mod tests {
             .start_chain_registered_session(Epoch(2), validators)
             .unwrap();
         assert_eq!(
-            runner
-                .pending_registered_session
-                .as_ref()
-                .unwrap()
-                .1
-                .registration_block,
-            None
+            runner.pending_registered_session.as_ref().unwrap().boundary,
+            RegistrationBoundary::AwaitingFinalizedBlock
         );
 
         runner.notify_sync_complete(SeqNum(100));
-        let (_, pending) = runner.pending_registered_session.as_ref().unwrap();
-        assert_eq!(pending.registration_block, Some(SeqNum(100)));
+        let pending = runner.pending_registered_session.as_ref().unwrap();
+        assert!(pending.boundary == RegistrationBoundary::Finalized(SeqNum(100)));
     }
 
     #[test]
@@ -940,7 +984,7 @@ mod tests {
         let validators = || {
             vec![DkgValidator::<NopSignature> {
                 node_id: nodes[0],
-                address: [1; 20],
+                address: Address::from([1; 20]),
                 stake: monad_types::Stake(alloy_primitives::U256::from(
                     crate::session::WEI_PER_MON,
                 )),
@@ -958,7 +1002,7 @@ mod tests {
             runner
                 .pending_registered_session
                 .as_ref()
-                .map(|(epoch, _)| *epoch),
+                .map(|pending| pending.epoch),
             Some(Epoch(2))
         );
     }
@@ -978,7 +1022,8 @@ mod tests {
                 } else {
                     DkgLocalKeyMaterial::derive([index as u8 + 20; 32])
                 };
-                keys.registration(*address, 2).unwrap()
+                keys.registration(Address::from(*address), Epoch(2))
+                    .unwrap()
             })
             .collect();
         let chain = Arc::new(RegistrationChain {
@@ -997,7 +1042,7 @@ mod tests {
             .zip(addresses)
             .map(|(node_id, address)| DkgValidator::<NopSignature> {
                 node_id: *node_id,
-                address,
+                address: Address::from(address),
                 stake: monad_types::Stake(alloy_primitives::U256::from(
                     crate::session::WEI_PER_MON,
                 )),
@@ -1040,10 +1085,7 @@ mod tests {
         let first = transaction_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let (address, keys) = {
             let managed = &runner.chain;
-            (
-                managed.registration.address.into_array(),
-                managed.local_keys.clone(),
-            )
+            (managed.registration.address, managed.local_keys.clone())
         };
         let registration =
             load_or_create_local_registration(directory.path(), Epoch(2), address, &keys, None)
@@ -1070,7 +1112,7 @@ mod tests {
             block: SeqNum,
             _epoch: Epoch,
             _parties: &[Address],
-        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
+        ) -> Result<Vec<Option<RegistrationCall>>, crate::DkgError> {
             Err(crate::DkgError::ChainDataUnavailable { block })
         }
 
@@ -1116,8 +1158,8 @@ mod tests {
             _block: SeqNum,
             _epoch: Epoch,
             _parties: &[Address],
-        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
-            Ok(self.registration.lock().unwrap().iter().copied().collect())
+        ) -> Result<Vec<Option<RegistrationCall>>, crate::DkgError> {
+            Ok(vec![*self.registration.lock().unwrap()])
         }
 
         fn read_events(
@@ -1154,12 +1196,15 @@ mod tests {
             _block: SeqNum,
             _epoch: Epoch,
             parties: &[Address],
-        ) -> Result<Vec<RegistrationCall>, crate::DkgError> {
-            Ok(self
-                .state
+        ) -> Result<Vec<Option<RegistrationCall>>, crate::DkgError> {
+            Ok(parties
                 .iter()
-                .filter(|registration| parties.contains(&Address::from(registration.address.0)))
-                .copied()
+                .map(|party| {
+                    self.state
+                        .iter()
+                        .find(|registration| Address::from(registration.address.0) == *party)
+                        .copied()
+                })
                 .collect())
         }
 

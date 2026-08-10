@@ -229,7 +229,7 @@ impl TriedbDkgStateReader {
         contract: Address,
         epoch: Epoch,
         parties: &[Address],
-    ) -> Result<Vec<RegistrationCall>, TriedbStateError>
+    ) -> Result<Vec<Option<RegistrationCall>>, TriedbStateError>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -248,9 +248,12 @@ impl TriedbDkgStateReader {
                     party,
                 },
             )?;
-            if registration.exists {
-                registrations.push(registration.registration.into_registration(party)?);
-            }
+            registrations.push(
+                registration
+                    .exists
+                    .then(|| registration.registration.into_registration(party))
+                    .transpose()?,
+            );
         }
 
         Ok(registrations)

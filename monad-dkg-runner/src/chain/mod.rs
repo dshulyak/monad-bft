@@ -8,7 +8,7 @@ use dkg_crypto::{BlsG2SerializedBytes, SecpPointBytes, BLS_G2_SERIALIZED_BYTES};
 use dkg_protocol::{
     BveQc, ChainCall, ChainEvent, DkgDoneQc, PCQc, QcSignature, QcSignatureBytes, RegistrationCall,
 };
-use monad_types::{Epoch, SeqNum};
+use monad_types::{Epoch, Nonce, SeqNum};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -19,7 +19,7 @@ mod submitter;
 mod triedb;
 mod triedb_state;
 
-pub(crate) use recovery::SessionScan;
+pub(crate) use recovery::{RecoveryTransition, SessionScan};
 pub(crate) use submitter::TxSubmitter;
 pub use triedb::new_triedb_runner;
 
@@ -312,7 +312,7 @@ const DEFAULT_TX_MAX_PRIORITY_FEE_PER_GAS: u128 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DkgTransactionContext {
-    pub nonce: u64,
+    pub nonce: Nonce,
     pub base_fee_per_gas: u64,
 }
 
@@ -324,15 +324,16 @@ pub(crate) struct DkgTransactionContext {
 pub(crate) trait DkgChain: Send + Sync + 'static {
     /// Reads registrations for the requested parties at exactly `block`.
     ///
-    /// The returned registrations must be in request order and omit
-    /// unregistered parties. Returns [`DkgError::ChainDataUnavailable`] when
+    /// The result has exactly one entry per requested party, in request order;
+    /// `None` identifies an unregistered party. Returns
+    /// [`DkgError::ChainDataUnavailable`] when
     /// the execution state has not reached the requested block.
     fn read_registrations(
         &self,
         block: SeqNum,
         epoch: Epoch,
         parties: &[Address],
-    ) -> Result<Vec<RegistrationCall>, DkgError>;
+    ) -> Result<Vec<Option<RegistrationCall>>, DkgError>;
 
     /// Reads either the recovery snapshot or one finalized block. Returns
     /// [`DkgError::ChainDataUnavailable`] when its state or receipts are not
@@ -435,7 +436,7 @@ mod bindings_tests {
     fn registration_boundary_round_trips_protocol_encoding() {
         let address = Address::repeat_byte(0xA5);
         let registration = DkgLocalKeyMaterial::derive([0x11; 32])
-            .registration(address.into_array(), 7)
+            .registration(address, Epoch(7))
             .unwrap();
 
         let contract = ContractRegistration::try_from((&registration, address)).unwrap();
@@ -447,7 +448,7 @@ mod bindings_tests {
     fn registration_boundary_rejects_zero_qc_verifier() {
         let address = Address::repeat_byte(0xA5);
         let registration = DkgLocalKeyMaterial::derive([0x11; 32])
-            .registration(address.into_array(), 7)
+            .registration(address, Epoch(7))
             .unwrap();
         let mut contract = ContractRegistration::try_from((&registration, address)).unwrap();
         contract.qcVerifier = Address::ZERO;

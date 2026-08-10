@@ -69,7 +69,7 @@ where
         block: SeqNum,
         epoch: Epoch,
         parties: &[Address],
-    ) -> Result<Vec<RegistrationCall>, DkgError> {
+    ) -> Result<Vec<Option<RegistrationCall>>, DkgError> {
         let mut state = self.state_read.clone();
         self.state_reader
             .read_registrations(&mut state, block, self.contract, epoch, parties)
