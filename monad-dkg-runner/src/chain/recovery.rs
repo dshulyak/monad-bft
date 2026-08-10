@@ -21,32 +21,37 @@ use monad_types::SeqNum;
 use super::{ChainEventSession, ChainRead};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SessionScan {
+pub(crate) struct SessionScan {
     session: ChainEventSession,
     phase: SessionPhase,
 }
 
 impl SessionScan {
-    pub(super) fn new(session: ChainEventSession, finalized: Option<SeqNum>) -> Self {
+    pub(crate) fn new(session: ChainEventSession, finalized: SeqNum) -> Self {
         Self {
             session,
             phase: SessionPhase::Snapshot(SnapshotPhase {
-                recovery_through: finalized.map_or(session.recovery_block, |head| {
-                    head.max(session.recovery_block)
-                }),
+                recovery_through: finalized.max(session.recovery_block),
             }),
         }
     }
 
-    pub(super) fn next(self, latest: SeqNum) -> Option<ChainRead> {
-        self.phase.next(self.session, latest)
+    pub(crate) fn next(self, latest: SeqNum) -> Option<ChainRead> {
+        self.phase
+            .next(self.session, latest.max(self.session.recovery_block))
     }
 
-    pub(super) fn recovery_block(self) -> SeqNum {
-        self.session.recovery_block
+    pub(crate) fn restart(&mut self, recovery_block: SeqNum, finalized: SeqNum) {
+        *self = Self::new(
+            ChainEventSession {
+                recovery_block,
+                ..self.session
+            },
+            finalized,
+        );
     }
 
-    pub(super) fn advance(&mut self, read: ChainRead) -> bool {
+    pub(crate) fn advance(&mut self, read: ChainRead) -> bool {
         let (phase, recovery_complete) = self.phase.complete(self.session, read);
         self.phase = phase;
         recovery_complete

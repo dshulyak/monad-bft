@@ -8,13 +8,12 @@ use std::{
 
 use alloy_primitives::U256;
 use bytes::Bytes;
-use dkg_core::{CoreInput, PartyId, PartySet, PartySetError, RuntimeCommand, SessionId};
-use dkg_crypto::{BlstBackend, K256SecpBackend, Matrix, MatrixShapeError};
+use dkg_core::{CoreInput, PartyId, RuntimeCommand, SessionId};
+use dkg_crypto::{BlstBackend, K256SecpBackend};
 use dkg_protocol::{
-    quantize, ChainCall, ChainEvent, DkgEngine, DkgEngineError, DkgEngineParams, DkgEnginePhase,
-    DkgInput, DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey, DkgMessageKind,
-    DkgSetupContext, DkgSetupError, DkgThresholdError, DkgThresholds, Epsilon, NativeVotingWeight,
-    QuantizationError, VirtualTopology, VirtualTopologyError,
+    ChainCall, ChainEvent, DkgDeliveryPolicy, DkgEngine, DkgEngineError, DkgEngineParams,
+    DkgEnginePhase, DkgInput, DkgMessage, DkgMessageError, DkgMessageId, DkgMessageKey,
+    DkgMessageKind, DkgRegisteredSetupError, DkgSetupContext, Epsilon, NativeVotingWeight,
 };
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
@@ -109,22 +108,12 @@ impl<ST: CertificateSignatureRecoverable> DkgPeerMap<ST> {
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
-    #[error("derive DKG thresholds failed: {0}")]
-    Threshold(#[source] DkgThresholdError),
-    #[error("build DKG party set failed: {0}")]
-    PartySet(#[source] PartySetError),
-    #[error("build DKG topology failed: {0}")]
-    Topology(#[source] VirtualTopologyError),
-    #[error("quantize DKG stake failed: {0}")]
-    Quantization(#[source] QuantizationError),
     #[error("DKG validator stake does not round to a positive u64 MON weight")]
     InvalidVotingWeights,
-    #[error("assemble DKG setup failed: {0}")]
-    Setup(#[source] DkgSetupError),
+    #[error("assemble registered DKG setup failed: {0}")]
+    RegisteredSetup(#[from] DkgRegisteredSetupError),
     #[error("initialize research DKG engine failed: {0:?}")]
     EngineInitialization(DkgEngineError),
-    #[error("shape DKG receiver public matrix failed: {0}")]
-    ReceiverMatrix(#[source] MatrixShapeError),
     #[error(transparent)]
     RecoveryWal(#[from] RecoveryWalError),
     #[error("classify DKG message failed: {0}")]
@@ -227,13 +216,20 @@ where
         Bytes,
         DkgObsolescence,
     >,
-    delivery_outbound: Vec<DeliveryOutbound<ST>>,
-    chain_calls: Vec<ChainCall>,
+    effects: Vec<SessionEffect<ST>>,
     pending_inputs: VecDeque<PendingEngineInput>,
     recovery_wal: RecoveryWal,
     recovered_outgoing: Vec<OutgoingRecord>,
     last_phase: DkgEnginePhase,
     awaiting_chain_recovery: bool,
+}
+
+pub(crate) enum SessionEffect<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    Network(DeliveryOutbound<ST>),
+    Chain(Box<ChainCall>),
 }
 
 enum PendingEngineInput {
@@ -254,12 +250,8 @@ where
         self.retries.next_timer()
     }
 
-    pub(crate) fn take_delivery_outbound(&mut self) -> Vec<DeliveryOutbound<ST>> {
-        mem::take(&mut self.delivery_outbound)
-    }
-
-    pub(crate) fn take_chain_calls(&mut self) -> Vec<ChainCall> {
-        mem::take(&mut self.chain_calls)
+    pub(crate) fn take_effects(&mut self) -> Vec<SessionEffect<ST>> {
+        mem::take(&mut self.effects)
     }
 
     fn new(init: SessionInit<ST>) -> Result<Self, SessionError> {
@@ -301,8 +293,7 @@ where
             max_ladder_level,
             mapping: init.mapping,
             retries: RetryScheduler::new(DKG_RETRY),
-            delivery_outbound: Vec::new(),
-            chain_calls: Vec::new(),
+            effects: Vec::new(),
             pending_inputs: VecDeque::new(),
             recovery_wal: init.recovery_wal,
             recovered_outgoing,
@@ -337,8 +328,12 @@ where
     }
 
     pub(crate) fn handle_timer(&mut self, now: Instant) -> Result<(), SessionError> {
-        self.delivery_outbound
-            .extend(self.retries.retry_due(now).into_iter().map(Into::into));
+        self.effects.extend(
+            self.retries
+                .retry_due(now)
+                .into_iter()
+                .map(|send| SessionEffect::Network(send.into())),
+        );
         self.settle()
     }
 
@@ -594,6 +589,13 @@ where
                 recipients,
                 message,
             } = record;
+            if message.delivery_policy() != DkgDeliveryPolicy::Durable {
+                warn!(
+                    kind = ?message.kind(),
+                    "skipping non-durable DKG message found in recovery WAL"
+                );
+                continue;
+            }
             let Some(first_recipient) = recipients.first().copied() else {
                 warn!("skipping persisted DKG message without recipients");
                 continue;
@@ -620,7 +622,7 @@ where
                 payload: message.into_bytes(),
             }
             .into();
-            self.delivery_outbound.extend(
+            self.effects.extend(
                 self.retries
                     .enqueue(
                         message_id,
@@ -630,7 +632,7 @@ where
                         Instant::now(),
                     )?
                     .into_iter()
-                    .map(Into::into),
+                    .map(|send| SessionEffect::Network(send.into())),
             );
         }
         Ok(())
@@ -640,7 +642,7 @@ where
         if let Some(group) = delivery_abort_group_for_chain_call(&call) {
             self.retries.observe(group);
         }
-        self.chain_calls.push(call);
+        self.effects.push(SessionEffect::Chain(Box::new(call)));
         Ok(())
     }
 
@@ -649,74 +651,15 @@ where
         recipients: impl IntoIterator<Item = PartyId>,
         message: DkgMessage,
     ) -> Result<(), SessionError> {
-        let kind = message.kind();
+        let policy = message.delivery_policy();
         let recipients = recipients.into_iter().collect::<BTreeSet<_>>();
         if recipients.is_empty() {
             return Ok(());
         }
-        if let Some(recipient) = recipients
-            .iter()
-            .find(|recipient| self.mapping.member_id(**recipient).is_none())
-        {
-            return Err(SessionError::UnknownParty {
-                action: "send to",
-                party: recipient.0,
-            });
-        }
-        if kind.is_sync() {
-            if recipients.len() != 1 {
-                return Err(SessionError::SyncMustBeUnicast);
-            }
-            let recipient = *recipients.first().expect("checked one sync recipient");
-            let identity = message.identity(
-                self.self_party,
-                recipient,
-                self.party_count,
-                self.max_ladder_level,
-            )?;
-            let to = self
-                .mapping
-                .member_id(recipient)
-                .expect("recipient validated above");
-            if kind.is_sync_request() {
-                let payload = DeliveryEnvelope {
-                    epoch: self.epoch.0,
-                    payload: message.into_bytes(),
-                }
-                .into();
-                self.delivery_outbound.extend(
-                    self.retries
-                        .enqueue(
-                            identity.message_id(),
-                            [to],
-                            payload,
-                            Some(DeliveryAbortGroup::Extraction),
-                            Instant::now(),
-                        )?
-                        .into_iter()
-                        .map(Into::into),
-                );
-                return Ok(());
-            }
-            // A lost response is recreated by the requester's next retry, so it
-            // must not acquire its own retry timer or sender-side dedup entry.
-            self.delivery_outbound.push(DeliveryOutbound {
-                to,
-                payload: DeliveryEnvelope {
-                    epoch: self.epoch.0,
-                    payload: message.into_bytes(),
-                }
-                .into(),
-            });
-            return Ok(());
+        if policy != DkgDeliveryPolicy::Durable && recipients.len() != 1 {
+            return Err(SessionError::SyncMustBeUnicast);
         }
         let message_id = self.message_id_for_recipients(&recipients, &message)?;
-        let payload = message.as_bytes().clone();
-        let abort_group = delivery_abort_group_for_peer_payload(
-            kind,
-            self.self_party,
-            *recipients.first().expect("checked recipients above"),
-        );
         let delivery_recipients = recipients
             .iter()
             .map(|party| {
@@ -730,33 +673,65 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let delivery_payload = DeliveryEnvelope {
             epoch: self.epoch.0,
-            payload: payload.clone(),
+            payload: message.as_bytes().clone(),
         }
         .into();
-        let sends = self.retries.enqueue(
-            message_id.clone(),
-            delivery_recipients,
-            delivery_payload,
-            abort_group,
-            Instant::now(),
-        )?;
-        if sends.is_empty() {
-            return Ok(());
+        match policy {
+            DkgDeliveryPolicy::Once => {
+                self.effects.push(SessionEffect::Network(DeliveryOutbound {
+                    to: delivery_recipients[0],
+                    payload: delivery_payload,
+                }));
+            }
+            DkgDeliveryPolicy::Retry => {
+                self.effects.extend(
+                    self.retries
+                        .enqueue(
+                            message_id,
+                            delivery_recipients,
+                            delivery_payload,
+                            Some(DeliveryAbortGroup::Extraction),
+                            Instant::now(),
+                        )?
+                        .into_iter()
+                        .map(|send| SessionEffect::Network(send.into())),
+                );
+            }
+            DkgDeliveryPolicy::Durable => {
+                let abort_group = delivery_abort_group_for_peer_payload(
+                    message.kind(),
+                    self.self_party,
+                    *recipients.first().expect("checked recipients above"),
+                );
+                let sends = self.retries.enqueue(
+                    message_id,
+                    delivery_recipients,
+                    delivery_payload,
+                    abort_group,
+                    Instant::now(),
+                )?;
+                if sends.is_empty() {
+                    return Ok(());
+                }
+                // The scheduler is mutated first, but its sends remain private until
+                // the WAL succeeds. A WAL failure terminates the session without
+                // exposing an output that recovery could not reconstruct.
+                self.recovery_wal
+                    .append(&RecoveryRecord::Outgoing(OutgoingRecord {
+                        recipients,
+                        message,
+                    }))?;
+                failpoint::failpoint!(
+                    name = "dkg.network.outgoing_persisted",
+                    description = "after durable DKG output and before network delivery is exposed",
+                );
+                self.effects.extend(
+                    sends
+                        .into_iter()
+                        .map(|send| SessionEffect::Network(send.into())),
+                );
+            }
         }
-        // The scheduler is mutated first, but its sends remain private until
-        // the WAL succeeds. A WAL failure terminates the session without
-        // exposing an output that recovery could not reconstruct.
-        self.recovery_wal
-            .append(&RecoveryRecord::Outgoing(OutgoingRecord {
-                recipients,
-                message,
-            }))?;
-        failpoint::failpoint!(
-            name = "dkg.network.outgoing_persisted",
-            description = "after durable DKG output and before network delivery is exposed",
-        );
-        self.delivery_outbound
-            .extend(sends.into_iter().map(Into::into));
         Ok(())
     }
 
@@ -862,55 +837,14 @@ fn build_engine(
         local_keys,
         registrations,
     } = key_material;
-    let party_count = registrations.len();
-    let receiver_publics = Matrix::from_vec(
-        party_count,
-        1,
-        registrations
-            .iter()
-            .map(|registration| registration.receiver.public_key)
-            .collect(),
-    )
-    .map_err(SessionError::ReceiverMatrix)?;
-    let epsilon = Epsilon::default();
-    let quantized = quantize(&voting_weights, epsilon, params.output_count)
-        .map_err(SessionError::Quantization)?;
-    let party_set = PartySet::new(
-        (0..party_count)
-            .map(|party| PartyId(u32::try_from(party).expect("party count fits u32")))
-            .collect(),
-    )
-    .map_err(SessionError::PartySet)?;
-    let topology = VirtualTopology::from_weights(
-        party_set,
-        voting_weights,
-        quantized.dealer_tickets,
-        quantized.receiver_tickets,
-    )
-    .map_err(SessionError::Topology)?;
-    let thresholds = DkgThresholds::derive_quantized(
-        &topology,
-        params.output_count,
-        quantized.dealer_batch_size,
-        epsilon,
-    )
-    .map_err(SessionError::Threshold)?;
-    let setup = DkgSetupContext::assemble(
+    let setup = DkgSetupContext::from_registrations(
         self_party,
         SessionId(epoch.0),
-        topology,
-        thresholds,
-        registrations
-            .iter()
-            .map(|registration| registration.qc_verifier)
-            .collect(),
-        receiver_publics,
-        registrations
-            .iter()
-            .map(|registration| registration.address)
-            .collect(),
-    )
-    .map_err(SessionError::Setup)?;
+        voting_weights,
+        &registrations,
+        params.output_count,
+        Epsilon::default(),
+    )?;
     DkgEngine::from_setup(setup, params, local_keys, seed)
         .map_err(SessionError::EngineInitialization)
 }

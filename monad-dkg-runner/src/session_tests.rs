@@ -63,9 +63,14 @@ fn session_submits_chain_call_and_processes_finalized_event() {
     session
         .handle_chain_call(ChainCall::PostDkgResult { qc: qc.clone() })
         .unwrap();
+    let effects = session.take_effects();
+    assert_eq!(effects.len(), 1);
+    let SessionEffect::Chain(submitted) = &effects[0] else {
+        panic!("expected DKG result chain effect");
+    };
     assert_eq!(
-        session.take_chain_calls(),
-        vec![ChainCall::PostDkgResult { qc: qc.clone() }]
+        submitted.as_ref(),
+        &ChainCall::PostDkgResult { qc: qc.clone() }
     );
     let wal_len = std::fs::metadata(&wal_path).unwrap().len();
 
@@ -138,7 +143,7 @@ fn protocol_rejection_is_not_persisted_or_dispatched() {
     }
 
     assert!(RecoveryState::load(&wal_path).unwrap().incoming.is_empty());
-    assert!(session.delivery_outbound.is_empty());
+    assert!(session.effects.is_empty());
 }
 
 fn test_session(
@@ -173,8 +178,7 @@ fn test_session(
     })
     .unwrap();
     session.finish_chain_recovery().unwrap();
-    session.take_chain_calls();
-    session.take_delivery_outbound();
+    session.take_effects();
     (session, wal_path)
 }
 

@@ -2,18 +2,18 @@ use std::{mem, path::PathBuf, sync::Arc, time::Instant};
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
-use dkg_protocol::RegistrationCall;
+use dkg_protocol::{ChainEvent, RegistrationCall};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_types::{Epoch, NodeId, SeqNum};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    chain::{ChainEventBatch, ChainEventReader, ChainEventSession, DkgChain, TxSubmitter},
+    chain::{ChainEventSession, ChainRead, DkgChain, SessionScan, TxSubmitter},
     registration::{assemble_registered_session, load_or_create_local_registration},
     reliable::ScheduledSend,
-    session::{start, DkgSession},
+    session::{start, DkgSession, SessionEffect},
     DkgChainConfig, DkgError, DkgLocalKeyMaterial, DkgValidator,
 };
 
@@ -57,8 +57,71 @@ struct ManagedChain {
     io: Arc<dyn DkgChain>,
     local_keys: DkgLocalKeyMaterial,
     submitter: TxSubmitter,
-    event_reader: ChainEventReader,
     registration: LocalRegistration,
+}
+
+struct ActiveSession<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    epoch: Epoch,
+    protocol: DkgSession<ST>,
+    scan: SessionScan,
+}
+
+impl<ST> ActiveSession<ST>
+where
+    ST: CertificateSignatureRecoverable,
+{
+    fn new(
+        epoch: Epoch,
+        party_count: usize,
+        recovery_block: SeqNum,
+        finalized: SeqNum,
+        protocol: DkgSession<ST>,
+    ) -> Self {
+        let chain_session = ChainEventSession {
+            epoch,
+            party_count,
+            recovery_block,
+        };
+        info!(
+            epoch = epoch.0,
+            party_count,
+            recovery_block = recovery_block.0,
+            "started DKG chain recovery"
+        );
+        Self {
+            epoch,
+            protocol,
+            scan: SessionScan::new(chain_session, finalized),
+        }
+    }
+
+    fn next_read(&self, finalized: SeqNum) -> Option<ChainRead> {
+        self.scan.next(finalized)
+    }
+
+    fn restart_scan(&mut self, recovery_block: SeqNum, finalized: SeqNum) {
+        self.scan.restart(recovery_block, finalized);
+        info!(
+            epoch = self.epoch.0,
+            recovery_block = recovery_block.0,
+            "restarted DKG chain recovery"
+        );
+    }
+
+    fn complete_read(&mut self, read: ChainRead) -> bool {
+        let recovery_complete_after = self.scan.advance(read);
+        if recovery_complete_after {
+            info!(
+                epoch = self.epoch.0,
+                through_block = read.block().0,
+                "completed DKG chain recovery"
+            );
+        }
+        recovery_complete_after
+    }
 }
 
 struct LocalRegistration {
@@ -195,10 +258,9 @@ where
     storage_root: PathBuf,
     pending_outbound: Vec<DeliveryOutbound<ST>>,
     // The previous protocol may still be finishing while the current one runs.
-    sessions: [Option<(Epoch, DkgSession<ST>)>; 2],
+    sessions: [Option<ActiveSession<ST>>; 2],
     latest_started_epoch: Option<Epoch>,
     pending_registered_session: Option<(Epoch, PendingRegisteredSession<ST>)>,
-    chain_session: Option<(Epoch, usize)>,
     sync_block: Option<SeqNum>,
     latest_finalized: Option<SeqNum>,
     chain: ManagedChain,
@@ -223,14 +285,12 @@ where
             sessions: [None, None],
             latest_started_epoch: None,
             pending_registered_session: None,
-            chain_session: None,
             sync_block: None,
             latest_finalized: None,
             chain: ManagedChain {
                 io: chain,
                 local_keys: config.local_keys.clone(),
                 submitter,
-                event_reader: ChainEventReader::default(),
                 registration,
             },
         })
@@ -299,7 +359,6 @@ where
     /// This never establishes or changes the recovery snapshot boundary.
     pub fn notify_finalized(&mut self, block: SeqNum) {
         self.record_finalized_head(block);
-        self.chain.event_reader.notify_finalized(block);
         self.settle_chain();
     }
 
@@ -313,13 +372,14 @@ where
         }
         self.sync_block = Some(block);
         self.record_finalized_head(block);
-        self.chain.event_reader.notify_finalized(block);
-        if let Some((epoch, party_count)) = self.chain_session {
-            self.chain.event_reader.start_session(ChainEventSession {
-                epoch,
-                party_count,
-                recovery_block: block,
-            });
+        // A later state sync establishes a new exact snapshot boundary for the
+        // newest protocol, so its owned cursor must not keep scanning the old one.
+        if let Some(session) = self.sessions[1].as_mut() {
+            session.restart_scan(
+                block,
+                self.latest_finalized
+                    .expect("synchronized runner has a finalized head"),
+            );
         }
         self.settle_chain();
     }
@@ -556,7 +616,7 @@ where
             epoch,
             registered.validators,
             registered.key_material,
-            Some(recovery_block),
+            recovery_block,
         )
     }
 
@@ -565,7 +625,7 @@ where
         epoch: Epoch,
         validators: Vec<DkgValidator<ST>>,
         key_material: crate::DkgRegisteredKeyMaterial,
-        recovery_block: Option<SeqNum>,
+        recovery_block: SeqNum,
     ) -> Result<(), DkgError> {
         let party_count = validators.len();
         if self
@@ -586,39 +646,33 @@ where
             return Ok(());
         };
         self.latest_started_epoch = Some(epoch);
-        if let Some((retired_epoch, _)) = self.sessions[0].as_ref() {
-            self.chain.submitter.retire_epoch(*retired_epoch);
+        if let Some(retired) = self.sessions[0].as_ref() {
+            self.chain.submitter.retire_epoch(retired.epoch);
         }
         self.sessions.rotate_left(1);
-        self.sessions[1] = Some((epoch, session));
-        self.start_chain_session(epoch, party_count, recovery_block);
+        self.sessions[1] = Some(ActiveSession::new(
+            epoch,
+            party_count,
+            recovery_block,
+            self.latest_finalized
+                .expect("registered session has a finalized boundary"),
+            session,
+        ));
         Ok(())
-    }
-
-    fn start_chain_session(
-        &mut self,
-        epoch: Epoch,
-        party_count: usize,
-        recovery_block: Option<SeqNum>,
-    ) {
-        self.chain_session = Some((epoch, party_count));
-        if let Some(recovery_block) = recovery_block {
-            self.chain.event_reader.start_session(ChainEventSession {
-                epoch,
-                party_count,
-                recovery_block,
-            });
-        }
     }
 
     pub fn handle_timer(&mut self, now: Instant) {
         for index in 0..self.sessions.len() {
-            let Some((epoch, session)) = &mut self.sessions[index] else {
+            let Some(session) = &mut self.sessions[index] else {
                 continue;
             };
-            let epoch = *epoch;
-            if session.next_timer().is_some_and(|deadline| deadline <= now) {
-                if let Err(err) = session.handle_timer(now) {
+            let epoch = session.epoch;
+            if session
+                .protocol
+                .next_timer()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                if let Err(err) = session.protocol.handle_timer(now) {
                     error!(?err, "failed to process DKG retry timer");
                 }
                 self.collect_session_effects(epoch);
@@ -639,15 +693,18 @@ where
             }
         };
         let epoch = Epoch(wire.epoch);
-        let Some((_, session)) = self
+        let Some(session) = self
             .sessions
             .iter_mut()
             .flatten()
-            .find(|(session_epoch, _)| *session_epoch == epoch)
+            .find(|session| session.epoch == epoch)
         else {
             return;
         };
-        if let Err(err) = session.handle_network_message(sender, wire.payload) {
+        if let Err(err) = session
+            .protocol
+            .handle_network_message(sender, wire.payload)
+        {
             error!(?err, ?sender, "failed to process DKG network message");
         }
         self.collect_session_effects(epoch);
@@ -657,7 +714,7 @@ where
         self.sessions
             .iter()
             .flatten()
-            .filter_map(|(_, session)| session.next_timer())
+            .filter_map(|session| session.protocol.next_timer())
             .min()
     }
 
@@ -667,40 +724,51 @@ where
     }
 
     fn collect_session_effects(&mut self, epoch: Epoch) {
-        let calls = self.take_session_effects(epoch);
-        self.submit_chain_calls(epoch, calls);
+        let effects = self.take_session_effects(epoch);
+        self.dispatch_session_effects(epoch, effects);
     }
 
-    fn take_session_effects(&mut self, epoch: Epoch) -> Vec<dkg_protocol::ChainCall> {
-        let Some((_, session)) = self
+    fn take_session_effects(&mut self, epoch: Epoch) -> Vec<SessionEffect<ST>> {
+        let Some(session) = self
             .sessions
             .iter_mut()
             .flatten()
-            .find(|(session_epoch, _)| *session_epoch == epoch)
+            .find(|session| session.epoch == epoch)
         else {
             return Vec::new();
         };
-        self.pending_outbound
-            .extend(session.take_delivery_outbound());
-        session.take_chain_calls()
+        session.protocol.take_effects()
     }
 
-    fn submit_chain_calls(&mut self, epoch: Epoch, calls: Vec<dkg_protocol::ChainCall>) {
+    fn dispatch_session_effects(&mut self, epoch: Epoch, effects: Vec<SessionEffect<ST>>) {
         // DkgSession exposes no engine effects until chain recovery finishes,
         // so transaction submission does not need a second recovery gate.
-        for call in calls {
-            failpoint::failpoint!(
-                name = "dkg.chain.call_buffered",
-                description =
-                    "after a DKG chain call is buffered and before transaction submission",
-            );
-            self.chain.submitter.submit(epoch, call);
+        for effect in effects {
+            match effect {
+                SessionEffect::Network(delivery) => self.pending_outbound.push(delivery),
+                SessionEffect::Chain(call) => {
+                    failpoint::failpoint!(
+                        name = "dkg.chain.call_buffered",
+                        description =
+                            "after a DKG chain call is buffered and before transaction submission",
+                    );
+                    self.chain.submitter.submit(epoch, *call);
+                }
+            }
         }
     }
 
     fn read_chain_events(&mut self) {
         loop {
-            let Some(read) = self.chain.event_reader.next_read() else {
+            let Some(finalized) = self.latest_finalized else {
+                return;
+            };
+            let Some(read) = self
+                .sessions
+                .iter()
+                .flatten()
+                .find_map(|session| session.next_read(finalized))
+            else {
                 return;
             };
             let events = match self.chain.io.read_events(read) {
@@ -716,8 +784,14 @@ where
                     return;
                 }
             };
-            let batch = self.chain.event_reader.complete(read, events);
-            if let Err(err) = self.accept_chain_batch(batch) {
+            let recovery_complete = self
+                .sessions
+                .iter_mut()
+                .flatten()
+                .find(|session| session.epoch == read.session().epoch)
+                .expect("blocking DKG read keeps its session alive")
+                .complete_read(read);
+            if let Err(err) = self.accept_chain_read(read, events, recovery_complete) {
                 error!(
                     ?err,
                     epoch = read.session().epoch.0,
@@ -728,32 +802,38 @@ where
         }
     }
 
-    fn accept_chain_batch(&mut self, batch: ChainEventBatch) -> Result<(), DkgError> {
-        let epoch = batch.session.epoch;
+    fn accept_chain_read(
+        &mut self,
+        read: ChainRead,
+        events: Vec<ChainEvent>,
+        recovery_complete: bool,
+    ) -> Result<(), DkgError> {
+        let epoch = read.session().epoch;
         let session = self
             .sessions
             .iter_mut()
             .flatten()
-            .find(|(session_epoch, _)| *session_epoch == epoch)
-            .map(|(_, session)| session)
+            .find(|session| session.epoch == epoch)
             .ok_or(DkgError::NoActiveSession { epoch: epoch.0 })?;
-        for event in batch.events.iter().cloned() {
+        for event in events.iter().cloned() {
             session
+                .protocol
                 .handle_chain_event(event)
                 .map_err(|err| DkgError::operation("handle DKG chain event", err))?;
         }
-        if batch.recovery_complete_after {
+        if recovery_complete {
             session
+                .protocol
                 .finish_chain_recovery()
                 .map_err(|err| DkgError::operation("finish DKG chain recovery", err))?;
         }
-        let calls = self.take_session_effects(epoch);
+        let effects = self.take_session_effects(epoch);
         // Apply the observed events before their engine-generated calls so
         // recovery cannot resubmit an effect that this same batch finalized.
         self.chain
             .submitter
-            .finalized_block(epoch, batch.block, batch.events);
-        self.submit_chain_calls(epoch, calls);
+            .finalized_block(epoch, read.block(), events);
+        self.dispatch_session_effects(epoch, effects);
         Ok(())
     }
 }
@@ -884,31 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn boundary_waits_for_sync_then_reads_through_finalized_head() {
-        let self_id = test_nodes(1).pop().unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let chain = Arc::new(RecordingChain::default());
-        let chain_adapter: Arc<dyn DkgChain> = chain.clone();
-        let mut runner = DkgRunner::<NopSignature>::new(
-            self_id,
-            directory.path().to_path_buf(),
-            DkgChainConfig::new([1; 32], Address::ZERO, 1),
-            chain_adapter,
-        )
-        .unwrap();
-        runner.notify_finalized(SeqNum(12));
-        runner.start_chain_session(Epoch(2), 4, None);
-        assert!(chain.reads.lock().unwrap().is_empty());
-
-        runner.notify_sync_complete(SeqNum(10));
-
-        assert_eq!(
-            *chain.reads.lock().unwrap(),
-            vec![(true, SeqNum(10)), (false, SeqNum(11)), (false, SeqNum(12))]
-        );
-    }
-
-    #[test]
     fn registered_session_waits_for_chain_snapshot_and_execution_sync() {
         let nodes = test_nodes(4);
         let signing_key = [9; 32];
@@ -961,7 +1016,7 @@ mod tests {
             .sessions
             .iter()
             .flatten()
-            .any(|(epoch, _)| *epoch == Epoch(2)));
+            .any(|session| session.epoch == Epoch(2)));
     }
 
     #[test]

@@ -10,21 +10,18 @@ use dkg_protocol::{
 };
 use monad_types::{Epoch, SeqNum};
 use thiserror::Error;
-use tracing::info;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::DkgError;
-
-use self::recovery::SessionScan;
 
 mod recovery;
 mod submitter;
 mod triedb;
 mod triedb_state;
 
-pub use triedb::new_triedb_runner;
-
+pub(crate) use recovery::SessionScan;
 pub(crate) use submitter::TxSubmitter;
+pub use triedb::new_triedb_runner;
 
 sol!("../dkg-contracts/src/DkgContract.sol");
 
@@ -391,14 +388,6 @@ pub(crate) struct ChainEventSession {
     pub recovery_block: SeqNum,
 }
 
-#[derive(Debug)]
-pub(crate) struct ChainEventBatch {
-    pub session: ChainEventSession,
-    pub block: SeqNum,
-    pub events: Vec<ChainEvent>,
-    pub recovery_complete_after: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChainRead {
     Snapshot(ChainEventSession),
@@ -416,77 +405,6 @@ impl ChainRead {
         match self {
             Self::Snapshot(session) => session.recovery_block,
             Self::Block(block, _) => block,
-        }
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct ChainEventReader {
-    finalized: Option<SeqNum>,
-    // The previous protocol may still be finishing while the current one runs.
-    scans: [Option<(Epoch, SessionScan)>; 2],
-}
-
-impl ChainEventReader {
-    pub(crate) fn notify_finalized(&mut self, block: SeqNum) {
-        self.finalized = Some(self.finalized.map_or(block, |latest| latest.max(block)));
-    }
-
-    pub(crate) fn start_session(&mut self, session: ChainEventSession) {
-        if let Some((_, scan)) = self
-            .scans
-            .iter_mut()
-            .flatten()
-            .find(|(epoch, _)| *epoch == session.epoch)
-        {
-            *scan = SessionScan::new(session, self.finalized);
-        } else {
-            if let Some((epoch, _)) = &self.scans[0] {
-                info!(epoch = epoch.0, "retired old DKG chain cursor");
-            }
-            self.scans.rotate_left(1);
-            self.scans[1] = Some((session.epoch, SessionScan::new(session, self.finalized)));
-        }
-        info!(
-            epoch = session.epoch.0,
-            party_count = session.party_count,
-            recovery_block = session.recovery_block.0,
-            "started DKG chain recovery"
-        );
-    }
-
-    pub(crate) fn next_read(&self) -> Option<ChainRead> {
-        self.scans.iter().flatten().find_map(|(_, scan)| {
-            let latest = self
-                .finalized
-                .unwrap_or(scan.recovery_block())
-                .max(scan.recovery_block());
-            scan.next(latest)
-        })
-    }
-
-    pub(crate) fn complete(&mut self, read: ChainRead, events: Vec<ChainEvent>) -> ChainEventBatch {
-        let session = read.session();
-        let scan = self
-            .scans
-            .iter_mut()
-            .flatten()
-            .find(|(epoch, _)| *epoch == session.epoch)
-            .map(|(_, scan)| scan)
-            .expect("blocking DKG read keeps its cursor alive");
-        let recovery_complete_after = scan.advance(read);
-        if recovery_complete_after {
-            info!(
-                epoch = session.epoch.0,
-                through_block = read.block().0,
-                "completed DKG chain recovery"
-            );
-        }
-        ChainEventBatch {
-            session,
-            block: read.block(),
-            events,
-            recovery_complete_after,
         }
     }
 }

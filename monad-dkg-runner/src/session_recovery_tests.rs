@@ -238,22 +238,22 @@ impl RecoveryModel {
             let Some(runtime) = &mut self.nodes[source].runtime else {
                 continue;
             };
-            self.network.extend(
-                runtime
-                    .session
-                    .take_delivery_outbound()
-                    .into_iter()
-                    .map(|outbound| NetworkMessage { source, outbound }),
-            );
-            for call in runtime.session.take_chain_calls() {
-                let Some(event) = self.chain.post(call) else {
-                    continue;
-                };
-                self.chain_messages
-                    .extend((0..node_count).map(|target| ChainMessage {
-                        target,
-                        input: ChainInput::Event(Box::new(event.clone())),
-                    }));
+            for effect in runtime.session.take_effects() {
+                match effect {
+                    SessionEffect::Network(outbound) => {
+                        self.network.push_back(NetworkMessage { source, outbound });
+                    }
+                    SessionEffect::Chain(call) => {
+                        let Some(event) = self.chain.post(*call) else {
+                            continue;
+                        };
+                        self.chain_messages
+                            .extend((0..node_count).map(|target| ChainMessage {
+                                target,
+                                input: ChainInput::Event(Box::new(event.clone())),
+                            }));
+                    }
+                }
             }
         }
     }
