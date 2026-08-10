@@ -15,6 +15,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 mod chain;
+mod metrics;
 mod record;
 mod recovery;
 mod registration;

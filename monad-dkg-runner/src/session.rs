@@ -386,14 +386,20 @@ where
         Ok(())
     }
 
-    pub(crate) fn handle_timer(&mut self, now: Instant) -> Result<(), SessionError> {
+    pub(crate) fn handle_timer(&mut self, now: Instant) -> Result<usize, SessionError> {
+        let retries = self.retries.retry_due(now);
+        let count = retries.len();
         self.effects.extend(
-            self.retries
-                .retry_due(now)
+            retries
                 .into_iter()
                 .map(|send| SessionEffect::Network(send.into())),
         );
-        self.settle()
+        self.settle()?;
+        Ok(count)
+    }
+
+    pub(crate) fn pending_retry_count(&self) -> usize {
+        self.retries.pending_count()
     }
 
     pub(crate) fn handle_chain_event(&mut self, event: ChainEvent) -> Result<(), SessionError> {

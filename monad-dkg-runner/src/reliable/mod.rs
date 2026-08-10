@@ -87,6 +87,10 @@ where
         self.deadlines.first().map(|(deadline, _, _)| *deadline)
     }
 
+    pub(crate) fn pending_count(&self) -> usize {
+        self.deadlines.len()
+    }
+
     pub(crate) fn retry_due(&mut self, now: Instant) -> Vec<ScheduledSend<Peer, Payload>> {
         let mut sends = Vec::new();
         while self

@@ -5384,6 +5384,7 @@ dependencies = [
  "monad-eth-types",
  "monad-ethcall",
  "monad-execution-state-read",
+ "monad-executor",
  "monad-types",
  "monad-validator",
  "proptest",

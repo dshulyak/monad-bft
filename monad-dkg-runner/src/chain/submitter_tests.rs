@@ -15,6 +15,7 @@ use monad_types::{Epoch, SeqNum};
 use super::*;
 use crate::{
     chain::{ChainRead, DkgTransactionContext},
+    metrics::DkgRunnerMetrics,
     DkgLocalKeyMaterial,
 };
 
@@ -425,7 +426,11 @@ fn test_submitter_with_context_and_block(
         transactions,
     });
     let config = DkgChainConfig::new([0x01; 32], Address::repeat_byte(0x22), 0x4eaf);
-    (TxSubmitter::new(&config, chain).unwrap(), receiver)
+    let metrics = DkgRunnerMetrics::new();
+    (
+        TxSubmitter::new(&config, chain, metrics.transaction()).unwrap(),
+        receiver,
+    )
 }
 
 fn test_tx_config() -> TxConfig {

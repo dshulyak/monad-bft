@@ -256,8 +256,9 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         error!(?err, "failed to configure DKG runner chain integration");
         None
     });
-    let (dkg_events, dkg_outbound_rx, dkg_local_tx_rx) = match dkg_runner {
+    let (dkg_events, dkg_outbound_rx, dkg_local_tx_rx, dkg_metrics) = match dkg_runner {
         Some((runner, local_tx_rx)) => {
+            let metrics = runner.metrics().clone();
             let (events, event_rx) = monad_dkg_runner::DkgRunnerHandle::channel();
             let (outbound_tx, outbound_rx) = flume::unbounded();
             tokio::spawn(async move {
@@ -265,10 +266,11 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     error!(?err, "DKG runner task stopped");
                 }
             });
-            (events, Some(outbound_rx), Some(local_tx_rx))
+            (events, Some(outbound_rx), Some(local_tx_rx), Some(metrics))
         }
         None => (
             monad_dkg_runner::DkgRunnerHandle::<SignatureType>::disabled(),
+            None,
             None,
             None,
         ),
@@ -569,11 +571,15 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         }
     }
 
+    let executor_metrics = dkg_metrics.as_ref().map_or_else(
+        || executor.metrics(),
+        |metrics| executor.metrics().push(metrics),
+    );
     let prometheus_metrics = Arc::new(
         NodePrometheusMetrics::new(
             prometheus_labels,
             state.metrics(),
-            executor.metrics(),
+            executor_metrics,
             process_start,
         )
         .map_err(|err| {
@@ -623,7 +629,9 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 None => futures_util::future::pending().boxed(),
             } => {
                 let otel_meter = maybe_otel_meter.as_ref().expect("otel_endpoint must have been set");
-                let executor_metrics = executor.metrics();
+                let executor_metrics = dkg_metrics
+                    .as_ref()
+                    .map_or_else(|| executor.metrics(), |metrics| executor.metrics().push(metrics));
                 send_metrics(
                     otel_meter,
                     &mut gauge_cache,

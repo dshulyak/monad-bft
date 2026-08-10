@@ -6,11 +6,13 @@ use dkg_protocol::{ChainEvent, RegistrationCall};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
+use monad_executor::ExecutorMetrics;
 use monad_types::{Epoch, NodeId, SeqNum};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     chain::{ChainEventSession, ChainRead, DkgChain, RecoveryTransition, SessionScan, TxSubmitter},
+    metrics::DkgRunnerMetrics,
     registration::{
         assemble_registered_session, load_or_create_local_registration, RegisteredSession,
     },
@@ -256,7 +258,9 @@ where
     pending_registered_session: Option<PendingRegisteredSession<ST>>,
     sync_block: Option<SeqNum>,
     latest_finalized: Option<SeqNum>,
+    latest_completed_epoch: Option<Epoch>,
     chain: ManagedChain,
+    metrics: DkgRunnerMetrics,
 }
 
 impl<ST> DkgRunner<ST>
@@ -269,7 +273,8 @@ where
         config: DkgChainConfig,
         chain: Arc<dyn DkgChain>,
     ) -> Result<Self, DkgError> {
-        let submitter = TxSubmitter::new(&config, Arc::clone(&chain))?;
+        let metrics = DkgRunnerMetrics::new();
+        let submitter = TxSubmitter::new(&config, Arc::clone(&chain), metrics.transaction())?;
         let registration = LocalRegistration::new(submitter.signer_address());
         Ok(Self {
             self_id,
@@ -280,13 +285,19 @@ where
             pending_registered_session: None,
             sync_block: None,
             latest_finalized: None,
+            latest_completed_epoch: None,
             chain: ManagedChain {
                 io: chain,
                 local_keys: config.local_keys.clone(),
                 submitter,
                 registration,
             },
+            metrics,
         })
+    }
+
+    pub fn metrics(&self) -> &ExecutorMetrics {
+        self.metrics.executor_metrics()
     }
 
     pub async fn run(
@@ -309,6 +320,7 @@ where
                     }
                     Ok(DkgRunnerEvent::StartSession { epoch, validators }) => {
                         if let Err(err) = self.start_chain_registered_session(epoch, validators) {
+                            self.metrics.protocol_error();
                             warn!(?err, epoch = epoch.0, "failed to start DKG session");
                         }
                     }
@@ -320,10 +332,10 @@ where
                 () = wait_for_timer(timer) => self.handle_timer(Instant::now()),
             }
             for message in self.take_outbound() {
-                outbound
-                    .send_async(message)
-                    .await
-                    .map_err(|_| DkgError::ChannelClosed("sending DKG network output"))?;
+                if outbound.send_async(message).await.is_err() {
+                    self.metrics.delivery_error();
+                    return Err(DkgError::ChannelClosed("sending DKG network output"));
+                }
             }
         }
     }
@@ -424,6 +436,7 @@ where
         self.reconcile_local_registration();
         self.start_pending_registered_session();
         self.read_chain_events();
+        self.update_session_metrics();
     }
 
     fn reconcile_local_registration(&mut self) {
@@ -443,6 +456,7 @@ where
                     if let Err(err) =
                         self.apply_local_registration_read(read, registrations.pop().flatten())
                     {
+                        self.metrics.chain_error();
                         error!(
                             ?err,
                             epoch = read.epoch.0,
@@ -461,6 +475,7 @@ where
                 }
                 Err(err) => {
                     self.chain.registration.read_failed(read);
+                    self.metrics.chain_error();
                     debug!(?err, epoch = read.epoch.0, block = read.block.0, party = %read.address, "failed to read local DKG registration from finalized state");
                     return;
                 }
@@ -546,6 +561,7 @@ where
         match self.execute_session_registration_read(&read) {
             Ok(state) => {
                 if let Err(err) = self.apply_session_registration_read(read.clone(), state) {
+                    self.metrics.protocol_error();
                     error!(
                         ?err,
                         epoch = read.epoch.0,
@@ -555,12 +571,15 @@ where
                 }
             }
             Err(DkgError::ChainDataUnavailable { .. }) => {}
-            Err(err) => warn!(
-                ?err,
-                epoch = read.epoch.0,
-                block = read.block.0,
-                "failed to read finalized DKG registrations"
-            ),
+            Err(err) => {
+                self.metrics.chain_error();
+                warn!(
+                    ?err,
+                    epoch = read.epoch.0,
+                    block = read.block.0,
+                    "failed to read finalized DKG registrations"
+                );
+            }
         }
     }
 
@@ -643,6 +662,7 @@ where
                 .expect("registered session has a finalized boundary"),
             session,
         ));
+        self.metrics.session_started();
         Ok(())
     }
 
@@ -657,12 +677,17 @@ where
                 .next_timer()
                 .is_some_and(|deadline| deadline <= now)
             {
-                if let Err(err) = session.protocol.handle_timer(now) {
-                    error!(?err, "failed to process DKG retry timer");
+                match session.protocol.handle_timer(now) {
+                    Ok(retries) => self.metrics.network_retries(retries),
+                    Err(err) => {
+                        self.metrics.protocol_error();
+                        error!(?err, "failed to process DKG retry timer");
+                    }
                 }
                 self.collect_session_effects(epoch);
             }
         }
+        self.update_session_metrics();
     }
 
     pub fn handle_network_message(
@@ -673,6 +698,7 @@ where
         let wire: DeliveryEnvelope = match message.as_ref().try_into() {
             Ok(wire) => wire,
             Err(err) => {
+                self.metrics.delivery_error();
                 warn!(?err, ?sender, "dropping malformed DKG delivery message");
                 return;
             }
@@ -690,9 +716,11 @@ where
             .protocol
             .handle_network_message(sender, wire.payload)
         {
+            self.metrics.protocol_error();
             error!(?err, ?sender, "failed to process DKG network message");
         }
         self.collect_session_effects(epoch);
+        self.update_session_metrics();
     }
 
     pub fn next_timer(&self) -> Option<Instant> {
@@ -752,6 +780,7 @@ where
                 Ok(events) => events,
                 Err(DkgError::ChainDataUnavailable { .. }) => return,
                 Err(err) => {
+                    self.metrics.chain_error();
                     warn!(
                         ?err,
                         epoch = read.session().epoch.0,
@@ -762,6 +791,7 @@ where
                 }
             };
             if let Err(err) = self.apply_chain_event_read(read, events) {
+                self.metrics.protocol_error();
                 error!(
                     ?err,
                     epoch = read.session().epoch.0,
@@ -790,6 +820,9 @@ where
         events: Vec<ChainEvent>,
     ) -> Result<(), DkgError> {
         let epoch = read.session().epoch;
+        let result_finalized = events
+            .iter()
+            .any(|event| matches!(event, ChainEvent::DkgResultRecorded { .. }));
         let session = self
             .sessions
             .iter_mut()
@@ -815,8 +848,27 @@ where
         self.chain
             .submitter
             .finalized_block(epoch, read.block(), events);
+        if result_finalized
+            && self
+                .latest_completed_epoch
+                .is_none_or(|completed| epoch > completed)
+        {
+            self.latest_completed_epoch = Some(epoch);
+            self.metrics.result_finalized();
+        }
         self.dispatch_session_effects(epoch, effects);
         Ok(())
+    }
+
+    fn update_session_metrics(&self) {
+        self.metrics.set_session_state(
+            self.sessions.iter().flatten().count(),
+            self.sessions
+                .iter()
+                .flatten()
+                .map(|session| session.protocol.pending_retry_count())
+                .sum(),
+        );
     }
 }
 

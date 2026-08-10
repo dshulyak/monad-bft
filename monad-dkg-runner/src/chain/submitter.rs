@@ -18,7 +18,7 @@ use super::{
     chain_call_kind, ContractRegistration, DkgChain, DkgChainConfig, DkgContract,
     DkgTransactionContext,
 };
-use crate::DkgError;
+use crate::{metrics::DkgTransactionMetrics, DkgError};
 
 mod logic;
 
@@ -32,10 +32,15 @@ pub(crate) struct TxSubmitter {
     prepared: Option<(TxKey, PreparedTx)>,
     finalized: BTreeSet<TxKey>,
     latest_context_block: Option<SeqNum>,
+    metrics: DkgTransactionMetrics,
 }
 
 impl TxSubmitter {
-    pub(crate) fn new(config: &DkgChainConfig, chain: Arc<dyn DkgChain>) -> Result<Self, DkgError> {
+    pub(crate) fn new(
+        config: &DkgChainConfig,
+        chain: Arc<dyn DkgChain>,
+        metrics: DkgTransactionMetrics,
+    ) -> Result<Self, DkgError> {
         let mut key = FixedBytes::<32>::from(config.signing_key);
         let signer = PrivateKeySigner::from_bytes(&key)
             .map_err(|err| DkgError::operation("construct DKG transaction signer", err));
@@ -58,6 +63,7 @@ impl TxSubmitter {
             prepared: None,
             finalized: BTreeSet::new(),
             latest_context_block: None,
+            metrics,
         })
     }
 
@@ -80,7 +86,7 @@ impl TxSubmitter {
                 dkg: dkg_core::Address(contract.into_array()),
             },
         );
-        self.submit_keys(key, block);
+        self.submit_keys(key, block, false);
     }
 
     pub(crate) fn submit(&mut self, epoch: Epoch, call: ChainCall) {
@@ -88,7 +94,7 @@ impl TxSubmitter {
         let Some(block) = self.latest_context_block else {
             return;
         };
-        self.submit_keys(key, block);
+        self.submit_keys(key, block, false);
     }
 
     pub(crate) fn retry_registration(&mut self, epoch: Epoch, block: SeqNum) {
@@ -101,7 +107,7 @@ impl TxSubmitter {
             })
             .cloned()
             .collect::<Vec<_>>();
-        self.submit_keys(keys, block);
+        self.submit_keys(keys, block, true);
     }
 
     pub(crate) fn confirm_registration(&mut self, epoch: Epoch, registration: &RegistrationCall) {
@@ -114,6 +120,7 @@ impl TxSubmitter {
             !(*pending_epoch == epoch && matches!(id, ChainTxId::Registration { .. }))
         });
         self.clear_orphaned_prepared();
+        self.update_pending_metric();
     }
 
     pub(crate) fn retire_epoch(&mut self, epoch: Epoch) {
@@ -122,6 +129,7 @@ impl TxSubmitter {
         self.finalized
             .retain(|(finalized_epoch, _)| *finalized_epoch != epoch);
         self.clear_orphaned_prepared();
+        self.update_pending_metric();
     }
 
     pub(crate) fn finalized_block(&mut self, epoch: Epoch, block: SeqNum, events: Vec<ChainEvent>) {
@@ -138,7 +146,7 @@ impl TxSubmitter {
             .collect::<Vec<_>>();
         // Advance an active retry with its own epoch's scan. A newer overlapping
         // epoch must not make it read a nonce from the wrong chain boundary.
-        self.submit_keys(keys, block);
+        self.submit_keys(keys, block, true);
     }
 
     fn enqueue(&mut self, epoch: Epoch, call: ChainCall) -> Option<TxKey> {
@@ -147,10 +155,16 @@ impl TxSubmitter {
             return None;
         }
         self.pending.insert(key.clone(), call);
+        self.update_pending_metric();
         Some(key)
     }
 
-    fn submit_keys(&mut self, keys: impl IntoIterator<Item = TxKey>, context_block: SeqNum) {
+    fn submit_keys(
+        &mut self,
+        keys: impl IntoIterator<Item = TxKey>,
+        context_block: SeqNum,
+        retry: bool,
+    ) {
         let keys = keys.into_iter().collect::<Vec<_>>();
         loop {
             let key = match &self.prepared {
@@ -165,6 +179,9 @@ impl TxSubmitter {
                 .pending
                 .get(&key)
                 .expect("selected DKG submission remains pending");
+            if retry {
+                self.metrics.retry();
+            }
             let context = match self.submission.read_context(context_block) {
                 Ok(context) => context,
                 Err(source) => {
@@ -175,6 +192,7 @@ impl TxSubmitter {
                         call_kind,
                         "failed to read DKG transaction context; will retry"
                     );
+                    self.metrics.error();
                     return;
                 }
             };
@@ -192,6 +210,7 @@ impl TxSubmitter {
                         .remove(&key)
                         .expect("obsolete DKG submission remains pending");
                     self.finalized.insert(key.clone());
+                    self.update_pending_metric();
                     // A finalized no-op/revert can consume the nonce without an
                     // event, such as a duplicate BVE witness for one pair.
                     info!(
@@ -209,6 +228,7 @@ impl TxSubmitter {
                         call_kind,
                         "failed to prepare DKG chain tx; will retry"
                     );
+                    self.metrics.error();
                     return;
                 }
             }
@@ -247,6 +267,7 @@ impl TxSubmitter {
                         tx_hash = %prepared.transaction.tx_hash(),
                         "failed to queue DKG chain tx; will retry"
                     );
+                    self.metrics.error();
                     return;
                 }
             }
@@ -270,6 +291,7 @@ impl TxSubmitter {
         {
             self.prepared = None;
         }
+        self.update_pending_metric();
     }
 
     fn clear_orphaned_prepared(&mut self) {
@@ -280,6 +302,10 @@ impl TxSubmitter {
         {
             self.prepared = None;
         }
+    }
+
+    fn update_pending_metric(&self) {
+        self.metrics.set_pending(self.pending.len());
     }
 }
 
