@@ -15,7 +15,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::ErrorKind,
     net::{SocketAddr, SocketAddrV4, UdpSocket},
     num::ParseIntError,
     sync::{Arc, Once},
@@ -34,8 +33,8 @@ use monad_executor::Executor;
 use monad_executor_glue::{Message, RouterCommand};
 use monad_peer_discovery::{mock::NopDiscovery, MonadNameRecord, NameRecord};
 use monad_raptorcast::{
-    create_dataplane_for_tests, new_defaulted_raptorcast_for_tests,
-    new_defaulted_raptorcast_for_tests_with_name_records,
+    create_dataplane_for_tests, new_defaulted_raptorcast_for_tests_with_name_records,
+    new_wireauth_raptorcast_for_tests, new_wireauth_raptorcast_for_tests_with_name_records,
     packet::{build_messages, deterministic},
     raptorcast_secondary::{
         group_message::FullNodesGroupMessage, SecondaryOutboundMessage,
@@ -183,72 +182,133 @@ pub fn zero_sized_packet() {
 
 // Verify that all received encoded symbols that are valid are rebroadcast
 // exactly once.
-#[test]
-pub fn valid_rebroadcast() {
-    let rebroadcast_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let rebroadcast_addr = rebroadcast_socket.local_addr().unwrap();
+#[tokio::test]
+async fn valid_rebroadcast() {
+    use monad_raptorcast::auth::{AuthenticatedSocketHandle, WireAuthProtocol};
 
-    let (tx_nodeid, tx_keypair, _rx_nodeid, known_addresses, rx_addr) =
-        set_up_test(Some(rebroadcast_addr));
-
-    let message: Bytes = vec![0; 4 * 1000].into();
-
-    let tx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    rebroadcast_socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-
-    // The sender and the receiver must share the validator set for
-    // the deterministic chunk assignment to agree.
-    let valset: BTreeMap<_, _> = known_addresses
-        .keys()
-        .map(|node_id| (*node_id, Stake::ONE))
+    let sender_key = Arc::new(keypair(1));
+    let receiver_key = keypair(2);
+    let target_key = Arc::new(keypair(3));
+    let sender_id = NodeId::new(sender_key.pubkey());
+    let receiver_id = NodeId::new(receiver_key.pubkey());
+    let target_id = NodeId::new(target_key.pubkey());
+    let sender_dp = create_dataplane_for_tests(false);
+    let receiver_dp = create_dataplane_for_tests(false);
+    let target_dp = create_dataplane_for_tests(false);
+    let receiver_addr = SocketAddr::V4(receiver_dp.auth_addr);
+    let (addresses, records) = test_peer_maps([
+        (sender_id, sender_key.as_ref(), sender_dp.auth_addr),
+        (receiver_id, &receiver_key, receiver_dp.auth_addr),
+        (target_id, target_key.as_ref(), target_dp.auth_addr),
+    ]);
+    let mut receiver = setup_authenticated_raptorcast_service(
+        receiver_key,
+        receiver_dp,
+        addresses.clone(),
+        records,
+    );
+    let validators = ValidatorSet::new_unchecked(
+        [sender_id, receiver_id, target_id]
+            .map(|id| (id, Stake::ONE))
+            .into(),
+    );
+    receiver.exec(vec![RouterCommand::AddEpochValidatorSet {
+        epoch: Epoch(0),
+        epoch_start: Round(0),
+        validator_set: vec![
+            (sender_id, Stake::ONE),
+            (receiver_id, Stake::ONE),
+            (target_id, Stake::ONE),
+        ],
+    }]);
+    let mut sender = AuthenticatedSocketHandle::new(
+        sender_dp.authenticated_socket,
+        WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::UDP_METRICS,
+            Default::default(),
+            sender_key.clone(),
+        ),
+    );
+    let mut target = AuthenticatedSocketHandle::new(
+        target_dp.authenticated_socket,
+        WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::UDP_METRICS,
+            Default::default(),
+            target_key,
+        ),
+    );
+    let groups = [(Epoch(0), validators)].into();
+    let group = PrimaryBroadcastGroup::of_epoch(Epoch(0), &sender_id, &groups).unwrap();
+    let addresses = addresses
+        .into_iter()
+        .map(|(id, addr)| (id, SocketAddr::V4(addr)))
         .collect();
-    let validators = ValidatorSet::new_unchecked(valset);
-    let group_map: ValidatorGroupMap<_> = [(Epoch(0), validators)].into();
-    let group = PrimaryBroadcastGroup::of_epoch(Epoch(0), &tx_nodeid, &group_map).unwrap();
-
-    // Only send the chunks assigned to the receiver, so every chunk it
-    // gets is one it is responsible for rebroadcasting.
-    let messages: Vec<_> = build_messages::<SignatureType>(
-        &tx_keypair,
+    let packets: Vec<_> = build_messages::<SignatureType>(
+        sender_key.as_ref(),
         DEFAULT_SEGMENT_SIZE,
-        message,
+        Bytes::from(vec![0; 4000]),
         Redundancy::from_u8(2),
-        0, // unix_ts_ms
+        0,
         BuildTarget::raptorcast(group, Round(1)),
-        &known_addresses,
+        &addresses,
     )
     .into_iter()
-    .filter(|(dest, _)| *dest == rx_addr)
+    .filter(|(destination, _)| *destination == receiver_addr)
     .collect();
-    assert!(!messages.is_empty());
+    assert!(!packets.is_empty());
+    let chunks: Vec<_> = packets
+        .iter()
+        .flat_map(|(_, payload)| payload.chunks(deterministic::DEFAULT_SEGMENT_LEN))
+        .map(Bytes::copy_from_slice)
+        .collect();
 
-    for i in 0..=1 {
-        let mut num_chunks = 0;
-        for message in &messages {
-            for chunk in message.1.chunks(deterministic::DEFAULT_SEGMENT_LEN) {
-                tx_socket.send_to(chunk, message.0).unwrap();
-
-                num_chunks += 1;
+    async fn receive_target(
+        target: &mut AuthenticatedSocketHandle<WireAuthProtocol>,
+        receiver: &mut AuthenticatedRaptorCast,
+        sender: &mut AuthenticatedSocketHandle<WireAuthProtocol>,
+    ) -> monad_raptorcast::auth::AuthRecvMsg<PubKeyType> {
+        loop {
+            tokio::select! {
+                message = target.recv() => return message.expect("authenticated receive"),
+                _ = receiver.next() => {},
+                _ = sender.recv() => {},
             }
         }
+    }
 
-        // Wait for all rebroadcasting activity to complete.
-        std::thread::sleep(Duration::from_millis(100));
-
-        if i == 0 {
-            for _ in 0..num_chunks {
-                // Verify that the rebroadcast target receives a copy of every symbol.
-                let _ = rebroadcast_socket.recv(&mut []).unwrap();
-            }
-        } else {
-            // Verify that the rebroadcast target has nothing more to receive.
-            assert_eq!(
-                rebroadcast_socket.recv(&mut []).unwrap_err().kind(),
-                ErrorKind::WouldBlock
+    for attempt in 0..2 {
+        for (_, payload) in &packets {
+            sender.write(
+                &receiver_id.pubkey(),
+                Some(receiver_addr),
+                payload.clone(),
+                deterministic::DEFAULT_SEGMENT_LEN as u16,
+                UdpPriority::Regular,
             );
         }
+        if attempt == 0 {
+            let mut received = BTreeSet::new();
+            for _ in &chunks {
+                let message = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    receive_target(&mut target, &mut receiver, &mut sender),
+                )
+                .await
+                .expect("rebroadcast timeout");
+                assert_eq!(message.sender, Some(receiver_id));
+                assert!(received.insert(message.payload));
+            }
+            assert_eq!(received, chunks.iter().cloned().collect());
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                receive_target(&mut target, &mut receiver, &mut sender)
+            )
+            .await
+            .is_err(),
+            "duplicate symbols must not be rebroadcast"
+        );
     }
 }
 
@@ -533,6 +593,175 @@ fn setup_raptorcast_service(
     )
 }
 
+type AuthenticatedRaptorCast = RaptorCast<
+    SignatureType,
+    MockMessage,
+    MockMessage,
+    MockEvent<PubKeyType>,
+    NopDiscovery<SignatureType>,
+    monad_raptorcast::auth::WireAuthProtocol,
+    monad_raptorcast::auth::NopScore<NodeId<PubKeyType>>,
+>;
+
+fn setup_authenticated_raptorcast_service(
+    keypair: KeyPair,
+    dataplane: DataplaneHandles,
+    known_addresses: HashMap<NodeId<PubKeyType>, SocketAddrV4>,
+    name_records: HashMap<NodeId<PubKeyType>, MonadNameRecord<SignatureType>>,
+) -> AuthenticatedRaptorCast {
+    new_wireauth_raptorcast_for_tests_with_name_records(
+        dataplane,
+        known_addresses,
+        name_records,
+        Arc::new(keypair),
+        Epoch(0),
+    )
+}
+
+async fn next_authenticated_event(
+    receiver: &mut AuthenticatedRaptorCast,
+    senders: &mut [&mut AuthenticatedRaptorCast],
+) -> MockEvent<PubKeyType> {
+    loop {
+        tokio::select! {
+            event = receiver.next() => return event.expect("receiver stream ended"),
+            _ = futures_util::future::select_all(senders.iter_mut().map(|sender| sender.next())) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn udp_receive_priority_tracks_validator_set_updates() {
+    use monad_raptorcast::auth::{
+        AuthenticatedSocketHandle, AuthenticationProtocol, WireAuthProtocol,
+    };
+
+    let first_key = Arc::new(keypair(1));
+    let second_key = Arc::new(keypair(2));
+    let receiver_key = keypair(3);
+    let first_id = NodeId::new(first_key.pubkey());
+    let second_id = NodeId::new(second_key.pubkey());
+    let receiver_id = NodeId::new(receiver_key.pubkey());
+    let first_dp = create_dataplane_for_tests(false);
+    let second_dp = create_dataplane_for_tests(false);
+    let receiver_dp = create_dataplane_for_tests(false);
+    let receiver_addr = SocketAddr::V4(receiver_dp.auth_addr);
+    let (addresses, records) = test_peer_maps([
+        (first_id, first_key.as_ref(), first_dp.auth_addr),
+        (second_id, second_key.as_ref(), second_dp.auth_addr),
+        (receiver_id, &receiver_key, receiver_dp.auth_addr),
+    ]);
+    let mut receiver = setup_authenticated_raptorcast_service(
+        receiver_key,
+        receiver_dp,
+        addresses.clone(),
+        records,
+    );
+    receiver.exec(vec![RouterCommand::AddEpochValidatorSet {
+        epoch: Epoch(0),
+        epoch_start: Round(0),
+        validator_set: vec![(second_id, Stake::ONE), (receiver_id, Stake::ONE)],
+    }]);
+    let mut first = AuthenticatedSocketHandle::new(
+        first_dp.authenticated_socket,
+        WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::UDP_METRICS,
+            Default::default(),
+            first_key.clone(),
+        ),
+    );
+    let mut second = AuthenticatedSocketHandle::new(
+        second_dp.authenticated_socket,
+        WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::UDP_METRICS,
+            Default::default(),
+            second_key.clone(),
+        ),
+    );
+    let destinations: HashMap<_, _> = addresses
+        .into_iter()
+        .map(|(id, addr)| (id, SocketAddr::V4(addr)))
+        .collect();
+    let send = |socket: &mut AuthenticatedSocketHandle<WireAuthProtocol>,
+                key: &KeyPair,
+                epoch: Epoch,
+                id| {
+        let payload = monad_raptorcast::message::OutboundRouterMessage::<MockMessage, SignatureType>::AppMessage(MockMessage::new(id, 100))
+            .try_serialize().unwrap();
+        let segment_size = DEFAULT_SEGMENT_SIZE - WireAuthProtocol::HEADER_SIZE;
+        for (_, packet) in build_messages::<SignatureType>(
+            key,
+            segment_size,
+            payload,
+            Redundancy::from_u8(2),
+            0,
+            BuildTarget::point_to_point(epoch, &receiver_id),
+            &destinations,
+        ) {
+            socket.write(
+                &receiver_id.pubkey(),
+                Some(receiver_addr),
+                packet,
+                segment_size,
+                UdpPriority::Regular,
+            );
+        }
+    };
+
+    // Establish both authenticated sessions before accumulating test traffic.
+    send(&mut first, first_key.as_ref(), Epoch(0), 0);
+    send(&mut second, second_key.as_ref(), Epoch(0), 0);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut received = BTreeSet::new();
+        while received.len() < 2 {
+            tokio::select! {
+                event = receiver.next() => {
+                    let MockEvent((sender, id)) = event.unwrap();
+                    assert_eq!(id, 0);
+                    received.insert(sender);
+                }
+                _ = first.recv() => {},
+                _ = second.recv() => {},
+            }
+        }
+    })
+    .await
+    .expect("authenticated warmups");
+
+    send(&mut first, first_key.as_ref(), Epoch(0), 1);
+    send(&mut first, first_key.as_ref(), Epoch(0), 2);
+    send(&mut second, second_key.as_ref(), Epoch(0), 3);
+    // Let the dataplane enqueue traffic from both peers before polling receives.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for (sender, id) in [(second_id, 3), (first_id, 1), (first_id, 2)] {
+        let MockEvent(received) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .expect("UDP receive timeout")
+            .unwrap();
+        assert_eq!(received, (sender, id));
+    }
+
+    // Retiring epoch 0 removes its validator's pin and pins the new validator.
+    receiver.exec(vec![
+        RouterCommand::AddEpochValidatorSet {
+            epoch: Epoch(2),
+            epoch_start: Round(10),
+            validator_set: vec![(first_id, Stake::ONE), (receiver_id, Stake::ONE)],
+        },
+        RouterCommand::UpdateCurrentRound(Epoch(2), Round(10)),
+    ]);
+    send(&mut second, second_key.as_ref(), Epoch(2), 4);
+    send(&mut first, first_key.as_ref(), Epoch(2), 5);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for (sender, id) in [(first_id, 5), (second_id, 4)] {
+        let MockEvent(received) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .expect("UDP receive timeout after pin update")
+            .unwrap();
+        assert_eq!(received, (sender, id));
+    }
+}
+
 // a fullnode must be able to forward an incoming FullNodesGroup
 // invite (e.g. PrepareGroup) from a validator to the secondary RC
 // channel even on a freshly booted node, before consensus has caught
@@ -541,6 +770,9 @@ fn setup_raptorcast_service(
 #[cfg(test)]
 #[tokio::test]
 async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
+    let _ = tracing_subscriber::fmt::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let epoch = Epoch(5); // non-zero, simulating boot from a real forkpoint
 
     let validator_keypair = keypair(1);
@@ -548,8 +780,8 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
     let fullnode_keypair = keypair(2);
     let fullnode_nodeid = NodeId::new(fullnode_keypair.pubkey());
 
-    // Only the fullnode is a real RaptorCast instance; the validator side just
-    // constructs and sends a packet manually, so it needs no dataplane.
+    // Only the fullnode is a RaptorCast instance; the validator sends its
+    // manually constructed packet through an authenticated socket.
     let fullnode_dp = create_dataplane_for_tests(false);
     let fullnode_addr = fullnode_dp.auth_addr;
 
@@ -560,7 +792,7 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
         .map(|(k, v)| (*k, SocketAddr::V4(*v)))
         .collect();
 
-    let mut fullnode_rc = new_defaulted_raptorcast_for_tests::<
+    let mut fullnode_rc = new_wireauth_raptorcast_for_tests::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -608,9 +840,11 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
 
     // Build a unicast raptorcast packet signed by the validator, targeted at the
     // fullnode.
+    let segment_size = DEFAULT_SEGMENT_SIZE
+        - <monad_raptorcast::auth::WireAuthProtocol as monad_raptorcast::auth::AuthenticationProtocol>::HEADER_SIZE;
     let packets = build_messages::<SignatureType>(
         &validator_keypair,
-        DEFAULT_SEGMENT_SIZE,
+        segment_size,
         msg_bytes,
         Redundancy::from_u8(2),
         0,
@@ -627,11 +861,23 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
         }
     }
 
-    let tx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tx_dataplane = create_dataplane_for_tests(false);
+    let mut tx_socket = monad_raptorcast::auth::AuthenticatedSocketHandle::new(
+        tx_dataplane.authenticated_socket,
+        monad_raptorcast::auth::WireAuthProtocol::new(
+            &monad_raptorcast::auth::metrics::UDP_METRICS,
+            Default::default(),
+            Arc::new(validator_keypair),
+        ),
+    );
     for (target_addr, payload) in &packets {
-        for chunk in payload.chunks(usize::from(DEFAULT_SEGMENT_SIZE)) {
-            tx_socket.send_to(chunk, target_addr).unwrap();
-        }
+        tx_socket.write(
+            &fullnode_nodeid.pubkey(),
+            Some(*target_addr),
+            payload.clone(),
+            segment_size,
+            UdpPriority::Regular,
+        );
     }
 
     // Drive the fullnode event loop until the channel receives the message or we time out.
@@ -641,6 +887,7 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
                 biased;
                 msg = channel_to_secondary_rx.recv() => return msg,
                 _ = fullnode_rc.next() => continue,
+                _ = tx_socket.recv() => continue,
             }
         }
     })
@@ -695,7 +942,7 @@ async fn publish_to_full_nodes() {
     ]);
 
     // 3. Create services with known addresses
-    let mut validator_rc = setup_raptorcast_service(
+    let mut validator_rc = setup_authenticated_raptorcast_service(
         validator_keypair,
         validator_dp,
         known_addresses.clone(),
@@ -703,14 +950,14 @@ async fn publish_to_full_nodes() {
     );
     validator_rc.set_dedicated_full_nodes(vec![full_node1_id, full_node2_id]);
 
-    let mut full_node1_rc = setup_raptorcast_service(
+    let mut full_node1_rc = setup_authenticated_raptorcast_service(
         full_node1_keypair,
         full_node1_dp,
         known_addresses.clone(),
         name_records.clone(),
     );
 
-    let mut full_node2_rc = setup_raptorcast_service(
+    let mut full_node2_rc = setup_authenticated_raptorcast_service(
         full_node2_keypair,
         full_node2_dp,
         known_addresses.clone(),
@@ -749,18 +996,22 @@ async fn publish_to_full_nodes() {
 
     // 7. Assert full nodes receive the message
     let timeout = Duration::from_secs(1);
-    let event1 = tokio::time::timeout(timeout, full_node1_rc.next())
-        .await
-        .expect("timeout")
-        .expect("stream ended");
+    let event1 = tokio::time::timeout(
+        timeout,
+        next_authenticated_event(&mut full_node1_rc, &mut [&mut validator_rc]),
+    )
+    .await
+    .expect("timeout");
     let MockEvent((from, id)) = event1;
     assert_eq!(from, validator_nodeid);
     assert_eq!(id, 42);
 
-    let event2 = tokio::time::timeout(timeout, full_node2_rc.next())
-        .await
-        .expect("timeout")
-        .expect("stream ended");
+    let event2 = tokio::time::timeout(
+        timeout,
+        next_authenticated_event(&mut full_node2_rc, &mut [&mut validator_rc]),
+    )
+    .await
+    .expect("timeout");
     let MockEvent((from, id)) = event2;
     assert_eq!(from, validator_nodeid);
     assert_eq!(id, 42);
@@ -1043,7 +1294,7 @@ async fn test_priority_messages() {
     .into_iter()
     .collect();
 
-    let mut tx_rc = new_defaulted_raptorcast_for_tests::<
+    let mut tx_rc = new_wireauth_raptorcast_for_tests::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -1055,7 +1306,7 @@ async fn test_priority_messages() {
         Epoch(0),
     );
 
-    let mut rx_rc = new_defaulted_raptorcast_for_tests::<
+    let mut rx_rc = new_wireauth_raptorcast_for_tests::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -1111,12 +1362,16 @@ async fn test_priority_messages() {
     let start = std::time::Instant::now();
 
     while received_messages.len() < MESSAGE_COUNT * 2 && start.elapsed() < timeout {
-        match tokio::time::timeout(Duration::from_millis(100), rx_rc.next()).await {
-            Ok(Some(event)) => {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            next_authenticated_event(&mut rx_rc, &mut [&mut tx_rc]),
+        )
+        .await
+        {
+            Ok(event) => {
                 let MockEvent((_, msg_id)) = event;
                 received_messages.push(msg_id);
             }
-            Ok(None) => break,
             Err(_) => continue,
         }
     }
@@ -1186,7 +1441,7 @@ async fn test_raptorcast_forwarding_priority() {
         ),
     ]);
 
-    let mut validator1_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
+    let mut validator1_rc = new_wireauth_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -1199,7 +1454,7 @@ async fn test_raptorcast_forwarding_priority() {
         Epoch(0),
     );
 
-    let mut validator2_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
+    let mut validator2_rc = new_wireauth_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -1212,7 +1467,7 @@ async fn test_raptorcast_forwarding_priority() {
         Epoch(0),
     );
 
-    let mut validator_fullnode_rc = new_defaulted_raptorcast_for_tests_with_name_records::<
+    let mut validator_fullnode_rc = new_wireauth_raptorcast_for_tests_with_name_records::<
         SignatureType,
         MockMessage,
         MockMessage,
@@ -1276,7 +1531,15 @@ async fn test_raptorcast_forwarding_priority() {
     let start = std::time::Instant::now();
 
     while received_messages.len() < 2 && start.elapsed() < timeout {
-        if let Some(event) = validator_fullnode_rc.next().await {
+        if let Ok(event) = tokio::time::timeout(
+            timeout,
+            next_authenticated_event(
+                &mut validator_fullnode_rc,
+                &mut [&mut validator1_rc, &mut validator2_rc],
+            ),
+        )
+        .await
+        {
             let MockEvent((from, msg_id)) = event;
             received_messages.push((from, msg_id));
         }

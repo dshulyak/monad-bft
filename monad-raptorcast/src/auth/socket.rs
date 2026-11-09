@@ -80,7 +80,10 @@ where
     bytes_read_metric: &'static MetricDef,
 }
 
-impl<AP: AuthenticationProtocol + Unpin> Stream for AuthenticatedSocketHandle<AP> {
+// The protocol is accessed through &mut AP and is never structurally pinned.
+impl<AP: AuthenticationProtocol> Unpin for AuthenticatedSocketHandle<AP> {}
+
+impl<AP: AuthenticationProtocol> Stream for AuthenticatedSocketHandle<AP> {
     type Item = Result<AuthRecvMsg<AP::PublicKey>, AP::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -330,6 +333,26 @@ where
 {
     socket: AuthenticatedSocketHandle<AP>,
     framer: F,
+}
+
+// Neither the socket nor the framer is structurally pinned by this handle.
+impl<AP, F> Unpin for FramedAuthenticatedSocketHandle<AP, F>
+where
+    AP: AuthenticationProtocol,
+    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
+{
+}
+
+impl<AP, F> Stream for FramedAuthenticatedSocketHandle<AP, F>
+where
+    AP: AuthenticationProtocol,
+    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
+{
+    type Item = Result<AuthRecvMsg<AP::PublicKey>, FramedRecvError<AP::Error>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        std::pin::pin!(self.get_mut().recv()).poll(cx).map(Some)
+    }
 }
 
 #[derive(Debug, Error)]

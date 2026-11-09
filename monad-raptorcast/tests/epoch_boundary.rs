@@ -212,7 +212,7 @@ fn spawn_validator(
 
     tokio::task::spawn_local(async move {
         let config = monad_raptorcast::config::RaptorCastConfig::<SecpSignature> {
-            shared_key: keypair,
+            shared_key: keypair.clone(),
             mtu: monad_dataplane::udp::DEFAULT_MTU,
             udp_message_max_age_ms: u64::MAX,
             sig_verification_rate_limit: 10_000,
@@ -251,7 +251,7 @@ fn spawn_validator(
             MockMessage,
             MockEvent<PubKeyType>,
             NopDiscovery<SecpSignature>,
-            monad_raptorcast::auth::NoopAuthProtocol<PubKeyType>,
+            monad_raptorcast::auth::WireAuthProtocol,
             monad_raptorcast::auth::NopScore<NodeId<PubKeyType>>,
         >::new(
             config,
@@ -259,7 +259,11 @@ fn spawn_validator(
             dataplane.tcp_socket,
             (
                 dataplane.authenticated_socket,
-                monad_raptorcast::auth::NoopAuthProtocol::new(),
+                monad_raptorcast::auth::WireAuthProtocol::new(
+                    &monad_raptorcast::auth::metrics::UDP_METRICS,
+                    Default::default(),
+                    keypair,
+                ),
             ),
             None,
             dataplane.control,

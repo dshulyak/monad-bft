@@ -375,8 +375,20 @@ async fn establish_connections(
             .expect("ready channel closed");
     }
 
-    for event_rx in event_rxs {
-        while event_rx.try_recv().is_ok() {}
+    // A completed handshake can precede delivery of its buffered warmup data.
+    // Wait for each sender so delayed warmups cannot race the scenario's data.
+    for (index, event_rx) in event_rxs.iter_mut().enumerate() {
+        let mut received = std::collections::BTreeSet::new();
+        while received.len() < node_ids.len() - 1 {
+            let MockEvent((from, message_id)) =
+                tokio::time::timeout(MESSAGE_TIMEOUT, event_rx.recv())
+                    .await
+                    .expect("warmup delivery timeout")
+                    .expect("warmup channel closed");
+            assert_eq!(message_id, 1);
+            assert_ne!(from, node_ids[index]);
+            assert!(received.insert(from), "duplicate warmup sender");
+        }
     }
 }
 
