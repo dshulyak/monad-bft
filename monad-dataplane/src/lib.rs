@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
+    collections::HashSet,
     fmt::Debug,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
@@ -32,7 +33,10 @@ use futures::channel::oneshot;
 use monad_types::UdpPriority;
 use monoio::{spawn, time::Instant, IoUringDriver, RuntimeBuilder};
 use tcp::{TcpConfig, TcpControl, TcpRateLimit};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    watch,
+};
 use tracing::{debug, warn};
 
 pub(crate) mod addrlist;
@@ -100,6 +104,30 @@ pub const DEFAULT_UDP_MAX_QUEUED_BYTES: usize = 100 * 1024 * 1024;
 pub const DEFAULT_UDP_TX_WORKERS: usize = 1;
 pub const MAX_UDP_TX_WORKERS: usize = 64;
 
+/// Per-socket UDP buffering before authentication. Delivery uses a single
+/// channel slot containing up to 128 datagrams. IP priority is only a scheduling
+/// hint; applications must authenticate every delivered datagram.
+#[derive(Clone, Copy, Debug)]
+pub struct UdpReceiveConfig {
+    /// Enable pinned-IP priority and round robin within each class. False
+    /// selects global FIFO order with the same byte admission limits.
+    pub prioritize: bool,
+    pub pinned_ip_bytes: usize,
+    pub other_ip_bytes: usize,
+    pub total_bytes: usize,
+}
+
+impl Default for UdpReceiveConfig {
+    fn default() -> Self {
+        Self {
+            prioritize: true,
+            pinned_ip_bytes: 5 * 1024 * 1024,
+            other_ip_bytes: 2 * 1024 * 1024,
+            total_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Configuration for the UDP pacing queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpPacingConfig {
@@ -141,6 +169,7 @@ pub struct DataplaneBuilder {
     tcp_sockets: Vec<(TcpSocketId, SocketAddr)>,
     udp_multishot: bool,
     udp_tx_workers: usize,
+    udp_receive: UdpReceiveConfig,
 }
 
 impl DataplaneBuilder {
@@ -167,11 +196,18 @@ impl DataplaneBuilder {
             tcp_sockets: Vec::new(),
             udp_multishot: true,
             udp_tx_workers: DEFAULT_UDP_TX_WORKERS,
+            udp_receive: UdpReceiveConfig::default(),
         }
     }
 
     pub fn with_udp_buffer_size(mut self, buffer_size: usize) -> Self {
         self.udp_buffer_size = Some(buffer_size);
+        self
+    }
+
+    pub fn with_udp_receive_config(mut self, config: UdpReceiveConfig) -> Self {
+        assert!(config.pinned_ip_bytes > 0 && config.other_ip_bytes > 0 && config.total_bytes > 0);
+        self.udp_receive = config;
         self
     }
 
@@ -253,6 +289,7 @@ impl DataplaneBuilder {
             tcp_sockets,
             udp_multishot,
             udp_tx_workers,
+            udp_receive,
         } = self;
 
         udp_pacing_config.validate();
@@ -267,9 +304,10 @@ impl DataplaneBuilder {
         let mut udp_socket_configs = Vec::new();
         let mut udp_pending_handles = Vec::new();
         for (id, addr) in udp_sockets {
-            let (ingress_tx, ingress_rx) = mpsc::channel(UDP_INGRESS_CHANNEL_SIZE);
-            udp_socket_configs.push((id, addr, ingress_tx));
-            udp_pending_handles.push((id, ingress_rx));
+            let (ingress_tx, ingress_rx) = mpsc::channel(1);
+            let (priority_ips, priority_updates) = watch::channel(HashSet::new());
+            udp_socket_configs.push((id, addr, ingress_tx, priority_updates));
+            udp_pending_handles.push((id, ingress_rx, priority_ips));
         }
 
         let mut tcp_socket_configs = Vec::new();
@@ -332,6 +370,7 @@ impl DataplaneBuilder {
                                     buffer_size: udp_buffer_size,
                                     use_multishot: udp_multishot,
                                     workers: udp_tx_workers,
+                                    receive: udp_receive,
                                 },
                                 udp_bound_addrs_tx,
                                 metrics,
@@ -359,7 +398,7 @@ impl DataplaneBuilder {
                 .collect();
 
         let mut udp_socket_handles = UdpSocketHandles::default();
-        for (id, ingress_rx) in udp_pending_handles {
+        for (id, ingress_rx, priority_ips) in udp_pending_handles {
             let socket_addr = *udp_bound_addrs
                 .get(&id)
                 .unwrap_or_else(|| panic!("missing bound address for udp socket {:?}", id));
@@ -367,6 +406,8 @@ impl DataplaneBuilder {
                 reader: UdpSocketReader {
                     socket_id: id,
                     ingress_rx,
+                    batch: Vec::new().into_iter(),
+                    priority_ips,
                 },
                 writer: UdpSocketWriter {
                     socket_id: id,
@@ -423,26 +464,39 @@ pub struct Dataplane {
 
 pub struct UdpSocketReader {
     socket_id: UdpSocketId,
-    ingress_rx: mpsc::Receiver<RecvUdpMsg>,
+    ingress_rx: mpsc::Receiver<Vec<RecvUdpMsg>>,
+    batch: std::vec::IntoIter<RecvUdpMsg>,
+    priority_ips: watch::Sender<HashSet<IpAddr>>,
 }
 
 impl UdpSocketReader {
     pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg>, limit: usize) -> usize {
         assert!(limit != 0, "UDP receive batch limit must be non-zero");
-        let received = self.ingress_rx.recv_many(messages, limit).await;
-        assert!(
-            received != 0,
-            "socket {:?} ingress channel closed",
-            self.socket_id
-        );
+        self.fill_batch().await;
+        let received = self.batch.len().min(limit);
+        messages.extend(self.batch.by_ref().take(received));
         received
     }
 
     pub async fn recv(&mut self) -> RecvUdpMsg {
-        self.ingress_rx
+        self.fill_batch().await;
+        self.batch.next().unwrap()
+    }
+
+    async fn fill_batch(&mut self) {
+        if self.batch.len() != 0 {
+            return;
+        }
+        self.batch = self
+            .ingress_rx
             .recv()
             .await
             .unwrap_or_else(|| panic!("socket {:?} ingress channel closed", self.socket_id))
+            .into_iter();
+        assert!(
+            self.batch.len() > 0,
+            "UDP delivery batches must not be empty"
+        );
     }
 }
 
@@ -461,6 +515,18 @@ pub struct UdpSocketHandle {
 }
 
 impl UdpSocketHandle {
+    /// Replace this socket's pinned source IPs, including buffered queues.
+    /// The one already-selected delivery batch retains its order.
+    pub fn set_receive_priority_ips(&self, ips: HashSet<IpAddr>) {
+        self.reader.priority_ips.send_if_modified(|current| {
+            if *current == ips {
+                false
+            } else {
+                *current = ips;
+                true
+            }
+        });
+    }
     pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg>, limit: usize) -> usize {
         self.reader.recv_many(messages, limit).await
     }
@@ -863,7 +929,6 @@ pub(crate) struct UdpMsg {
 
 const TCP_INGRESS_CHANNEL_SIZE: usize = 1024;
 const TCP_EGRESS_CHANNEL_SIZE: usize = 256;
-const UDP_INGRESS_CHANNEL_SIZE: usize = 12_800;
 const UDP_EGRESS_CHANNEL_SIZE: usize = 12_800;
 
 impl Dataplane {

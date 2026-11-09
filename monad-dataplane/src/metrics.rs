@@ -52,6 +52,12 @@ macro_rules! define_metrics {
 }
 
 define_metrics! {
+    udp_ingress_queued_bytes => UDP_INGRESS_QUEUED_BYTES("monad.dataplane.udp.ingress.current_queued_bytes", "UDP payload and packet metadata bytes waiting for batch delivery"),
+    udp_ingress_packets_dropped => UDP_INGRESS_PACKETS_DROPPED("monad.dataplane.udp.ingress.total_packets_dropped", "UDP packets dropped by ingress byte limits"),
+    udp_ingress_bytes_dropped => UDP_INGRESS_BYTES_DROPPED("monad.dataplane.udp.ingress.total_bytes_dropped", "UDP payload and packet metadata bytes dropped by ingress limits"),
+    udp_ingress_batches_delivered => UDP_INGRESS_BATCHES_DELIVERED("monad.dataplane.udp.ingress.total_batches_delivered", "UDP batches delivered through the single-slot handoff"),
+    udp_ingress_packets_delivered => UDP_INGRESS_PACKETS_DELIVERED("monad.dataplane.udp.ingress.total_packets_delivered", "UDP packets delivered through the batch handoff"),
+    udp_ingress_priority_packets_delivered => UDP_INGRESS_PRIORITY_PACKETS_DELIVERED("monad.dataplane.udp.ingress.total_priority_packets_delivered", "UDP packets selected from pinned IP queues"),
     udp_messages_received => UDP_MESSAGES_RECEIVED("monad.dataplane.udp.total_messages_received", "Total UDP datagrams received from the network"),
     udp_bytes_received => UDP_BYTES_RECEIVED("monad.dataplane.udp.total_bytes_received", "Total UDP payload bytes received from the network"),
     udp_messages_sent => UDP_MESSAGES_SENT("monad.dataplane.udp.total_messages_sent", "Total UDP datagrams successfully sent to the network"),
