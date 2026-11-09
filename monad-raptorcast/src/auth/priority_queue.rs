@@ -117,9 +117,26 @@ impl<P: PubKey> Pinned for WatchPinned<P> {
     }
 
     fn poll_updated(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match self.updates.poll_next_unpin(cx) {
-            Poll::Ready(Some(())) => Poll::Ready(()),
-            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+        loop {
+            // watch::changed can yield when Tokio's cooperative budget runs
+            // out, even if a new value exists. Observe the version directly
+            // before allowing buffered messages to use cached priority.
+            if self.current.borrow_and_update().has_changed() {
+                return Poll::Ready(());
+            }
+            match self.updates.poll_next_unpin(cx) {
+                // The notification may refer to a version consumed above.
+                Poll::Ready(Some(())) => continue,
+                Poll::Ready(None) | Poll::Pending => {
+                    // Close the race between checking the version and
+                    // registering the asynchronous notification's waker.
+                    return if self.current.borrow_and_update().has_changed() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    };
+                }
+            }
         }
     }
 }
@@ -713,6 +730,27 @@ mod tests {
         }
         assert_eq!(values, [2, 3, 4, 5]);
         assert_eq!(queue.dropped_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn pin_updates_precede_dequeue_when_tokio_budget_is_exhausted() {
+        let (updates, pins) = watch::channel(HashSet::from([pin(1)]));
+        let source = futures::stream::iter(
+            [packet(1, 1, 11), packet(1, 1, 12), packet(2, 2, 21)].map(Ok::<_, Infallible>),
+        );
+        let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
+        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 11);
+
+        while tokio::task::coop::has_budget_remaining() {
+            let mut consume = std::pin::pin!(tokio::task::consume_budget());
+            assert!(futures::poll!(&mut consume).is_ready());
+        }
+        updates.send_replace(HashSet::from([pin(2)]));
+        let mut receive = std::pin::pin!(queue.recv());
+        let Poll::Ready(Some(Ok(message))) = futures::poll!(&mut receive) else {
+            panic!("ready pin update must not wait for Tokio's cooperative budget");
+        };
+        assert_eq!(message.payload[0], 21);
     }
 
     #[tokio::test]
