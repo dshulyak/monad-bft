@@ -25,7 +25,7 @@ pub use metrics::{
     GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
 };
 pub use priority_queue::{
-    Pinned, PriorityQueue, PriorityQueueConfig, QueueIdentity, Sender, WatchPinned,
+    Pinned, PriorityQueue, PriorityQueueConfig, QueueIdentity, RecvMany, Sender, WatchPinned,
 };
 pub use protocol::{AuthenticationProtocol, NoopAuthProtocol, NoopHeader, WireAuthProtocol};
 pub use socket::{

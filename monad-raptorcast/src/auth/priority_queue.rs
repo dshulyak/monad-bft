@@ -37,8 +37,46 @@ use tokio::sync::watch;
 
 use super::AuthRecvMsg;
 
-const BATCH_SIZE: usize = 64;
+pub(crate) const RECEIVE_BATCH_SIZE: usize = 128;
+const PROCESS_BATCH_SIZE: usize = 32;
 const LOOKUP_CAPACITY: usize = 1000;
+
+/// Appends at most `limit` items per poll. Ready(None) marks EOF and may still
+/// append a final batch. Pending must leave `messages` unchanged. A ready batch
+/// may be empty when the transport consumed only authentication/control traffic.
+pub trait RecvMany {
+    type Item;
+
+    fn poll_recv_many(
+        &mut self,
+        cx: &mut Context<'_>,
+        messages: &mut Vec<Self::Item>,
+        limit: usize,
+    ) -> Poll<Option<()>>;
+}
+
+impl<S: Stream + Unpin> RecvMany for S {
+    type Item = S::Item;
+
+    fn poll_recv_many(
+        &mut self,
+        cx: &mut Context<'_>,
+        messages: &mut Vec<Self::Item>,
+        limit: usize,
+    ) -> Poll<Option<()>> {
+        assert!(limit > 0);
+        let start = messages.len();
+        for _ in 0..limit {
+            match Pin::new(&mut *self).poll_next(cx) {
+                Poll::Ready(Some(item)) => messages.push(item),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending if messages.len() == start => return Poll::Pending,
+                Poll::Pending => break,
+            }
+        }
+        Poll::Ready(Some(()))
+    }
+}
 
 /// Only authenticated public keys may appear here. Ports are deliberately
 /// excluded so reconnects cannot multiply an IP's allowance.
@@ -267,9 +305,12 @@ impl<P: PubKey> Groups<P> {
 
 type LookupResult<P> = (Sender<P>, Option<QueueIdentity<P>>);
 
-/// Receives from one authenticated socket (or an equivalent Stream).
+/// Receives from one authenticated batch receiver (or an equivalent Stream).
 ///
-/// Each poll reads a bounded batch even with a backlog, then returns one item.
+/// Alternates intake of up to 128 messages with service of up to 32 messages,
+/// refilling early when empty. Intake uses the previous batch's accounted size
+/// as a headroom estimate: near the aggregate limit, service continues until
+/// another batch fits. Larger incoming batches can still overflow and are capped.
 /// Pinned groups always precede ordinary groups, so pinned traffic may starve
 /// ordinary traffic. Each class uses round robin across groups and FIFO within
 /// a group. Ordinary authenticated identities on the same IP share one queue.
@@ -280,7 +321,7 @@ type LookupResult<P> = (Sender<P>, Option<QueueIdentity<P>>);
 /// count toward the total and initially share the ordinary IP limit. On a
 /// pinning update, admitted data is retained until its new limit is known, then
 /// excess newest messages are dropped. Global overflow drops the incoming item.
-pub struct PriorityQueue<S: Stream, P: Pinned> {
+pub struct PriorityQueue<S: RecvMany, P: Pinned> {
     socket: S,
     pinned: P,
     config: PriorityQueueConfig,
@@ -297,9 +338,16 @@ pub struct PriorityQueue<S: Stream, P: Pinned> {
     dropped_bytes: u64,
     socket_closed: bool,
     socket_error: Option<Box<S::Item>>,
+    receive_buffer: Vec<S::Item>,
+    processing_remaining: usize,
+    receive_reserve: usize,
 }
 
-impl<S: Stream, P: Pinned> PriorityQueue<S, P> {
+// Only the receiver and pinning provider are polled in place. Buffered items
+// are moved through ordinary mutable references and are never pinned.
+impl<S: RecvMany + Unpin, P: Pinned + Unpin> Unpin for PriorityQueue<S, P> {}
+
+impl<S: RecvMany, P: Pinned> PriorityQueue<S, P> {
     pub fn new(socket: S, pinned: P, config: PriorityQueueConfig) -> Self {
         assert!(config.pinned_bytes > 0);
         assert!(config.other_ip_bytes > 0);
@@ -321,6 +369,9 @@ impl<S: Stream, P: Pinned> PriorityQueue<S, P> {
             dropped_bytes: 0,
             socket_closed: false,
             socket_error: None,
+            receive_buffer: Vec::with_capacity(RECEIVE_BATCH_SIZE),
+            processing_remaining: 0,
+            receive_reserve: 0,
         }
     }
 
@@ -478,7 +529,7 @@ impl<S: Stream, P: Pinned> PriorityQueue<S, P> {
 
 // Preserve the socket's send and metrics interfaces while replacing receives
 // with the queue's recv/Stream implementations.
-impl<S: Stream, P: Pinned> Deref for PriorityQueue<S, P> {
+impl<S: RecvMany, P: Pinned> Deref for PriorityQueue<S, P> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -486,7 +537,7 @@ impl<S: Stream, P: Pinned> Deref for PriorityQueue<S, P> {
     }
 }
 
-impl<S: Stream, P: Pinned> DerefMut for PriorityQueue<S, P> {
+impl<S: RecvMany, P: Pinned> DerefMut for PriorityQueue<S, P> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.socket
     }
@@ -495,7 +546,7 @@ impl<S: Stream, P: Pinned> DerefMut for PriorityQueue<S, P> {
 impl<S, P, E> Stream for PriorityQueue<S, P>
 where
     P: Pinned + Unpin,
-    S: Stream<Item = Result<AuthRecvMsg<P::PublicKey>, E>> + Unpin,
+    S: RecvMany<Item = Result<AuthRecvMsg<P::PublicKey>, E>> + Unpin,
 {
     type Item = Result<AuthRecvMsg<P::PublicKey>, E>;
 
@@ -504,27 +555,46 @@ where
         if this.pinned.poll_updated(cx).is_ready() {
             this.updated();
         }
-        let mut work = BATCH_SIZE;
+        let mut work = RECEIVE_BATCH_SIZE;
         this.reclassify(&mut work);
         this.poll_lookups(cx, &mut work);
-        let mut received = 0;
-        while received < BATCH_SIZE && !this.socket_closed {
-            match Pin::new(&mut this.socket).poll_next(cx) {
-                Poll::Ready(Some(Ok(message))) => {
-                    received += 1;
-                    this.push(message);
-                    this.poll_lookups(cx, &mut work);
+        let mut received_batch = false;
+        if !this.socket_closed
+            && (this.processing_remaining == 0 || this.queued_bytes == 0)
+            && this.queued_bytes < this.config.total_bytes
+            && this.config.total_bytes - this.queued_bytes >= this.receive_reserve
+        {
+            match this
+                .socket
+                .poll_recv_many(cx, &mut this.receive_buffer, RECEIVE_BATCH_SIZE)
+            {
+                Poll::Ready(status) => {
+                    this.socket_closed = status.is_none();
+                    received_batch = true;
+                    this.processing_remaining = PROCESS_BATCH_SIZE;
+                    let mut messages = std::mem::take(&mut this.receive_buffer);
+                    let mut batch_bytes: usize = 0;
+                    for item in messages.drain(..) {
+                        match item {
+                            Ok(message) => {
+                                batch_bytes = batch_bytes.saturating_add(
+                                    message.payload.len()
+                                        + std::mem::size_of::<Message<P::PublicKey>>(),
+                                );
+                                this.push(message);
+                                this.poll_lookups(cx, &mut work);
+                            }
+                            Err(error) => this.socket_error = Some(Box::new(Err(error))),
+                        }
+                    }
+                    this.receive_buffer = messages;
+                    this.receive_reserve = batch_bytes.min(this.config.total_bytes);
                 }
-                Poll::Ready(Some(Err(error))) => {
-                    received += 1;
-                    this.socket_error = Some(Box::new(Err(error)));
-                }
-                Poll::Ready(None) => this.socket_closed = true,
-                Poll::Pending => break,
+                Poll::Pending => this.processing_remaining = PROCESS_BATCH_SIZE,
             }
         }
         // Finishing a bounded batch must not rely on another socket notification.
-        if received == BATCH_SIZE
+        if received_batch
             || work == 0
             || (!this.reclassifying.is_empty() && this.pending.len() < LOOKUP_CAPACITY)
         {
@@ -537,12 +607,17 @@ where
                 .or_else(|| this.ordinary.pop(&this.pending))
             {
                 this.queued_bytes -= message.bytes();
+                this.processing_remaining = this.processing_remaining.saturating_sub(1);
                 return Poll::Ready(Some(Ok(message.value)));
             }
         }
         if let Some(error) = this.socket_error.take() {
+            this.processing_remaining = this.processing_remaining.saturating_sub(1);
             return Poll::Ready(Some(*error));
         }
+        // Unresolved routes or control-only batches must not prevent intake
+        // from discovering another sender that can make progress.
+        this.processing_remaining = 0;
         if this.socket_closed && this.queued_bytes == 0 {
             Poll::Ready(None)
         } else {
@@ -554,7 +629,7 @@ where
 impl<S, P, E> PriorityQueue<S, P>
 where
     P: Pinned + Unpin,
-    S: Stream<Item = Result<AuthRecvMsg<P::PublicKey>, E>> + Unpin,
+    S: RecvMany<Item = Result<AuthRecvMsg<P::PublicKey>, E>> + Unpin,
 {
     /// Cancellation safe: buffered messages and in-flight lookups belong to self.
     pub async fn recv(&mut self) -> Option<Result<AuthRecvMsg<P::PublicKey>, E>> {
@@ -629,15 +704,71 @@ mod tests {
         let (_updates, pins) = watch::channel(HashSet::from([pin(2)]));
         let (incoming, source) = futures::channel::mpsc::unbounded();
         let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
-        incoming
-            .unbounded_send(Ok::<_, Infallible>(packet(1, 1, 11)))
-            .unwrap();
-        incoming.unbounded_send(Ok(packet(1, 1, 12))).unwrap();
-        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 11);
-        assert_eq!(queue.queued_bytes(), unit_bytes());
-        incoming.unbounded_send(Ok(packet(2, 2, 21))).unwrap();
-        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 21);
-        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 12);
+        for value in 1..=40 {
+            incoming
+                .unbounded_send(Ok::<_, Infallible>(packet(1, 1, value)))
+                .unwrap();
+        }
+        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 1);
+        incoming.unbounded_send(Ok(packet(2, 2, 99))).unwrap();
+        for value in 2..=32 {
+            assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], value);
+        }
+        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 99);
+        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 33);
+    }
+
+    #[tokio::test]
+    async fn balances_intake_and_service_and_backpressures_a_full_queue() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        let source = futures::stream::iter((0..512).map(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, Infallible>(packet(1, 1, 1))
+        }));
+        let (_updates, pins) = watch::channel(HashSet::new());
+        let mut queue = PriorityQueue::new(
+            source,
+            WatchPinned::new(pins),
+            PriorityQueueConfig {
+                total_bytes: 256 * unit_bytes(),
+                ..Default::default()
+            },
+        );
+        for _ in 0..32 {
+            queue.recv().await.unwrap().unwrap();
+            assert_eq!(reads.load(Ordering::Relaxed), 128);
+        }
+        assert_eq!(queue.queued_bytes(), 96 * unit_bytes());
+        for _ in 32..128 {
+            queue.recv().await.unwrap().unwrap();
+            assert_eq!(reads.load(Ordering::Relaxed), 256);
+        }
+        // Continue serving past 32 outputs when there is insufficient room for
+        // another intake batch. Resume before draining the queue completely.
+        assert_eq!(queue.queued_bytes(), 128 * unit_bytes());
+        queue.recv().await.unwrap().unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 384);
+        assert_eq!(queue.queued_bytes(), 255 * unit_bytes());
+        assert_eq!(queue.dropped_bytes(), 0);
+        while queue.recv().await.is_some() {}
+        assert_eq!(reads.load(Ordering::Relaxed), 512);
+        assert_eq!(queue.queued_bytes(), 0);
+        assert_eq!(queue.dropped_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn refills_before_32_outputs_when_the_queue_is_empty() {
+        let (_updates, pins) = watch::channel(HashSet::new());
+        let (incoming, source) = futures::channel::mpsc::unbounded();
+        let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
+        for value in 1..=3 {
+            incoming
+                .unbounded_send(Ok::<_, Infallible>(packet(1, 1, value)))
+                .unwrap();
+            assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], value);
+            assert_eq!(queue.queued_bytes(), 0);
+        }
     }
 
     #[tokio::test]
