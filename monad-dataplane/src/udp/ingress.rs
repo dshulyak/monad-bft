@@ -14,11 +14,12 @@ use std::{
     cell::RefCell,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     rc::Rc,
     task::{Poll, Waker},
 };
 
+use bytes::Bytes;
 use futures::future::poll_fn;
 use tokio::sync::{mpsc, watch};
 
@@ -95,20 +96,33 @@ impl Queue {
         self.metrics.udp_ingress_queued_bytes.sub(bytes as u64);
     }
 
+    #[cfg(test)]
     fn push(&mut self, message: RecvUdpMsg) -> bool {
+        self.push_with(
+            message.src_addr,
+            message.payload.len(),
+            message.stride,
+            || message.payload,
+        )
+    }
+
+    fn push_with(
+        &mut self,
+        src_addr: SocketAddr,
+        len: usize,
+        stride: u16,
+        payload: impl FnOnce() -> Bytes,
+    ) -> bool {
         if self.closed {
             return false;
         }
-        let ip = message.src_addr.ip();
-        let packet = Packet {
-            sequence: self.sequence,
-            message,
-        };
+        let ip = src_addr.ip();
+        let sequence = self.sequence;
         self.sequence = self
             .sequence
             .checked_add(1)
             .expect("UDP ingress sequence overflow");
-        let bytes = packet.bytes();
+        let bytes = len + std::mem::size_of::<Packet>();
         let used = self.flows.get(&ip).map_or(0, |flow| flow.bytes);
         if bytes > self.config.total_bytes - self.bytes
             || bytes > self.limit(&ip).saturating_sub(used)
@@ -116,6 +130,16 @@ impl Queue {
             self.drop_packet(bytes);
             return true;
         }
+        // Rejected datagrams never allocate or copy their payload out of the
+        // receive ring; the admission budget is known from address and length.
+        let packet = Packet {
+            sequence,
+            message: RecvUdpMsg {
+                src_addr,
+                payload: payload(),
+                stride,
+            },
+        };
         let flow = self.flows.entry(ip).or_default();
         if flow.packets.is_empty() {
             if !self.config.prioritize {
@@ -284,11 +308,29 @@ pub(crate) struct Ingress {
 }
 
 impl Ingress {
-    pub(crate) fn push(&self, message: RecvUdpMsg) -> bool {
+    #[cfg(test)]
+    fn push(&self, message: RecvUdpMsg) -> bool {
+        self.push_with(
+            message.src_addr,
+            message.payload.len(),
+            message.stride,
+            || message.payload,
+        )
+    }
+
+    pub(crate) fn push_with(
+        &self,
+        src_addr: SocketAddr,
+        len: usize,
+        stride: u16,
+        payload: impl FnOnce() -> Bytes,
+    ) -> bool {
         if self.delivery.is_closed() {
             return false;
         }
-        self.queue.borrow_mut().push(message)
+        self.queue
+            .borrow_mut()
+            .push_with(src_addr, len, stride, payload)
     }
 }
 
@@ -520,6 +562,35 @@ mod tests {
             );
             assert_eq!(queue.bytes, 0);
             assert_eq!(queue.metrics.udp_ingress_queued_bytes.get(), 0);
+        }
+    }
+
+    #[test]
+    fn rejected_payloads_are_not_copied_for_ip_or_global_overflow() {
+        for prioritize in [false, true] {
+            let mut queue = Queue::new(
+                UdpReceiveConfig {
+                    prioritize,
+                    other_ip_bytes: unit(),
+                    total_bytes: 2 * unit(),
+                    ..Default::default()
+                },
+                DataplaneMetrics::default(),
+            );
+            queue.push(packet(1, 1));
+            queue.push_with(packet(1, 2).src_addr, 8, 8, || {
+                panic!("per-IP overflow copied its payload")
+            });
+            queue.push(packet(2, 3));
+            queue.push_with(packet(3, 4).src_addr, 8, 8, || {
+                panic!("global overflow copied its payload")
+            });
+            assert_eq!(queue.bytes, 2 * unit());
+            assert_eq!(queue.metrics.udp_ingress_packets_dropped.get(), 2);
+            assert_eq!(
+                queue.pop_batch(128).iter().map(value).collect::<Vec<_>>(),
+                [1, 3]
+            );
         }
     }
 

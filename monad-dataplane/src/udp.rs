@@ -256,17 +256,12 @@ async fn rx_single_socket(
 
         match socket.recv_from(buf).await {
             (Ok((len, src_addr)), buf) => {
-                let payload = buf.freeze();
                 metrics.udp_messages_received.inc();
                 metrics.udp_bytes_received.add(len as u64);
 
-                let msg = RecvUdpMsg {
-                    src_addr,
-                    payload,
-                    stride: len.max(1).try_into().unwrap(),
-                };
-
-                if !udp_ingress_tx.push(msg) {
+                if !udp_ingress_tx.push_with(src_addr, len, len.max(1).try_into().unwrap(), || {
+                    buf.freeze()
+                }) {
                     break;
                 }
                 received += 1;
@@ -303,20 +298,18 @@ async fn run_multishot_stream(
     while let Some(result) = stream.next().await {
         match result {
             Ok((src_addr, buf)) => {
-                let payload = Bytes::copy_from_slice(&buf);
-                let len = payload.len();
+                let len = buf.len();
                 metrics.udp_messages_received.inc();
                 metrics.udp_bytes_received.add(len as u64);
-
-                let msg = RecvUdpMsg {
-                    src_addr: src_addr.into(),
-                    payload,
-                    stride: len.max(1).try_into().unwrap(),
-                };
-
-                if !udp_ingress_tx.push(msg) {
+                if !udp_ingress_tx.push_with(
+                    src_addr.into(),
+                    len,
+                    len.max(1).try_into().unwrap(),
+                    || Bytes::copy_from_slice(&buf),
+                ) {
                     return MultishotResult::ChannelClosed;
                 }
+                drop(buf);
                 received += 1;
                 if received % ingress::RECEIVE_BATCH_SIZE == 0 {
                     ingress::yield_receive().await;
