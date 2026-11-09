@@ -15,6 +15,7 @@
 
 pub mod framing;
 pub mod metrics;
+pub mod priority_queue;
 pub mod protocol;
 pub mod socket;
 
@@ -22,6 +23,9 @@ pub use framing::{AuthPacketFramer, LeanUdpFramer, LeanUdpFramingError, NopScore
 pub use metrics::{
     GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ,
     GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
+};
+pub use priority_queue::{
+    Pinned, PriorityQueue, PriorityQueueConfig, QueueIdentity, Sender, WatchPinned,
 };
 pub use protocol::{AuthenticationProtocol, NoopAuthProtocol, NoopHeader, WireAuthProtocol};
 pub use socket::{

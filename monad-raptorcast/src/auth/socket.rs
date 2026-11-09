@@ -22,6 +22,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use futures::Stream;
 use monad_crypto::certificate_signature::PubKey;
 use monad_dataplane::{UdpSocketHandle, UnicastMsg};
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain, MetricDef};
@@ -77,6 +78,16 @@ where
     metrics: ExecutorMetrics,
     bytes_written_metric: &'static MetricDef,
     bytes_read_metric: &'static MetricDef,
+}
+
+impl<AP: AuthenticationProtocol + Unpin> Stream for AuthenticatedSocketHandle<AP> {
+    type Item = Result<AuthRecvMsg<AP::PublicKey>, AP::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // recv is cancellation safe: socket receive state and authentication
+        // deadlines live in the handle rather than in this temporary future.
+        std::pin::pin!(self.get_mut().recv()).poll(cx).map(Some)
+    }
 }
 
 impl<AP> AuthenticatedSocketHandle<AP>
