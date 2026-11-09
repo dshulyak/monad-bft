@@ -16,7 +16,7 @@
 use std::{
     collections::VecDeque,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::Instant,
@@ -181,6 +181,10 @@ where
 
     pub fn segment_size(&self, mtu: u16) -> u16 {
         monad_dataplane::udp::segment_size_for_mtu(mtu) - AP::HEADER_SIZE
+    }
+
+    pub fn set_receive_priority_ips(&self, ips: std::collections::HashSet<IpAddr>) {
+        self.socket.set_receive_priority_ips(ips);
     }
 
     pub async fn recv(&mut self) -> Result<AuthRecvMsg<AP::PublicKey>, AP::Error> {
@@ -547,6 +551,10 @@ where
         self.socket.has_any_session_by_public_key(public_key)
     }
 
+    pub fn set_receive_priority_ips(&self, ips: std::collections::HashSet<IpAddr>) {
+        self.socket.set_receive_priority_ips(ips);
+    }
+
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
         self.socket.metrics().chain(self.framer.metrics())
     }
@@ -792,9 +800,16 @@ mod tests {
         .await
         .unwrap();
         let mut messages = Vec::new();
-        bob.socket.recv_many(&mut messages, 128).await;
-        assert_eq!(messages.len(), 128);
-        bob.socket.recv_many(&mut messages, 128).await;
+        while messages.len() < 144 {
+            let before = messages.len();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                bob.socket.recv_many(&mut messages, 128),
+            )
+            .await
+            .unwrap();
+            assert!(messages.len() - before <= 128);
+        }
         assert_eq!(messages.len(), 144);
         for (value, message) in messages.drain(..).enumerate() {
             let message = message.unwrap();

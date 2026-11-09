@@ -642,8 +642,14 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
     let first_id = NodeId::new(first_key.pubkey());
     let second_id = NodeId::new(second_key.pubkey());
     let receiver_id = NodeId::new(receiver_key.pubkey());
-    let first_dp = create_dataplane_for_tests(false);
-    let second_dp = create_dataplane_for_tests(false);
+    let first_dp = monad_raptorcast::create_dataplane_for_tests_at_ip(
+        false,
+        std::net::Ipv4Addr::new(127, 0, 0, 2),
+    );
+    let second_dp = monad_raptorcast::create_dataplane_for_tests_at_ip(
+        false,
+        std::net::Ipv4Addr::new(127, 0, 0, 3),
+    );
     let receiver_dp = create_dataplane_for_tests(false);
     let receiver_addr = SocketAddr::V4(receiver_dp.auth_addr);
     let (addresses, records) = test_peer_maps([
@@ -728,18 +734,29 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
     .await
     .expect("authenticated warmups");
 
-    send(&mut first, first_key.as_ref(), Epoch(0), 1);
-    send(&mut first, first_key.as_ref(), Epoch(0), 2);
-    send(&mut second, second_key.as_ref(), Epoch(0), 3);
-    // Let the dataplane enqueue traffic from both peers before polling receives.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for (sender, id) in [(second_id, 3), (first_id, 1), (first_id, 2)] {
-        let MockEvent(received) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
-            .await
-            .expect("UDP receive timeout")
-            .unwrap();
-        assert_eq!(received, (sender, id));
+    for id in 1000..1300 {
+        send(&mut first, first_key.as_ref(), Epoch(0), id);
     }
+    send(&mut second, second_key.as_ref(), Epoch(0), 2000);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut pinned_position = None;
+    let mut ordinary = Vec::new();
+    for position in 0..301 {
+        let MockEvent((sender, id)) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if sender == second_id {
+            assert_eq!(id, 2000);
+            pinned_position = Some(position);
+        } else {
+            assert_eq!(sender, first_id);
+            ordinary.push(id);
+        }
+    }
+    // At most one already-selected 128-packet batch can precede the pin.
+    assert!(pinned_position.unwrap() <= 128);
+    assert_eq!(ordinary, (1000..1300).collect::<Vec<_>>());
 
     // Retiring epoch 0 removes its validator's pin and pins the new validator.
     receiver.exec(vec![
@@ -750,16 +767,28 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
         },
         RouterCommand::UpdateCurrentRound(Epoch(2), Round(10)),
     ]);
-    send(&mut second, second_key.as_ref(), Epoch(2), 4);
-    send(&mut first, first_key.as_ref(), Epoch(2), 5);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for (sender, id) in [(first_id, 5), (second_id, 4)] {
-        let MockEvent(received) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
-            .await
-            .expect("UDP receive timeout after pin update")
-            .unwrap();
-        assert_eq!(received, (sender, id));
+    for id in 3000..3300 {
+        send(&mut second, second_key.as_ref(), Epoch(2), id);
     }
+    send(&mut first, first_key.as_ref(), Epoch(2), 4000);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut pinned_position = None;
+    let mut ordinary = Vec::new();
+    for position in 0..301 {
+        let MockEvent((sender, id)) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if sender == first_id {
+            assert_eq!(id, 4000);
+            pinned_position = Some(position);
+        } else {
+            assert_eq!(sender, second_id);
+            ordinary.push(id);
+        }
+    }
+    assert!(pinned_position.unwrap() <= 128);
+    assert_eq!(ordinary, (3000..3300).collect::<Vec<_>>());
 }
 
 // a fullnode must be able to forward an incoming FullNodesGroup

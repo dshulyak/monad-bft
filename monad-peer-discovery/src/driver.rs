@@ -25,6 +25,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
 use monad_types::NodeId;
+use tokio::sync::watch;
 use tokio_util::time::{DelayQueue, delay_queue::Key};
 
 use crate::{
@@ -143,6 +144,7 @@ where
 
     pending_emits: VecDeque<PeerDiscoveryEmit<PD::SignatureType>>,
     waker: Option<Waker>,
+    updates: watch::Sender<()>,
 }
 
 impl<PD: PeerDiscoveryAlgo> std::fmt::Debug for PeerDiscoveryDriver<PD> {
@@ -161,6 +163,7 @@ impl<PD: PeerDiscoveryAlgo> PeerDiscoveryDriver<PD> {
 
             pending_emits: Default::default(),
             waker: None,
+            updates: watch::channel(()).0,
         };
 
         this.exec(init_cmds);
@@ -225,6 +228,13 @@ impl<PD: PeerDiscoveryAlgo> PeerDiscoveryDriver<PD> {
         };
 
         self.exec(cmds);
+        self.updates.send_replace(());
+    }
+
+    /// Address consumers can refresh after peer-discovery state changes,
+    /// including updates that do not emit an outbound router command.
+    pub fn subscribe_updates(&self) -> watch::Receiver<()> {
+        self.updates.subscribe()
     }
 
     fn exec(&mut self, cmds: Vec<PeerDiscoveryCommand<PD::SignatureType>>) {
