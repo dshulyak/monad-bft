@@ -110,9 +110,16 @@ const TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES: usize = 512 * 1024;
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
 
 pub(crate) type OwnedMessageBuilder<ST> = packet::MessageBuilder<'static, ST>;
-type DirectUdpTransport<ST, AP, DS> = auth::FramedAuthenticatedSocketHandle<
-    AP,
-    auth::LeanUdpFramer<NodeId<CertificateSignaturePubKey<ST>>, DS>,
+type QueuedUdpSocket<AP> = auth::PriorityQueue<
+    auth::AuthenticatedSocketHandle<AP>,
+    auth::WatchPinned<<AP as auth::AuthenticationProtocol>::PublicKey>,
+>;
+type DirectUdpTransport<ST, AP, DS> = auth::PriorityQueue<
+    auth::FramedAuthenticatedSocketHandle<
+        AP,
+        auth::LeanUdpFramer<NodeId<CertificateSignaturePubKey<ST>>, DS>,
+    >,
+    auth::WatchPinned<CertificateSignaturePubKey<ST>>,
 >;
 
 pub struct RaptorCast<ST, M, OM, SE, PD, AP, DS>
@@ -151,10 +158,9 @@ where
 
     tcp_reader: TcpSocketReader,
     tcp_writer: TcpSocketWriter,
-    udp_socket: auth::AuthenticatedSocketHandle<AP>,
+    udp_socket: QueuedUdpSocket<AP>,
     direct_udp_transport: Option<DirectUdpTransport<ST, AP, DS>>,
-    udp_priority_updates: watch::Receiver<()>,
-    udp_priority_notifications: futures::stream::BoxStream<'static, ()>,
+    udp_pins: watch::Sender<HashSet<auth::QueueIdentity<CertificateSignaturePubKey<ST>>>>,
     dataplane_control: DataplaneControl,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
@@ -247,14 +253,12 @@ where
             ?is_dynamic_fullnode, ?self_id, ?config.mtu, "RaptorCast::new",
         );
 
-        let udp_priority_updates = peer_discovery_driver.lock().unwrap().subscribe_updates();
-        let udp_priority_notifications =
-            futures::stream::unfold(udp_priority_updates.clone(), |mut updates| async move {
-                updates.changed().await.ok()?;
-                Some(((), updates))
-            })
-            .boxed();
-        let udp_socket = auth::AuthenticatedSocketHandle::new(authenticated.0, authenticated.1);
+        let (udp_pins, pin_updates) = watch::channel(HashSet::new());
+        let udp_socket = auth::PriorityQueue::new(
+            auth::AuthenticatedSocketHandle::new(authenticated.0, authenticated.1),
+            auth::WatchPinned::new(pin_updates.clone()),
+            Default::default(),
+        );
         let direct_udp_transport = direct_udp.map(|(socket, protocol, direct_udp_peer_score)| {
             let max_fragment_payload =
                 usize::from(segment_size_for_mtu(config.mtu).saturating_sub(AP::HEADER_SIZE));
@@ -264,9 +268,14 @@ where
                 ..Default::default()
             };
             let socket = auth::AuthenticatedSocketHandle::new(socket, protocol);
-            auth::FramedAuthenticatedSocketHandle::new(
+            let socket = auth::FramedAuthenticatedSocketHandle::new(
                 socket,
                 auth::LeanUdpFramer::new(direct_udp_peer_score, leanudp_config),
+            );
+            auth::PriorityQueue::new(
+                socket,
+                auth::WatchPinned::new(pin_updates),
+                Default::default(),
             )
         });
 
@@ -322,8 +331,7 @@ where
             tcp_writer,
             udp_socket,
             direct_udp_transport,
-            udp_priority_updates,
-            udp_priority_notifications,
+            udp_pins,
             dataplane_control: control,
             pending_events: Default::default(),
             channel_to_secondary: None,
@@ -382,38 +390,19 @@ where
     }
 
     fn update_udp_validator_pools(&mut self) {
-        let discovery = self.peer_discovery_driver.lock().unwrap();
-        let known = discovery.get_known_auth_udp_addrs();
-        let mut primary_ips = HashSet::new();
-        let mut direct_ips = HashSet::new();
-        for validator in self
+        let pinned = self
             .epoch_validators
             .values()
-            .flat_map(|set| set.get_members().keys())
-        {
-            if let Some(record) = discovery.get_name_record(validator) {
-                primary_ips.insert(std::net::IpAddr::V4(
-                    *record.authenticated_udp_address().ip(),
-                ));
-                if let Some(addr) = record.direct_udp_address() {
-                    direct_ips.insert(std::net::IpAddr::V4(*addr.ip()));
-                }
+            .flat_map(|validators| validators.get_members().keys().copied())
+            .map(auth::QueueIdentity::PublicKey)
+            .collect();
+        self.udp_pins.send_if_modified(|current| {
+            if *current == pinned {
+                return false;
             }
-            if let Some(addr) = known.get(validator) {
-                primary_ips.insert(addr.ip());
-            }
-            if let Some(addr) = self
-                .udp_socket
-                .get_socket_by_public_key(&validator.pubkey())
-            {
-                primary_ips.insert(addr.ip());
-            }
-        }
-        drop(discovery);
-        self.udp_socket.set_receive_priority_ips(primary_ips);
-        if let Some(transport) = self.direct_udp_transport.as_ref() {
-            transport.set_receive_priority_ips(direct_ips);
-        }
+            *current = pinned;
+            true
+        });
 
         let validators = [self.current_epoch, self.current_epoch + Epoch(1)]
             .into_iter()
@@ -1347,15 +1336,6 @@ where
             this.waker = Some(cx.waker().clone());
         }
 
-        let mut priority_update = this.udp_priority_updates.borrow_and_update().has_changed();
-        while let Poll::Ready(Some(())) = this.udp_priority_notifications.poll_next_unpin(cx) {
-            priority_update |= this.udp_priority_updates.borrow_and_update().has_changed();
-        }
-        priority_update |= this.udp_priority_updates.borrow_and_update().has_changed();
-        if priority_update {
-            this.update_udp_validator_pools();
-        }
-
         if let Some(event) = this.pending_events.pop_front() {
             return Poll::Ready(Some(event.into()));
         }
@@ -1366,18 +1346,18 @@ where
                 let mut sock = pin!(budgeted(this.udp_socket.recv(), &mut poll_quota));
 
                 match sock.poll_unpin(cx) {
-                    Poll::Ready(Ok(msg)) => {
+                    Poll::Ready(Some(Ok(msg))) => {
                         this.metrics
                             .gauge(GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED)
                             .inc();
                         msg
                     }
-                    Poll::Ready(Err(e)) => {
+                    Poll::Ready(Some(Err(e))) => {
                         this.metrics.gauge(GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS).inc();
                         trace!(error=?e, "socket recv error");
                         continue;
                     }
-                    Poll::Pending => break,
+                    Poll::Ready(None) | Poll::Pending => break,
                 }
             };
 
@@ -1508,7 +1488,7 @@ where
             loop {
                 let mut recv_fut = pin!(budgeted(socket.recv(), &mut poll_quota));
                 match recv_fut.poll_unpin(cx) {
-                    Poll::Ready(Ok(msg)) => {
+                    Poll::Ready(Some(Ok(msg))) => {
                         let from = msg
                             .sender
                             .expect("framed direct udp transport requires authenticated messages");
@@ -1541,16 +1521,16 @@ where
                             return Poll::Ready(Some(event.into()));
                         }
                     }
-                    Poll::Ready(Err(err)) => {
+                    Poll::Ready(Some(Err(err))) => {
                         trace!(error=?err, "direct udp socket recv error");
                         continue;
                     }
-                    Poll::Pending => break,
+                    Poll::Ready(None) | Poll::Pending => break,
                 }
             }
         }
 
-        // TODO(dshulyak): Prioritize TCP ingress in the dataplane once WireAuth TCP lands.
+        // TODO(dshulyak): Route TCP receives through PriorityQueue once WireAuth TCP lands.
         let mut poll_quota = TCP_POLL_QUOTA;
         loop {
             let mut recv_fut = pin!(budgeted(this.tcp_reader.recv(), &mut poll_quota));

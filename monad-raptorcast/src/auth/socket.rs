@@ -16,7 +16,7 @@
 use std::{
     collections::VecDeque,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Instant,
@@ -181,10 +181,6 @@ where
 
     pub fn segment_size(&self, mtu: u16) -> u16 {
         monad_dataplane::udp::segment_size_for_mtu(mtu) - AP::HEADER_SIZE
-    }
-
-    pub fn set_receive_priority_ips(&self, ips: std::collections::HashSet<IpAddr>) {
-        self.socket.set_receive_priority_ips(ips);
     }
 
     pub async fn recv(&mut self) -> Result<AuthRecvMsg<AP::PublicKey>, AP::Error> {
@@ -549,10 +545,6 @@ where
 
     pub fn has_any_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
         self.socket.has_any_session_by_public_key(public_key)
-    }
-
-    pub fn set_receive_priority_ips(&self, ips: std::collections::HashSet<IpAddr>) {
-        self.socket.set_receive_priority_ips(ips);
     }
 
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {

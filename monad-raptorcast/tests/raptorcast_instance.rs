@@ -734,14 +734,14 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
     .await
     .expect("authenticated warmups");
 
-    for id in 1000..1300 {
+    for id in 1000..1100 {
         send(&mut first, first_key.as_ref(), Epoch(0), id);
     }
     send(&mut second, second_key.as_ref(), Epoch(0), 2000);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut pinned_position = None;
     let mut ordinary = Vec::new();
-    for position in 0..301 {
+    for position in 0..101 {
         let MockEvent((sender, id)) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
             .await
             .unwrap()
@@ -754,9 +754,10 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
             ordinary.push(id);
         }
     }
-    // At most one already-selected 128-packet batch can precede the pin.
-    assert!(pinned_position.unwrap() <= 128);
-    assert_eq!(ordinary, (1000..1300).collect::<Vec<_>>());
+    // Intake is bounded by raw packets, including duplicate RaptorCast shards.
+    // Once read, the validator must overtake the remaining ordinary backlog.
+    assert!(pinned_position.unwrap() <= 64);
+    assert_eq!(ordinary, (1000..1100).collect::<Vec<_>>());
 
     // Retiring epoch 0 removes its validator's pin and pins the new validator.
     receiver.exec(vec![
@@ -767,14 +768,14 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
         },
         RouterCommand::UpdateCurrentRound(Epoch(2), Round(10)),
     ]);
-    for id in 3000..3300 {
+    for id in 3000..3100 {
         send(&mut second, second_key.as_ref(), Epoch(2), id);
     }
     send(&mut first, first_key.as_ref(), Epoch(2), 4000);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut pinned_position = None;
     let mut ordinary = Vec::new();
-    for position in 0..301 {
+    for position in 0..101 {
         let MockEvent((sender, id)) = tokio::time::timeout(Duration::from_secs(2), receiver.next())
             .await
             .unwrap()
@@ -787,8 +788,8 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
             ordinary.push(id);
         }
     }
-    assert!(pinned_position.unwrap() <= 128);
-    assert_eq!(ordinary, (3000..3300).collect::<Vec<_>>());
+    assert!(pinned_position.unwrap() <= 64);
+    assert_eq!(ordinary, (3000..3100).collect::<Vec<_>>());
 }
 
 // a fullnode must be able to forward an incoming FullNodesGroup

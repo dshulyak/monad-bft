@@ -38,7 +38,7 @@ use tokio::sync::watch;
 use super::AuthRecvMsg;
 
 pub(crate) const RECEIVE_BATCH_SIZE: usize = 128;
-const PROCESS_BATCH_SIZE: usize = 32;
+pub const PROCESS_BATCH_SIZE: usize = 64;
 const LOOKUP_CAPACITY: usize = 1000;
 
 /// Appends at most `limit` items per poll. Ready(None) marks EOF and may still
@@ -132,6 +132,7 @@ impl<P: PubKey> WatchPinned<P> {
             receiver.changed().await.ok()?;
             Some(((), receiver))
         })
+        .fuse()
         .boxed();
         Self { current, updates }
     }
@@ -181,6 +182,8 @@ impl<P: PubKey> Pinned for WatchPinned<P> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PriorityQueueConfig {
+    /// False uses global FIFO with the same intake, service and byte budgets.
+    pub prioritize: bool,
     pub pinned_bytes: usize,
     pub other_ip_bytes: usize,
     pub total_bytes: usize,
@@ -189,6 +192,7 @@ pub struct PriorityQueueConfig {
 impl Default for PriorityQueueConfig {
     fn default() -> Self {
         Self {
+            prioritize: true,
             pinned_bytes: 5 * 1024 * 1024,
             other_ip_bytes: 2 * 1024 * 1024,
             total_bytes: 1024 * 1024 * 1024,
@@ -301,13 +305,47 @@ impl<P: PubKey> Groups<P> {
         }
         None
     }
+
+    fn first_sequence(&self) -> Option<u64> {
+        self.queues
+            .values()
+            .filter_map(|queue| {
+                queue
+                    .values
+                    .first_key_value()
+                    .map(|(sequence, _)| *sequence)
+            })
+            .min()
+    }
+
+    fn pop_fifo(&mut self, pending: &HashMap<Sender<P>, Messages<P>>) -> Option<Message<P>> {
+        let (index, sequence) = self
+            .ready
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                (
+                    index,
+                    *self.queues[identity].values.first_key_value().unwrap().0,
+                )
+            })
+            .min_by_key(|(_, sequence)| *sequence)?;
+        if pending
+            .values()
+            .any(|queue| *queue.values.first_key_value().unwrap().0 < sequence)
+        {
+            return None;
+        }
+        self.ready.rotate_left(index);
+        self.pop(pending)
+    }
 }
 
 type LookupResult<P> = (Sender<P>, Option<QueueIdentity<P>>);
 
 /// Receives from one authenticated batch receiver (or an equivalent Stream).
 ///
-/// Alternates intake of up to 128 messages with service of up to 32 messages,
+/// Alternates intake of up to 128 messages with service of up to 64 messages,
 /// refilling early when empty. Intake uses the previous batch's accounted size
 /// as a headroom estimate: near the aggregate limit, service continues until
 /// another batch fits. Larger incoming batches can still overflow and are capped.
@@ -601,11 +639,23 @@ where
             cx.waker().wake_by_ref();
         }
         if this.reclassifying.is_empty() {
-            if let Some(message) = this
-                .priority
-                .pop(&this.pending)
-                .or_else(|| this.ordinary.pop(&this.pending))
-            {
+            let message = if this.config.prioritize {
+                this.priority
+                    .pop(&this.pending)
+                    .or_else(|| this.ordinary.pop(&this.pending))
+            } else {
+                match (
+                    this.priority.first_sequence(),
+                    this.ordinary.first_sequence(),
+                ) {
+                    (Some(priority), Some(ordinary)) if priority < ordinary => {
+                        this.priority.pop_fifo(&this.pending)
+                    }
+                    (Some(_), None) => this.priority.pop_fifo(&this.pending),
+                    _ => this.ordinary.pop_fifo(&this.pending),
+                }
+            };
+            if let Some(message) = message {
                 this.queued_bytes -= message.bytes();
                 this.processing_remaining = this.processing_remaining.saturating_sub(1);
                 return Poll::Ready(Some(Ok(message.value)));
@@ -700,22 +750,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_pin_updates_preserves_the_last_set() {
+        let (updates, pins) = watch::channel(HashSet::from([pin(2)]));
+        let source = futures::stream::iter(
+            [packet(1, 1, 11), packet(2, 2, 21), packet(2, 2, 22)].map(Ok::<_, Infallible>),
+        );
+        let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
+        drop(updates);
+        for expected in [21, 22, 11] {
+            assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], expected);
+        }
+        assert!(queue.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fifo_ignores_priority_and_round_robin_but_keeps_limits() {
+        let (_updates, pins) = watch::channel(HashSet::from([pin(2)]));
+        let source = futures::stream::iter(
+            [
+                packet(1, 1, 11),
+                packet(1, 1, 12),
+                packet(2, 2, 21),
+                packet(3, 3, 31),
+            ]
+            .map(Ok::<_, Infallible>),
+        );
+        let mut queue = PriorityQueue::new(
+            source,
+            WatchPinned::new(pins),
+            PriorityQueueConfig {
+                prioritize: false,
+                other_ip_bytes: unit_bytes(),
+                ..Default::default()
+            },
+        );
+        let mut values = Vec::new();
+        while let Some(message) = queue.recv().await {
+            values.push(message.unwrap().payload[0]);
+        }
+        assert_eq!(values, [11, 21, 31]);
+        assert_eq!(queue.dropped_bytes(), unit_bytes() as u64);
+        assert_eq!(queue.queued_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn receives_priority_traffic_while_ordinary_work_is_buffered() {
         let (_updates, pins) = watch::channel(HashSet::from([pin(2)]));
         let (incoming, source) = futures::channel::mpsc::unbounded();
         let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
-        for value in 1..=40 {
+        for value in 1..=80 {
             incoming
                 .unbounded_send(Ok::<_, Infallible>(packet(1, 1, value)))
                 .unwrap();
         }
         assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 1);
         incoming.unbounded_send(Ok(packet(2, 2, 99))).unwrap();
-        for value in 2..=32 {
+        for value in 2..=64 {
             assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], value);
         }
         assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 99);
-        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 33);
+        assert_eq!(queue.recv().await.unwrap().unwrap().payload[0], 65);
     }
 
     #[tokio::test]
@@ -735,16 +829,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        for _ in 0..32 {
+        for _ in 0..64 {
             queue.recv().await.unwrap().unwrap();
             assert_eq!(reads.load(Ordering::Relaxed), 128);
         }
-        assert_eq!(queue.queued_bytes(), 96 * unit_bytes());
-        for _ in 32..128 {
+        assert_eq!(queue.queued_bytes(), 64 * unit_bytes());
+        for _ in 64..128 {
             queue.recv().await.unwrap().unwrap();
             assert_eq!(reads.load(Ordering::Relaxed), 256);
         }
-        // Continue serving past 32 outputs when there is insufficient room for
+        // Continue serving past 64 outputs when there is insufficient room for
         // another intake batch. Resume before draining the queue completely.
         assert_eq!(queue.queued_bytes(), 128 * unit_bytes());
         queue.recv().await.unwrap().unwrap();
@@ -758,7 +852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refills_before_32_outputs_when_the_queue_is_empty() {
+    async fn refills_before_64_outputs_when_the_queue_is_empty() {
         let (_updates, pins) = watch::channel(HashSet::new());
         let (incoming, source) = futures::channel::mpsc::unbounded();
         let mut queue = PriorityQueue::new(source, WatchPinned::new(pins), Default::default());
@@ -782,6 +876,7 @@ mod tests {
         );
         let unit = unit_bytes();
         let config = PriorityQueueConfig {
+            prioritize: true,
             pinned_bytes: 5 * unit,
             other_ip_bytes: 2 * unit,
             total_bytes: 6 * unit,

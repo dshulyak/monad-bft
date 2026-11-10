@@ -44,9 +44,6 @@ use crate::{
     pacing::{PacingItem, PacingQueue, Scheduled},
 };
 
-mod ingress;
-mod wake;
-
 const DEFAULT_RINGBUF_COUNT: u32 = 2048;
 const DEFAULT_RINGBUF_SIZE: u32 = ETHERNET_SEGMENT_SIZE as u32;
 
@@ -96,7 +93,6 @@ pub(crate) struct UdpTaskConfig {
     pub buffer_size: Option<usize>,
     pub use_multishot: bool,
     pub workers: usize,
-    pub receive: crate::UdpReceiveConfig,
 }
 
 fn configure_socket(socket: &UdpSocket, buffer_size: Option<usize>) {
@@ -153,12 +149,7 @@ fn set_mtu_discovery(socket: &UdpSocket) {
 }
 
 pub(crate) fn spawn_tasks(
-    socket_configs: Vec<(
-        UdpSocketId,
-        SocketAddr,
-        mpsc::Sender<Vec<RecvUdpMsg>>,
-        tokio::sync::watch::Receiver<std::collections::HashSet<std::net::IpAddr>>,
-    )>,
+    socket_configs: Vec<(UdpSocketId, SocketAddr, mpsc::Sender<RecvUdpMsg>)>,
     udp_egress_rx: mpsc::Receiver<UdpMsg>,
     config: UdpTaskConfig,
     bound_addrs_tx: std_mpsc::SyncSender<Vec<(UdpSocketId, SocketAddr)>>,
@@ -170,14 +161,12 @@ pub(crate) fn spawn_tasks(
         buffer_size,
         use_multishot,
         workers: worker_count,
-        receive,
     } = config;
     assert!(worker_count != 0, "at least one UDP TX worker is required");
     let mut worker_sockets: Vec<Vec<_>> = (0..worker_count).map(|_| Vec::new()).collect();
     let mut bound_addrs = Vec::with_capacity(socket_configs.len());
 
-    for (socket_id, socket_addr, ingress_tx, priority_updates) in socket_configs {
-        let ingress_tx = ingress::start(ingress_tx, priority_updates, receive, metrics.clone());
+    for (socket_id, socket_addr, ingress_tx) in socket_configs {
         let socket = std::net::UdpSocket::bind(socket_addr).unwrap();
         for sockets in &mut worker_sockets {
             sockets.push((
@@ -247,26 +236,27 @@ pub(crate) fn spawn_tasks(
 
 async fn rx_single_socket(
     socket: UdpSocket,
-    udp_ingress_tx: ingress::Ingress,
+    udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     metrics: DataplaneMetrics,
 ) {
-    let mut received = 0;
     loop {
         let buf = BytesMut::with_capacity(ETHERNET_SEGMENT_SIZE.into());
 
         match socket.recv_from(buf).await {
             (Ok((len, src_addr)), buf) => {
+                let payload = buf.freeze();
                 metrics.udp_messages_received.inc();
                 metrics.udp_bytes_received.add(len as u64);
 
-                if !udp_ingress_tx.push_with(src_addr, len, len.max(1).try_into().unwrap(), || {
-                    buf.freeze()
-                }) {
+                let msg = RecvUdpMsg {
+                    src_addr,
+                    payload,
+                    stride: len.max(1).try_into().unwrap(),
+                };
+
+                if let Err(err) = udp_ingress_tx.send(msg).await {
+                    warn!(?src_addr, ?err, "error queueing up received UDP message");
                     break;
-                }
-                received += 1;
-                if received % ingress::RECEIVE_BATCH_SIZE == 0 {
-                    ingress::yield_receive().await;
                 }
             }
             (Err(err), _buf) => {
@@ -285,7 +275,7 @@ enum MultishotResult<R> {
 
 async fn run_multishot_stream(
     socket: &UdpSocket,
-    udp_ingress_tx: &ingress::Ingress,
+    udp_ingress_tx: &mpsc::Sender<RecvUdpMsg>,
     ring: UserRecvMsgRingBuf<Ipv4RecvMsgParser>,
     metrics: &DataplaneMetrics,
 ) -> MultishotResult<UserRecvMsgRingBuf<Ipv4RecvMsgParser>> {
@@ -293,26 +283,24 @@ async fn run_multishot_stream(
         .recvmsg_multishot(ring)
         .expect("failed to create multishot stream");
     let mut stream = multishot.stream();
-    let mut received = 0;
 
     while let Some(result) = stream.next().await {
         match result {
             Ok((src_addr, buf)) => {
-                let len = buf.len();
+                let payload = Bytes::copy_from_slice(&buf);
+                let len = payload.len();
                 metrics.udp_messages_received.inc();
                 metrics.udp_bytes_received.add(len as u64);
-                if !udp_ingress_tx.push_with(
-                    src_addr.into(),
-                    len,
-                    len.max(1).try_into().unwrap(),
-                    || Bytes::copy_from_slice(&buf),
-                ) {
+
+                let msg = RecvUdpMsg {
+                    src_addr: src_addr.into(),
+                    payload,
+                    stride: len.max(1).try_into().unwrap(),
+                };
+
+                if let Err(err) = udp_ingress_tx.send(msg).await {
+                    warn!(?err, "error queueing up received UDP message (multishot)");
                     return MultishotResult::ChannelClosed;
-                }
-                drop(buf);
-                received += 1;
-                if received % ingress::RECEIVE_BATCH_SIZE == 0 {
-                    ingress::yield_receive().await;
                 }
             }
             Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
@@ -338,7 +326,7 @@ async fn run_multishot_stream(
 
 async fn rx_multishot_socket(
     socket: UdpSocket,
-    udp_ingress_tx: ingress::Ingress,
+    udp_ingress_tx: mpsc::Sender<RecvUdpMsg>,
     group_id: u16,
     metrics: DataplaneMetrics,
 ) {
@@ -734,13 +722,6 @@ mod tests {
         let rx_addr = rx_socket.local_addr().unwrap();
         let tx_socket = UdpSocket::bind(addr).unwrap();
         let (ingress_tx, mut ingress_rx) = mpsc::channel(1);
-        let (_priority_ips, updates) = tokio::sync::watch::channel(Default::default());
-        let ingress_tx = ingress::start(
-            ingress_tx,
-            updates,
-            Default::default(),
-            DataplaneMetrics::new(),
-        );
 
         spawn(rx_multishot_socket(
             rx_socket,
@@ -757,7 +738,7 @@ mod tests {
             .await
             .expect("timed out waiting for UDP message")
             .expect("UDP ingress channel closed");
-        assert_eq!(msg[0].payload.as_ref(), payload);
+        assert_eq!(msg.payload.as_ref(), payload);
 
         drop(existing_ring);
     }
