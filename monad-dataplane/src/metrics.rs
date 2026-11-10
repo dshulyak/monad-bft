@@ -52,6 +52,13 @@ macro_rules! define_metrics {
 }
 
 define_metrics! {
+    udp_auth_packets_rejected => UDP_AUTH_PACKETS_REJECTED("monad.dataplane.udp.auth.packets_rejected", "Packets rejected by UDP authentication"),
+    udp_ingress_queued_bytes => UDP_INGRESS_QUEUED_BYTES("monad.dataplane.udp.ingress.current_queued_bytes", "Accounted UDP receive queue bytes"),
+    udp_ingress_packets_dropped => UDP_INGRESS_PACKETS_DROPPED("monad.dataplane.udp.ingress.total_packets_dropped", "Packets dropped from UDP receive queues"),
+    udp_ingress_bytes_dropped => UDP_INGRESS_BYTES_DROPPED("monad.dataplane.udp.ingress.total_bytes_dropped", "Accounted UDP receive bytes dropped"),
+    udp_ingress_batches_delivered => UDP_INGRESS_BATCHES_DELIVERED("monad.dataplane.udp.ingress.total_batches_delivered", "UDP receive batches delivered"),
+    udp_ingress_packets_delivered => UDP_INGRESS_PACKETS_DELIVERED("monad.dataplane.udp.ingress.total_packets_delivered", "UDP receive packets delivered"),
+    udp_ingress_priority_packets_delivered => UDP_INGRESS_PRIORITY_PACKETS_DELIVERED("monad.dataplane.udp.ingress.total_priority_packets_delivered", "Priority UDP receive packets delivered"),
     udp_messages_received => UDP_MESSAGES_RECEIVED("monad.dataplane.udp.total_messages_received", "Total UDP datagrams received from the network"),
     udp_bytes_received => UDP_BYTES_RECEIVED("monad.dataplane.udp.total_bytes_received", "Total UDP payload bytes received from the network"),
     udp_messages_sent => UDP_MESSAGES_SENT("monad.dataplane.udp.total_messages_sent", "Total UDP datagrams successfully sent to the network"),

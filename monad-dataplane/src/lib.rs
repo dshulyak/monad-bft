@@ -27,15 +27,20 @@ use std::{
 };
 
 use addrlist::Addrlist;
+use auth::{Identity, UdpCommand};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use monad_types::UdpPriority;
 use monoio::{spawn, time::Instant, IoUringDriver, RuntimeBuilder};
 use tcp::{TcpConfig, TcpControl, TcpRateLimit};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    watch,
+};
 use tracing::{debug, warn};
 
 pub(crate) mod addrlist;
+pub mod auth;
 pub(crate) mod ban_expiry;
 pub(crate) mod buffer_ext;
 mod metrics;
@@ -94,7 +99,7 @@ impl<I: PartialEq + Copy, H> SocketHandles<I, H> {
 }
 
 pub type TcpSocketHandles = SocketHandles<TcpSocketId, TcpSocketHandle>;
-pub type UdpSocketHandles = SocketHandles<UdpSocketId, UdpSocketHandle>;
+pub type UdpSocketHandles<I = ()> = SocketHandles<UdpSocketId, UdpSocketHandle<I>>;
 
 pub const DEFAULT_UDP_MAX_QUEUED_BYTES: usize = 100 * 1024 * 1024;
 pub const DEFAULT_UDP_TX_WORKERS: usize = 1;
@@ -134,6 +139,7 @@ pub struct DataplaneBuilder {
     /// 1_000 = 1 Gbps, 10_000 = 10 Gbps
     udp_up_bandwidth_mbps: u64,
     udp_pacing_config: UdpPacingConfig,
+    udp_receive_config: udp::ReceiveConfig,
     udp_buffer_size: Option<usize>,
     tcp_config: TcpConfig,
     ban_duration: Duration,
@@ -152,6 +158,7 @@ impl DataplaneBuilder {
         Self {
             udp_up_bandwidth_mbps: up_bandwidth_mbps,
             udp_pacing_config: UdpPacingConfig::for_global_bandwidth(up_bandwidth_mbps),
+            udp_receive_config: udp::ReceiveConfig::default(),
             udp_buffer_size: None,
             trusted_addresses: vec![],
             tcp_config: TcpConfig {
@@ -168,6 +175,12 @@ impl DataplaneBuilder {
             udp_multishot: true,
             udp_tx_workers: DEFAULT_UDP_TX_WORKERS,
         }
+    }
+
+    pub fn with_udp_receive_config(mut self, config: udp::ReceiveConfig) -> Self {
+        assert!(config.pinned_bytes > 0 && config.other_ip_bytes > 0 && config.total_bytes > 0);
+        self.udp_receive_config = config;
+        self
     }
 
     pub fn with_udp_buffer_size(mut self, buffer_size: usize) -> Self {
@@ -242,9 +255,19 @@ impl DataplaneBuilder {
     }
 
     pub fn build(self) -> Dataplane {
+        self.build_inner::<()>(false)
+    }
+
+    /// Creates identity-bearing UDP sockets. Inbound data is dropped until an
+    /// authentication backend is installed; raw writes are then rejected.
+    pub fn build_with_identity<I: Identity>(self) -> Dataplane<I> {
+        self.build_inner::<I>(true)
+    }
+    fn build_inner<I: Identity>(self, require_auth: bool) -> Dataplane<I> {
         let DataplaneBuilder {
             udp_up_bandwidth_mbps: up_bandwidth_mbps,
             udp_pacing_config,
+            udp_receive_config,
             udp_buffer_size,
             trusted_addresses: trusted,
             tcp_config,
@@ -267,9 +290,13 @@ impl DataplaneBuilder {
         let mut udp_socket_configs = Vec::new();
         let mut udp_pending_handles = Vec::new();
         for (id, addr) in udp_sockets {
-            let (ingress_tx, ingress_rx) = mpsc::channel(UDP_INGRESS_CHANNEL_SIZE);
-            udp_socket_configs.push((id, addr, ingress_tx));
-            udp_pending_handles.push((id, ingress_rx));
+            let (ingress_tx, ingress_rx) = mpsc::channel(1);
+            let (priority_tx, priority_rx) = watch::channel((
+                std::collections::HashSet::new(),
+                udp_receive_config.prioritize,
+            ));
+            udp_socket_configs.push((id, addr, ingress_tx, priority_rx));
+            udp_pending_handles.push((id, ingress_rx, priority_tx));
         }
 
         let mut tcp_socket_configs = Vec::new();
@@ -332,6 +359,8 @@ impl DataplaneBuilder {
                                     buffer_size: udp_buffer_size,
                                     use_multishot: udp_multishot,
                                     workers: udp_tx_workers,
+                                    require_auth,
+                                    receive: udp_receive_config,
                                 },
                                 udp_bound_addrs_tx,
                                 metrics,
@@ -359,7 +388,7 @@ impl DataplaneBuilder {
                 .collect();
 
         let mut udp_socket_handles = UdpSocketHandles::default();
-        for (id, ingress_rx) in udp_pending_handles {
+        for (id, ingress_rx, priority) in udp_pending_handles {
             let socket_addr = *udp_bound_addrs
                 .get(&id)
                 .unwrap_or_else(|| panic!("missing bound address for udp socket {:?}", id));
@@ -367,6 +396,8 @@ impl DataplaneBuilder {
                 reader: UdpSocketReader {
                     socket_id: id,
                     ingress_rx,
+                    batch: Vec::new().into_iter(),
+                    priority,
                 },
                 writer: UdpSocketWriter {
                     socket_id: id,
@@ -374,6 +405,7 @@ impl DataplaneBuilder {
                     egress_tx: udp_egress_tx.clone(),
                     msgs_dropped: Arc::new(AtomicUsize::new(0)),
                     metrics: metrics.clone(),
+                    max_pending_bytes: udp_pacing_config.max_queued_bytes,
                 },
             };
             udp_socket_handles.push(id, handle);
@@ -413,63 +445,82 @@ impl DataplaneBuilder {
     }
 }
 
-pub struct Dataplane {
+pub struct Dataplane<I: Identity = ()> {
     pub tcp_sockets: TcpSocketHandles,
-    pub udp_sockets: UdpSocketHandles,
+    pub udp_sockets: UdpSocketHandles<I>,
     pub control: DataplaneControl,
     ready: Arc<AtomicBool>,
     metrics: DataplaneMetrics,
 }
 
-pub struct UdpSocketReader {
+pub struct UdpSocketReader<I: Identity = ()> {
     socket_id: UdpSocketId,
-    ingress_rx: mpsc::Receiver<RecvUdpMsg>,
+    ingress_rx: mpsc::Receiver<Vec<RecvUdpMsg<I>>>,
+    batch: std::vec::IntoIter<RecvUdpMsg<I>>,
+    priority: watch::Sender<(std::collections::HashSet<I>, bool)>,
 }
 
-impl UdpSocketReader {
-    pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg>, limit: usize) -> usize {
-        assert!(limit != 0, "UDP receive batch limit must be non-zero");
-        let received = self.ingress_rx.recv_many(messages, limit).await;
-        assert!(
-            received != 0,
-            "socket {:?} ingress channel closed",
-            self.socket_id
-        );
-        received
-    }
-
-    pub async fn recv(&mut self) -> RecvUdpMsg {
-        self.ingress_rx
+impl<I: Identity> UdpSocketReader<I> {
+    async fn fill_batch(&mut self) {
+        if self.batch.len() != 0 {
+            return;
+        }
+        self.batch = self
+            .ingress_rx
             .recv()
             .await
             .unwrap_or_else(|| panic!("socket {:?} ingress channel closed", self.socket_id))
+            .into_iter();
+        assert!(self.batch.len() > 0);
+    }
+    pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg<I>>, limit: usize) -> usize {
+        assert!(limit > 0);
+        self.fill_batch().await;
+        let count = self.batch.len().min(limit);
+        messages.extend(self.batch.by_ref().take(count));
+        count
+    }
+    pub async fn recv(&mut self) -> RecvUdpMsg<I> {
+        self.fill_batch().await;
+        self.batch.next().unwrap()
     }
 }
 
 #[derive(Clone)]
-pub struct UdpSocketWriter {
+pub struct UdpSocketWriter<I: Identity = ()> {
+    max_pending_bytes: usize,
     socket_id: UdpSocketId,
     socket_addr: SocketAddr,
-    egress_tx: mpsc::Sender<UdpMsg>,
+    egress_tx: mpsc::Sender<UdpCommand<I>>,
     msgs_dropped: Arc<AtomicUsize>,
     metrics: DataplaneMetrics,
 }
 
-pub struct UdpSocketHandle {
-    reader: UdpSocketReader,
-    writer: UdpSocketWriter,
+pub struct UdpSocketHandle<I: Identity = ()> {
+    reader: UdpSocketReader<I>,
+    writer: UdpSocketWriter<I>,
 }
 
-impl UdpSocketHandle {
-    pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg>, limit: usize) -> usize {
+impl<I: Identity> UdpSocketHandle<I> {
+    pub(crate) fn command(&self, command: UdpCommand<I>) -> bool {
+        match self.writer.egress_tx.try_send(command) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.writer.metrics.udp_egress_messages_dropped.inc();
+                false
+            }
+            Err(TrySendError::Closed(_)) => panic!("UDP dataplane command channel closed"),
+        }
+    }
+    pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg<I>>, limit: usize) -> usize {
         self.reader.recv_many(messages, limit).await
     }
 
-    pub fn split(self) -> (UdpSocketReader, UdpSocketWriter) {
+    pub fn split(self) -> (UdpSocketReader<I>, UdpSocketWriter<I>) {
         (self.reader, self.writer)
     }
 
-    pub async fn recv(&mut self) -> RecvUdpMsg {
+    pub async fn recv(&mut self) -> RecvUdpMsg<I> {
         self.reader.recv().await
     }
 
@@ -493,7 +544,7 @@ impl UdpSocketHandle {
         self.writer.write_unicast_with_priority(msg, priority)
     }
 
-    pub fn writer(&self) -> &UdpSocketWriter {
+    pub fn writer(&self) -> &UdpSocketWriter<I> {
         &self.writer
     }
 
@@ -506,16 +557,17 @@ impl UdpSocketHandle {
     }
 }
 
-impl UdpSocketWriter {
+impl<I: Identity> UdpSocketWriter<I> {
     pub fn write(&self, dst: SocketAddr, payload: Bytes, stride: u16) {
         let msg_length = payload.len();
-        let result = self.egress_tx.try_send(UdpMsg {
+        let result = self.egress_tx.try_send(UdpCommand::Send(UdpMsg {
             socket_id: self.socket_id,
             dst,
             payload,
             stride,
             priority: UdpPriority::Regular,
-        });
+            encryption: None,
+        }));
 
         match result {
             Ok(()) => {}
@@ -545,7 +597,7 @@ impl UdpSocketWriter {
         let mut pending_count = msg.msg_count();
 
         for udp_msg in msg.into_iter_with_priority(self.socket_id, priority) {
-            match self.egress_tx.try_send(udp_msg) {
+            match self.egress_tx.try_send(UdpCommand::Send(udp_msg)) {
                 Ok(()) => pending_count -= 1,
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Closed(_)) => {
@@ -580,7 +632,7 @@ impl UdpSocketWriter {
         let mut pending_count = msg.msg_count();
 
         for udp_msg in msg.into_iter_with_priority(self.socket_id, priority) {
-            match self.egress_tx.try_send(udp_msg) {
+            match self.egress_tx.try_send(UdpCommand::Send(udp_msg)) {
                 Ok(()) => pending_count -= 1,
                 Err(TrySendError::Full(_)) => break,
                 Err(TrySendError::Closed(_)) => {
@@ -788,11 +840,11 @@ impl BroadcastMsg {
         self.targets.len()
     }
 
-    fn into_iter_with_priority(
+    fn into_iter_with_priority<I: Identity>(
         self,
         socket_id: UdpSocketId,
         priority: UdpPriority,
-    ) -> impl Iterator<Item = UdpMsg> {
+    ) -> impl Iterator<Item = UdpMsg<I>> {
         let Self {
             targets,
             payload,
@@ -804,6 +856,7 @@ impl BroadcastMsg {
             payload: payload.clone(),
             stride,
             priority,
+            encryption: None,
         })
     }
 }
@@ -819,11 +872,11 @@ impl UnicastMsg {
         self.msgs.len()
     }
 
-    fn into_iter_with_priority(
+    fn into_iter_with_priority<I: Identity>(
         self,
         socket_id: UdpSocketId,
         priority: UdpPriority,
-    ) -> impl Iterator<Item = UdpMsg> {
+    ) -> impl Iterator<Item = UdpMsg<I>> {
         let Self { msgs, stride } = self;
         msgs.into_iter().map(move |(dst, payload)| UdpMsg {
             socket_id,
@@ -831,15 +884,17 @@ impl UnicastMsg {
             payload,
             stride,
             priority,
+            encryption: None,
         })
     }
 }
 
 #[derive(Clone)]
-pub struct RecvUdpMsg {
+pub struct RecvUdpMsg<I: Identity = ()> {
     pub src_addr: SocketAddr,
     pub payload: Bytes,
     pub stride: u16,
+    pub sender: Option<I>,
 }
 
 #[derive(Clone)]
@@ -853,20 +908,20 @@ pub struct TcpMsg {
     pub completion: Option<oneshot::Sender<()>>,
 }
 
-pub(crate) struct UdpMsg {
+pub(crate) struct UdpMsg<I: Identity = ()> {
     pub(crate) socket_id: UdpSocketId,
     pub(crate) dst: SocketAddr,
     pub(crate) payload: Bytes,
     pub(crate) stride: u16,
     pub(crate) priority: UdpPriority,
+    pub(crate) encryption: Option<auth::Encryption<I>>,
 }
 
 const TCP_INGRESS_CHANNEL_SIZE: usize = 1024;
 const TCP_EGRESS_CHANNEL_SIZE: usize = 256;
-const UDP_INGRESS_CHANNEL_SIZE: usize = 12_800;
 const UDP_EGRESS_CHANNEL_SIZE: usize = 12_800;
 
-impl Dataplane {
+impl<I: Identity> Dataplane<I> {
     /// Returns the live dataplane metrics for Prometheus or OTel registration.
     pub fn metrics(&self) -> &monad_executor::ExecutorMetrics {
         self.metrics.executor_metrics()

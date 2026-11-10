@@ -14,24 +14,19 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
-    collections::VecDeque,
     future::Future,
     net::SocketAddr,
-    pin::Pin,
     task::{Context, Poll},
-    time::Instant,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use monad_crypto::certificate_signature::PubKey;
-use monad_dataplane::{RecvUdpMsg, UdpSocketHandle, UnicastMsg};
+use monad_dataplane::{RecvUdpMsg, UdpSocketHandle};
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain, MetricDef};
 use monad_peer_score::IdentityScore;
 use monad_types::{NodeId, UdpPriority};
 use thiserror::Error;
-use tokio::time::Sleep;
-use tracing::{debug, trace, warn};
-use zerocopy::IntoBytes;
+use tracing::{debug, warn};
 
 use super::{
     framing::{AuthPacketFramer, LeanUdpFramer},
@@ -47,7 +42,6 @@ use super::{
 };
 
 // Allow two retries so a cookie-challenged handshake can resend its initiation.
-pub(crate) const AUTH_SESSION_CONNECT_RETRY_ATTEMPTS: u64 = 2;
 
 #[derive(Clone)]
 pub struct AuthRecvMsg<P: PubKey> {
@@ -57,38 +51,16 @@ pub struct AuthRecvMsg<P: PubKey> {
     pub sender: Option<NodeId<P>>,
 }
 
-#[derive(Clone, Copy)]
-enum SendTarget<'a, P> {
-    Address(SocketAddr),
-    Peer { addr: SocketAddr, public_key: &'a P },
-}
-
-#[derive(Clone, Copy)]
-enum WriteRoute<'a, P> {
-    Send(SendTarget<'a, P>),
-    Buffer(&'a P),
-}
-
-pub struct AuthenticatedSocketHandle<AP>
-where
-    AP: AuthenticationProtocol,
-{
-    socket: UdpSocketHandle,
-    auth_protocol: AP,
-    auth_timer: Option<(Pin<Box<Sleep>>, Instant)>,
+pub struct AuthenticatedSocketHandle<AP: AuthenticationProtocol<PublicKey: PubKey>> {
+    socket: monad_dataplane::auth::AuthenticatedUdpSocket<AP>,
     metrics: ExecutorMetrics,
     bytes_written_metric: &'static MetricDef,
     bytes_read_metric: &'static MetricDef,
-    receive_buffer: Vec<RecvUdpMsg>,
-    received: VecDeque<Result<AuthRecvMsg<AP::PublicKey>, AP::Error>>,
+    receive_buffer: Vec<RecvUdpMsg<AP::PublicKey>>,
 }
-
-// The protocol is accessed through &mut AP and is never structurally pinned.
-impl<AP: AuthenticationProtocol> Unpin for AuthenticatedSocketHandle<AP> {}
-
-impl<AP: AuthenticationProtocol> RecvMany for AuthenticatedSocketHandle<AP> {
+impl<AP: AuthenticationProtocol<PublicKey: PubKey>> Unpin for AuthenticatedSocketHandle<AP> {}
+impl<AP: AuthenticationProtocol<PublicKey: PubKey>> RecvMany for AuthenticatedSocketHandle<AP> {
     type Item = Result<AuthRecvMsg<AP::PublicKey>, AP::Error>;
-
     fn poll_recv_many(
         &mut self,
         cx: &mut Context<'_>,
@@ -100,297 +72,154 @@ impl<AP: AuthenticationProtocol> RecvMany for AuthenticatedSocketHandle<AP> {
             .map(|_| Some(()))
     }
 }
-
-impl<AP> AuthenticatedSocketHandle<AP>
-where
-    AP: AuthenticationProtocol,
-{
-    pub fn new(socket: UdpSocketHandle, auth_protocol: AP) -> Self {
+impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP> {
+    pub fn new(socket: UdpSocketHandle<AP::PublicKey>, protocol: AP) -> Self {
         Self {
-            socket,
-            auth_protocol,
-            auth_timer: None,
+            socket: monad_dataplane::auth::AuthenticatedUdpSocket::new(socket, protocol),
             metrics: init_socket_executor_metrics(),
             bytes_written_metric: GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
             bytes_read_metric: GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ,
             receive_buffer: Vec::with_capacity(RECEIVE_BATCH_SIZE),
-            received: VecDeque::with_capacity(RECEIVE_BATCH_SIZE),
         }
     }
-
     fn with_direct_metrics(mut self) -> Self {
         self.metrics = init_direct_udp_executor_metrics();
         self.bytes_written_metric = GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_WRITTEN;
         self.bytes_read_metric = GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_READ;
         self
     }
-
-    /// An address targets that socket; `None` uses an existing session for the key.
-    pub fn write(
-        &mut self,
-        public_key: &AP::PublicKey,
-        auth_addr: Option<SocketAddr>,
-        mut msg: Bytes,
-        stride: u16,
-        priority: UdpPriority,
-    ) {
-        let route = match auth_addr {
-            Some(auth_addr) if self.is_connected_socket_and_public_key(&auth_addr, public_key) => {
-                WriteRoute::Send(SendTarget::Address(auth_addr))
-            }
-            Some(auth_addr) => {
-                if !self
-                    .auth_protocol
-                    .has_initiator_session_by_socket_and_public_key(&auth_addr, public_key)
-                {
-                    if let Err(error) =
-                        self.connect(public_key, auth_addr, AUTH_SESSION_CONNECT_RETRY_ATTEMPTS)
-                    {
-                        warn!(
-                            ?public_key,
-                            ?auth_addr,
-                            ?error,
-                            "failed to initiate authenticated UDP session"
-                        );
-                        return;
-                    }
-                    self.flush();
-                }
-                WriteRoute::Buffer(public_key)
-            }
-            None => {
-                let Some(addr) = self.auth_protocol.get_socket_by_public_key(public_key) else {
-                    warn!(
-                        ?public_key,
-                        "failed to find socket for connected public key"
-                    );
-                    return;
-                };
-                WriteRoute::Send(SendTarget::Peer { addr, public_key })
-            }
-        };
-
-        let stride = usize::from(stride);
-        while !msg.is_empty() {
-            let piece = msg.split_to(msg.len().min(stride));
-            if self.write_piece(route, piece, priority).is_err() {
-                return;
-            }
-        }
-    }
-
     pub fn segment_size(&self, mtu: u16) -> u16 {
         monad_dataplane::udp::segment_size_for_mtu(mtu) - AP::HEADER_SIZE
     }
-
+    pub fn write(
+        &mut self,
+        public_key: &AP::PublicKey,
+        addr: Option<SocketAddr>,
+        msg: Bytes,
+        stride: u16,
+        priority: UdpPriority,
+    ) {
+        let _ = self.try_write(public_key, addr, msg, stride, priority);
+    }
+    fn try_write(
+        &mut self,
+        public_key: &AP::PublicKey,
+        addr: Option<SocketAddr>,
+        msg: Bytes,
+        stride: u16,
+        priority: UdpPriority,
+    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
+        let bytes = msg.len();
+        self.socket
+            .write(*public_key, addr, msg, stride, priority)?;
+        self.metrics
+            .gauge(self.bytes_written_metric)
+            .add(bytes as u64);
+        Ok(())
+    }
+    pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
+        self.socket.set_priority_identities(identities);
+    }
+    pub fn set_prioritize(&self, enabled: bool) {
+        self.socket.set_prioritize(enabled);
+    }
+    fn received(
+        &mut self,
+        message: RecvUdpMsg<AP::PublicKey>,
+    ) -> Option<AuthRecvMsg<AP::PublicKey>> {
+        // Never expose raw packets queued before authentication was installed.
+        if AP::HEADER_SIZE > 0 && message.sender.is_none() {
+            return None;
+        }
+        self.metrics
+            .gauge(self.bytes_read_metric)
+            .add(message.payload.len() as u64);
+        Some(AuthRecvMsg {
+            src_addr: message.src_addr,
+            payload: message.payload,
+            stride: message.stride,
+            sender: message.sender.map(NodeId::new),
+        })
+    }
     pub async fn recv(&mut self) -> Result<AuthRecvMsg<AP::PublicKey>, AP::Error> {
         loop {
-            if let Some(message) = self.received.pop_front() {
-                return message;
+            let message = self.socket.recv().await;
+            if let Some(message) = self.received(message) {
+                return Ok(message);
             }
-            self.fill_received(RECEIVE_BATCH_SIZE).await;
         }
     }
-
-    /// Reads a dataplane batch, authenticates it, and appends its application
-    /// messages/errors. Control-only batches can append zero messages. Buffered
-    /// single-receive results are returned before reading the dataplane again.
-    /// `limit` must be between 1 and 128, inclusive.
-    /// Cancellation safe: no await occurs between dequeue and authentication.
     pub async fn recv_many(
         &mut self,
         messages: &mut Vec<Result<AuthRecvMsg<AP::PublicKey>, AP::Error>>,
         limit: usize,
     ) {
         assert!(limit > 0 && limit <= RECEIVE_BATCH_SIZE);
-        if self.received.is_empty() {
-            self.fill_received(limit).await;
-        }
-        messages.extend(self.received.drain(..self.received.len().min(limit)));
-    }
-
-    async fn fill_received(&mut self, limit: usize) {
-        loop {
-            let timer = AuthenticatedTimerFuture {
-                auth_protocol: &mut self.auth_protocol,
-                auth_timer: &mut self.auth_timer,
-            };
-
-            tokio::select! {
-                () = timer => {
-                    self.flush();
-                    continue;
-                }
-                _ = self.socket.recv_many(&mut self.receive_buffer, limit) => break,
+        self.socket.recv_many(&mut self.receive_buffer, limit).await;
+        let mut batch = std::mem::take(&mut self.receive_buffer);
+        for message in batch.drain(..) {
+            if let Some(message) = self.received(message) {
+                messages.push(Ok(message));
             }
         }
-        let mut flush = false;
-        for message in self.receive_buffer.drain(..) {
-            let mut packet_buf = message.payload.to_vec();
-            match self
-                .auth_protocol
-                .dispatch(&mut packet_buf, message.src_addr)
-            {
-                Ok(Some((plaintext, auth_public_key))) => {
-                    self.metrics
-                        .gauge(self.bytes_read_metric)
-                        .add(plaintext.len() as u64);
-                    self.received.push_back(Ok(AuthRecvMsg {
-                        src_addr: message.src_addr,
-                        payload: plaintext,
-                        stride: message.stride,
-                        sender: auth_public_key.map(NodeId::new),
-                    }));
-                }
-                Ok(None) => {
-                    flush = true;
-                }
-                Err(e) => {
-                    debug!(addr=?message.src_addr, error=?e, "failed to decrypt message");
-                    self.received.push_back(Err(e));
-                }
-            }
-        }
-        if flush {
-            self.flush();
-        }
+        self.receive_buffer = batch;
     }
-
+    pub fn is_connected_public_key(&self, public_key: &AP::PublicKey) -> bool {
+        self.socket.is_connected_public_key(public_key)
+    }
     pub fn is_connected_socket_and_public_key(
         &self,
-        socket_addr: &SocketAddr,
+        addr: &SocketAddr,
         public_key: &AP::PublicKey,
     ) -> bool {
-        self.auth_protocol
-            .is_connected_socket_and_public_key(socket_addr, public_key)
+        self.socket
+            .is_connected_socket_and_public_key(addr, public_key)
     }
-
     pub fn get_socket_by_public_key(&self, public_key: &AP::PublicKey) -> Option<SocketAddr> {
-        self.auth_protocol.get_socket_by_public_key(public_key)
+        self.socket.get_socket_by_public_key(public_key)
     }
-
     pub fn has_any_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
-        self.auth_protocol.has_any_session_by_public_key(public_key)
+        self.socket.has_any_session_by_public_key(public_key)
     }
-
+    pub fn has_initiator_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
+        self.socket.has_initiator_session_by_public_key(public_key)
+    }
     pub fn connect(
         &mut self,
-        remote_public_key: &AP::PublicKey,
-        remote_addr: SocketAddr,
-        retry_attempts: u64,
-    ) -> Result<(), AP::Error> {
-        self.auth_protocol
-            .connect(remote_public_key, remote_addr, retry_attempts)
+        public_key: &AP::PublicKey,
+        addr: SocketAddr,
+        attempts: u64,
+    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
+        self.socket.connect(*public_key, addr, attempts)
     }
-
-    pub fn flush(&mut self) {
-        while let Some((addr, packet)) = self.auth_protocol.next_packet() {
-            self.enqueue_packet(addr, packet, UdpPriority::High);
-        }
-    }
-
-    pub fn timer(&mut self) -> AuthenticatedTimerFuture<'_, AP> {
-        AuthenticatedTimerFuture {
-            auth_protocol: &mut self.auth_protocol,
-            auth_timer: &mut self.auth_timer,
-        }
-    }
-
+    /// Protocol control and timers are serviced independently by the dataplane.
+    pub fn flush(&mut self) {}
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
-        self.auth_protocol.metrics().push(&self.metrics)
-    }
-
-    #[allow(clippy::result_unit_err)]
-    fn write_piece(
-        &mut self,
-        route: WriteRoute<'_, AP::PublicKey>,
-        plaintext: Bytes,
-        priority: UdpPriority,
-    ) -> Result<(), ()> {
-        match route {
-            WriteRoute::Send(target) => self.write_encrypted_piece(target, plaintext, priority),
-            WriteRoute::Buffer(public_key) => {
-                let len = plaintext.len();
-                self.auth_protocol
-                    .buffer_message(public_key, plaintext)
-                    .map_err(|err| warn!(?public_key, error=?err, "failed to buffer message"))?;
-                self.metrics
-                    .gauge(self.bytes_written_metric)
-                    .add(len as u64);
-                Ok(())
-            }
-        }
-    }
-
-    #[allow(clippy::result_unit_err)]
-    fn write_encrypted_piece(
-        &mut self,
-        target: SendTarget<'_, AP::PublicKey>,
-        plaintext: Bytes,
-        priority: UdpPriority,
-    ) -> Result<(), ()> {
-        let plaintext_len = plaintext.len();
-        let header_size = AP::HEADER_SIZE as usize;
-        let mut packet = BytesMut::with_capacity(header_size + plaintext.len());
-        packet.resize(header_size, 0);
-        packet.extend_from_slice(&plaintext);
-        let (addr, header) = match target {
-            SendTarget::Address(addr) => (
-                addr,
-                self.auth_protocol
-                    .encrypt_by_socket(&addr, &mut packet[header_size..]),
-            ),
-            SendTarget::Peer { addr, public_key } => (
-                addr,
-                self.auth_protocol
-                    .encrypt_by_public_key(public_key, &mut packet[header_size..]),
-            ),
-        };
-        let header = header.map_err(|err| {
-            warn!(?addr, error=?err, "failed to encrypt message");
-        })?;
-        packet[..header_size].copy_from_slice(header.as_bytes());
-        self.enqueue_packet(addr, packet.freeze(), priority);
-        self.metrics
-            .gauge(self.bytes_written_metric)
-            .add(plaintext_len as u64);
-        Ok(())
-    }
-
-    fn enqueue_packet(&self, addr: SocketAddr, packet: Bytes, priority: UdpPriority) {
-        debug_assert!(!packet.is_empty());
-        debug_assert!(packet.len() <= u16::MAX as usize);
-        let stride = packet.len() as u16;
-        self.socket.write_unicast_with_priority(
-            UnicastMsg {
-                msgs: vec![(addr, packet)],
-                stride,
-            },
-            priority,
-        );
+        self.socket.metrics().push(&self.metrics)
     }
 }
 
 pub struct FramedAuthenticatedSocketHandle<AP, F>
 where
-    AP: AuthenticationProtocol,
+    AP: AuthenticationProtocol<PublicKey: PubKey>,
     F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
 {
     socket: AuthenticatedSocketHandle<AP>,
     framer: F,
+    receive_buffer: Vec<Result<AuthRecvMsg<AP::PublicKey>, AP::Error>>,
 }
 
 // Neither the socket nor the framer is structurally pinned by this handle.
 impl<AP, F> Unpin for FramedAuthenticatedSocketHandle<AP, F>
 where
-    AP: AuthenticationProtocol,
+    AP: AuthenticationProtocol<PublicKey: PubKey>,
     F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
 {
 }
 
 impl<AP, F> RecvMany for FramedAuthenticatedSocketHandle<AP, F>
 where
-    AP: AuthenticationProtocol,
+    AP: AuthenticationProtocol<PublicKey: PubKey>,
     F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
 {
     type Item = Result<AuthRecvMsg<AP::PublicKey>, FramedRecvError<AP::Error>>;
@@ -402,11 +231,10 @@ where
         limit: usize,
     ) -> Poll<Option<()>> {
         assert!(limit > 0 && limit <= RECEIVE_BATCH_SIZE);
-        if self.socket.received.is_empty() {
-            std::task::ready!(std::pin::pin!(self.socket.fill_received(limit)).poll(cx));
-        }
-        let received = self.socket.received.len().min(limit);
-        for message in self.socket.received.drain(..received) {
+        std::task::ready!(self
+            .socket
+            .poll_recv_many(cx, &mut self.receive_buffer, limit));
+        for message in self.receive_buffer.drain(..) {
             match message {
                 Err(error) => messages.push(Err(FramedRecvError::Auth(error))),
                 Ok(msg) => {
@@ -443,13 +271,14 @@ pub enum FramedRecvError<E: std::fmt::Debug> {
 
 impl<AP, F> FramedAuthenticatedSocketHandle<AP, F>
 where
-    AP: AuthenticationProtocol,
+    AP: AuthenticationProtocol<PublicKey: PubKey>,
     F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
 {
     pub fn new(socket: AuthenticatedSocketHandle<AP>, framer: F) -> Self {
         Self {
             socket: socket.with_direct_metrics(),
             framer,
+            receive_buffer: Vec::with_capacity(RECEIVE_BATCH_SIZE),
         }
     }
 
@@ -478,7 +307,8 @@ where
         }
     }
 
-    /// Returns `Err(())` if the message was not written or buffered.
+    /// Queues framed plaintext for asynchronous authenticated delivery.
+    /// Returns `Err(())` if framing or command-queue admission fails.
     #[allow(clippy::result_unit_err)]
     pub fn write_buffered(
         &mut self,
@@ -494,36 +324,14 @@ where
             }
         };
 
-        let connected = self
-            .socket
-            .auth_protocol
-            .is_connected_public_key(public_key);
-        if !connected
-            && !self
-                .socket
-                .auth_protocol
-                .has_initiator_session_by_public_key(public_key)
-        {
-            return Err(());
-        }
-        let route = if connected {
-            let Some(addr) = self.socket.get_socket_by_public_key(public_key) else {
-                warn!(
-                    ?public_key,
-                    "failed to find socket for connected public key"
-                );
-                return Err(());
-            };
-            WriteRoute::Send(SendTarget::Peer { addr, public_key })
-        } else {
-            WriteRoute::Buffer(public_key)
-        };
-
         for packet in packets {
             if packet.is_empty() {
                 continue;
             }
-            self.socket.write_piece(route, packet, priority)?;
+            let stride = packet.len().try_into().map_err(|_| ())?;
+            self.socket
+                .try_write(public_key, None, packet, stride, priority)
+                .map_err(|_| ())?;
         }
 
         Ok(())
@@ -534,13 +342,16 @@ where
         remote_public_key: &AP::PublicKey,
         remote_addr: SocketAddr,
         retry_attempts: u64,
-    ) -> Result<(), AP::Error> {
+    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
         self.socket
             .connect(remote_public_key, remote_addr, retry_attempts)
     }
 
     pub fn flush(&mut self) {
         self.socket.flush();
+    }
+    pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
+        self.socket.set_priority_identities(identities);
     }
 
     pub fn has_any_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
@@ -554,7 +365,7 @@ where
 
 impl<AP, S> FramedAuthenticatedSocketHandle<AP, LeanUdpFramer<NodeId<AP::PublicKey>, S>>
 where
-    AP: AuthenticationProtocol,
+    AP: AuthenticationProtocol<PublicKey: PubKey>,
     S: IdentityScore<Identity = NodeId<AP::PublicKey>>,
 {
     pub fn set_dedicated_identities(
@@ -565,57 +376,6 @@ where
     }
 }
 
-pub struct AuthenticatedTimerFuture<'a, AP: AuthenticationProtocol> {
-    auth_protocol: &'a mut AP,
-    auth_timer: &'a mut Option<(Pin<Box<Sleep>>, Instant)>,
-}
-
-impl<AP: AuthenticationProtocol> Future for AuthenticatedTimerFuture<'_, AP> {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        trace!("polling wireauth timer");
-
-        loop {
-            let Some(deadline) = self.auth_protocol.next_deadline() else {
-                return Poll::Pending;
-            };
-
-            let now = Instant::now();
-            if deadline <= now {
-                if let Some(d) = now.checked_duration_since(deadline) {
-                    if d > std::time::Duration::from_millis(100) {
-                        warn!(delta_ms = d.as_millis(), "slow polling wireauth timer");
-                    }
-                }
-
-                self.auth_protocol.tick();
-                return Poll::Ready(());
-            }
-
-            // refresh the socket timer when wireauth's next deadline moves earlier.
-            let should_update_timer = self
-                .auth_timer
-                .as_ref()
-                .is_none_or(|(_, stored_deadline)| deadline < *stored_deadline);
-            if should_update_timer {
-                *self.auth_timer = Some((
-                    Box::pin(tokio::time::sleep_until(deadline.into())),
-                    deadline,
-                ));
-            }
-
-            match self.auth_timer.as_mut() {
-                Some((sleep, _)) => match sleep.as_mut().poll(cx) {
-                    Poll::Ready(()) => *self.auth_timer = None,
-                    Poll::Pending => return Poll::Pending,
-                },
-                None => return Poll::Pending,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -623,7 +383,6 @@ mod tests {
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         pin::pin,
         sync::Arc,
-        task::Poll,
         time::Duration,
     };
 
@@ -693,7 +452,7 @@ mod tests {
             let mut dp = DataplaneBuilder::new(1000)
                 .with_tcp_sockets([(monad_dataplane::TcpSocketId::Raptorcast, bind_addr)])
                 .with_udp_sockets(udp_sockets)
-                .build();
+                .build_with_identity::<monad_secp::PubKey>();
 
             let tcp_socket = dp
                 .tcp_sockets
@@ -984,12 +743,71 @@ mod tests {
         let mut bob = PeerNode::new(2);
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sender.send_to(b"plaintext", bob.auth_addr).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(3), bob.socket.recv())
-                .await
-                .unwrap()
-                .is_err()
+        let rejected = bob
+            .dataplane_metrics
+            .metric_handles()
+            .into_iter()
+            .find(|(name, _, _)| *name == "monad.dataplane.udp.auth.packets_rejected")
+            .unwrap()
+            .1;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rejected.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dataplane rejects plaintext without application polling");
+        assert!(poll!(pin!(bob.socket.recv())).is_pending());
+        // Handshake and decryption must also progress with neither application
+        // polling a receive future. The ciphertext never reaches this thread.
+        let mut alice = PeerNode::new(1);
+        alice.socket.write(
+            &bob.public_key,
+            Some(bob.auth_addr),
+            Bytes::from_static(b"authenticated"),
+            13,
+            UdpPriority::Regular,
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let decrypts = bob
+                    .socket
+                    .metrics()
+                    .into_inner()
+                    .into_iter()
+                    .find(|(name, _, _)| {
+                        *name == crate::auth::metrics::UDP_METRICS.api_decrypt.name
+                    })
+                    .unwrap()
+                    .1;
+                if decrypts > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dataplane decrypts before the receiver is polled");
+        let buffered = alice
+            .socket
+            .metrics()
+            .into_inner()
+            .into_iter()
+            .find(|(name, _, _)| {
+                *name
+                    == crate::auth::metrics::UDP_METRICS
+                        .initiator_messages_sent_from_buffer
+                        .name
+            })
+            .unwrap()
+            .1;
+        assert_eq!(
+            buffered, 0,
+            "plaintext must wait outside WireAuth's encrypt-on-handshake buffer"
+        );
+        let message = bob.socket.recv().await.unwrap();
+        assert_eq!(message.payload.as_ref(), b"authenticated");
+        assert_eq!(message.sender.unwrap().pubkey(), alice.public_key);
     }
 
     #[tokio::test]
@@ -1047,7 +865,7 @@ mod tests {
                 monad_dataplane::UdpSocketId::AuthenticatedRaptorcast,
                 bind_addr,
             )])
-            .build();
+            .build_with_identity::<monad_secp::PubKey>();
 
         let authenticated_socket = dp
             .udp_sockets
@@ -1069,21 +887,36 @@ mod tests {
         );
         let mut handle = AuthenticatedSocketHandle::new(authenticated_socket, auth_protocol);
 
-        assert_eq!(poll!(pin!(handle.timer())), Poll::Pending);
-
-        tokio::time::sleep(Duration::from_millis(11)).await;
-
-        assert_eq!(poll!(pin!(handle.timer())), Poll::Ready(()));
-        assert_eq!(poll!(pin!(handle.timer())), Poll::Pending);
-
-        // this ensures that timer is updated with a shorter deadline
+        let ticks = |handle: &AuthenticatedSocketHandle<WireAuthProtocol>| {
+            handle
+                .metrics()
+                .into_inner()
+                .into_iter()
+                .find(|(name, _, _)| *name == crate::auth::metrics::UDP_METRICS.api_tick.name)
+                .unwrap()
+                .1
+        };
+        let initial = ticks(&handle);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ticks(&handle) == initial {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dataplane must tick with no application receives");
         let remote_keypair = keypair(2);
-        let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 19004));
+        let remote_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19004));
+        let initial = ticks(&handle);
         handle
             .connect(&remote_keypair.pubkey(), remote_addr, 1)
-            .expect("connect failed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert_eq!(poll!(pin!(handle.timer())), Poll::Ready(()));
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ticks(&handle) == initial {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dataplane must service new handshake deadline without receive polling");
     }
 
     #[tokio::test]
@@ -1097,7 +930,7 @@ mod tests {
                 monad_dataplane::UdpSocketId::AuthenticatedRaptorcast,
                 bind_addr,
             )])
-            .build();
+            .build_with_identity::<monad_secp::PubKey>();
         let recv_socket = recv_dp
             .udp_sockets
             .take(monad_dataplane::UdpSocketId::AuthenticatedRaptorcast)

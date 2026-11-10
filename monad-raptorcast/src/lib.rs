@@ -64,10 +64,7 @@ use monad_validator::{
     validator_set::{ValidatorSet, ValidatorSetType as _},
 };
 use packet::regular;
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    watch,
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, debug_span, error, trace, warn};
 use util::{
     budgeted, AutoRebroadcast, BroadcastGroup, BroadcastGroupError, BuildTarget, Collector,
@@ -110,16 +107,9 @@ const TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES: usize = 512 * 1024;
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
 
 pub(crate) type OwnedMessageBuilder<ST> = packet::MessageBuilder<'static, ST>;
-type QueuedUdpSocket<AP> = auth::PriorityQueue<
-    auth::AuthenticatedSocketHandle<AP>,
-    auth::WatchPinned<<AP as auth::AuthenticationProtocol>::PublicKey>,
->;
-type DirectUdpTransport<ST, AP, DS> = auth::PriorityQueue<
-    auth::FramedAuthenticatedSocketHandle<
-        AP,
-        auth::LeanUdpFramer<NodeId<CertificateSignaturePubKey<ST>>, DS>,
-    >,
-    auth::WatchPinned<CertificateSignaturePubKey<ST>>,
+type DirectUdpTransport<ST, AP, DS> = auth::FramedAuthenticatedSocketHandle<
+    AP,
+    auth::LeanUdpFramer<NodeId<CertificateSignaturePubKey<ST>>, DS>,
 >;
 
 pub struct RaptorCast<ST, M, OM, SE, PD, AP, DS>
@@ -158,9 +148,8 @@ where
 
     tcp_reader: TcpSocketReader,
     tcp_writer: TcpSocketWriter,
-    udp_socket: QueuedUdpSocket<AP>,
+    udp_socket: auth::AuthenticatedSocketHandle<AP>,
     direct_udp_transport: Option<DirectUdpTransport<ST, AP, DS>>,
-    udp_pins: watch::Sender<HashSet<auth::QueueIdentity<CertificateSignaturePubKey<ST>>>>,
     dataplane_control: DataplaneControl,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
@@ -201,8 +190,8 @@ where
         config: config::RaptorCastConfig<ST>,
         secondary_mode: SecondaryRaptorCastModeConfig,
         tcp_socket: TcpSocketHandle,
-        authenticated: (UdpSocketHandle, AP),
-        direct_udp: Option<(UdpSocketHandle, AP, DS)>,
+        authenticated: (UdpSocketHandle<AP::PublicKey>, AP),
+        direct_udp: Option<(UdpSocketHandle<AP::PublicKey>, AP, DS)>,
         control: DataplaneControl,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
@@ -253,12 +242,7 @@ where
             ?is_dynamic_fullnode, ?self_id, ?config.mtu, "RaptorCast::new",
         );
 
-        let (udp_pins, pin_updates) = watch::channel(HashSet::new());
-        let udp_socket = auth::PriorityQueue::new(
-            auth::AuthenticatedSocketHandle::new(authenticated.0, authenticated.1),
-            auth::WatchPinned::new(pin_updates.clone()),
-            Default::default(),
-        );
+        let udp_socket = auth::AuthenticatedSocketHandle::new(authenticated.0, authenticated.1);
         let direct_udp_transport = direct_udp.map(|(socket, protocol, direct_udp_peer_score)| {
             let max_fragment_payload =
                 usize::from(segment_size_for_mtu(config.mtu).saturating_sub(AP::HEADER_SIZE));
@@ -268,14 +252,9 @@ where
                 ..Default::default()
             };
             let socket = auth::AuthenticatedSocketHandle::new(socket, protocol);
-            let socket = auth::FramedAuthenticatedSocketHandle::new(
+            auth::FramedAuthenticatedSocketHandle::new(
                 socket,
                 auth::LeanUdpFramer::new(direct_udp_peer_score, leanudp_config),
-            );
-            auth::PriorityQueue::new(
-                socket,
-                auth::WatchPinned::new(pin_updates),
-                Default::default(),
             )
         });
 
@@ -331,7 +310,6 @@ where
             tcp_writer,
             udp_socket,
             direct_udp_transport,
-            udp_pins,
             dataplane_control: control,
             pending_events: Default::default(),
             channel_to_secondary: None,
@@ -390,19 +368,16 @@ where
     }
 
     fn update_udp_validator_pools(&mut self) {
-        let pinned = self
+        let pinned: HashSet<_> = self
             .epoch_validators
             .values()
             .flat_map(|validators| validators.get_members().keys().copied())
-            .map(auth::QueueIdentity::PublicKey)
+            .map(|node| node.pubkey())
             .collect();
-        self.udp_pins.send_if_modified(|current| {
-            if *current == pinned {
-                return false;
-            }
-            *current = pinned;
-            true
-        });
+        self.udp_socket.set_priority_identities(pinned.clone());
+        if let Some(transport) = &self.direct_udp_transport {
+            transport.set_priority_identities(pinned);
+        }
 
         let validators = [self.current_epoch, self.current_epoch + Epoch(1)]
             .into_iter()
@@ -791,24 +766,26 @@ where
     }
 }
 
-pub struct DataplaneHandles {
+pub struct DataplaneHandles<I: monad_dataplane::auth::Identity = monad_secp::PubKey> {
     pub tcp_socket: monad_dataplane::TcpSocketHandle,
-    pub authenticated_socket: UdpSocketHandle,
-    pub direct_udp_socket: Option<UdpSocketHandle>,
+    pub authenticated_socket: UdpSocketHandle<I>,
+    pub direct_udp_socket: Option<UdpSocketHandle<I>>,
     pub control: DataplaneControl,
     pub tcp_addr: SocketAddrV4,
     pub auth_addr: SocketAddrV4,
     pub direct_udp_addr: Option<SocketAddrV4>,
 }
 
-pub fn create_dataplane_for_tests(with_direct_udp: bool) -> DataplaneHandles {
+pub fn create_dataplane_for_tests<I: monad_dataplane::auth::Identity>(
+    with_direct_udp: bool,
+) -> DataplaneHandles<I> {
     create_dataplane_for_tests_at_ip(with_direct_udp, std::net::Ipv4Addr::LOCALHOST)
 }
 
-pub fn create_dataplane_for_tests_at_ip(
+pub fn create_dataplane_for_tests_at_ip<I: monad_dataplane::auth::Identity>(
     with_direct_udp: bool,
     ip: std::net::Ipv4Addr,
-) -> DataplaneHandles {
+) -> DataplaneHandles<I> {
     let bind_addr: SocketAddr = (ip, 0).into();
     let up_bandwidth_mbps = 1_000;
 
@@ -820,7 +797,7 @@ pub fn create_dataplane_for_tests_at_ip(
     let mut dp = DataplaneBuilder::new(up_bandwidth_mbps)
         .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_addr)])
         .with_udp_sockets(udp_sockets)
-        .build();
+        .build_with_identity::<I>();
 
     let tcp_socket = dp.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
     let tcp_addr = match tcp_socket.local_addr() {
@@ -870,7 +847,7 @@ pub fn dummy_proposer_schedule<PT: PubKey>() -> BoxedProposerSchedule<PT> {
 }
 
 pub fn new_defaulted_raptorcast_for_tests<ST, M, OM, SE>(
-    dataplane: DataplaneHandles,
+    dataplane: DataplaneHandles<CertificateSignaturePubKey<ST>>,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     shared_key: Arc<ST::KeyPairType>,
     current_epoch: Epoch,
@@ -898,7 +875,7 @@ where
 }
 
 pub fn new_defaulted_raptorcast_for_tests_with_name_records<ST, M, OM, SE>(
-    dataplane: DataplaneHandles,
+    dataplane: DataplaneHandles<CertificateSignaturePubKey<ST>>,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     name_records: HashMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>>,
     shared_key: Arc<ST::KeyPairType>,
@@ -1346,18 +1323,18 @@ where
                 let mut sock = pin!(budgeted(this.udp_socket.recv(), &mut poll_quota));
 
                 match sock.poll_unpin(cx) {
-                    Poll::Ready(Some(Ok(msg))) => {
+                    Poll::Ready(Ok(msg)) => {
                         this.metrics
                             .gauge(GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED)
                             .inc();
                         msg
                     }
-                    Poll::Ready(Some(Err(e))) => {
+                    Poll::Ready(Err(e)) => {
                         this.metrics.gauge(GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS).inc();
                         trace!(error=?e, "socket recv error");
                         continue;
                     }
-                    Poll::Ready(None) | Poll::Pending => break,
+                    Poll::Pending => break,
                 }
             };
 
@@ -1488,7 +1465,7 @@ where
             loop {
                 let mut recv_fut = pin!(budgeted(socket.recv(), &mut poll_quota));
                 match recv_fut.poll_unpin(cx) {
-                    Poll::Ready(Some(Ok(msg))) => {
+                    Poll::Ready(Ok(msg)) => {
                         let from = msg
                             .sender
                             .expect("framed direct udp transport requires authenticated messages");
@@ -1521,16 +1498,16 @@ where
                             return Poll::Ready(Some(event.into()));
                         }
                     }
-                    Poll::Ready(Some(Err(err))) => {
+                    Poll::Ready(Err(err)) => {
                         trace!(error=?err, "direct udp socket recv error");
                         continue;
                     }
-                    Poll::Ready(None) | Poll::Pending => break,
+                    Poll::Pending => break,
                 }
             }
         }
 
-        // TODO(dshulyak): Route TCP receives through PriorityQueue once WireAuth TCP lands.
+        // TODO(dshulyak): Integrate TCP authentication and receive priority in the dataplane once WireAuth TCP lands.
         let mut poll_quota = TCP_POLL_QUOTA;
         loop {
             let mut recv_fut = pin!(budgeted(this.tcp_reader.recv(), &mut poll_quota));

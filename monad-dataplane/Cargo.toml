@@ -11,14 +11,18 @@ bench = false
 [dependencies]
 monad-executor = { workspace = true }
 monad-types = { workspace = true }
+monad-wireauth = { workspace = true }
+monad-secp = { workspace = true }
 
 async-channel = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 governor = { workspace = true }
 libc = { workspace = true }
+lru = { workspace = true }
 monoio = { workspace = true }
 socket2 = { workspace = true }
+secp256k1 = { workspace = true, features = ["rand"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 zerocopy = { workspace = true }

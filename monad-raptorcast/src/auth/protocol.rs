@@ -13,209 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{convert::TryFrom, net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use bytes::Bytes;
 use monad_crypto::certificate_signature::PubKey;
+pub use monad_dataplane::auth::{AuthenticationProtocol, WireAuthProtocol};
 use monad_executor::ExecutorMetricsChain;
-use monad_wireauth::messages::{DataPacketHeader, Packet};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-pub trait AuthenticationProtocol {
-    type PublicKey: PubKey;
-    type Error: std::fmt::Debug;
-    type Header: IntoBytes + Immutable;
-
-    const HEADER_SIZE: u16;
-
-    fn connect(
-        &mut self,
-        remote_public_key: &Self::PublicKey,
-        remote_addr: SocketAddr,
-        retry_attempts: u64,
-    ) -> Result<(), Self::Error>;
-
-    fn dispatch(
-        &mut self,
-        packet: &mut [u8],
-        remote_addr: SocketAddr,
-    ) -> Result<Option<(Bytes, Option<Self::PublicKey>)>, Self::Error>;
-
-    fn encrypt_by_public_key(
-        &mut self,
-        public_key: &Self::PublicKey,
-        plaintext: &mut [u8],
-    ) -> Result<Self::Header, Self::Error>;
-
-    fn encrypt_by_socket(
-        &mut self,
-        socket_addr: &SocketAddr,
-        plaintext: &mut [u8],
-    ) -> Result<Self::Header, Self::Error>;
-
-    fn buffer_message(
-        &mut self,
-        public_key: &Self::PublicKey,
-        message: Bytes,
-    ) -> Result<(), Self::Error>;
-
-    fn is_connected_public_key(&self, public_key: &Self::PublicKey) -> bool;
-
-    fn is_connected_socket_and_public_key(
-        &self,
-        socket_addr: &SocketAddr,
-        public_key: &Self::PublicKey,
-    ) -> bool;
-
-    fn get_socket_by_public_key(&self, public_key: &Self::PublicKey) -> Option<SocketAddr>;
-
-    fn has_any_session_by_public_key(&self, public_key: &Self::PublicKey) -> bool;
-
-    fn has_initiator_session_by_public_key(&self, public_key: &Self::PublicKey) -> bool;
-
-    fn has_initiator_session_by_socket_and_public_key(
-        &self,
-        socket_addr: &SocketAddr,
-        public_key: &Self::PublicKey,
-    ) -> bool;
-
-    fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)>;
-
-    fn tick(&mut self);
-
-    fn next_deadline(&self) -> Option<Instant>;
-
-    fn metrics(&self) -> ExecutorMetricsChain<'_>;
-}
-
-pub struct WireAuthProtocol {
-    api: monad_wireauth::API<monad_wireauth::StdContext, Arc<monad_secp::KeyPair>>,
-}
-
-impl WireAuthProtocol {
-    pub fn new(
-        metric_names: &'static monad_wireauth::MetricNames,
-        config: monad_wireauth::Config,
-        signing_key: Arc<monad_secp::KeyPair>,
-    ) -> Self {
-        let context = monad_wireauth::StdContext::new();
-        Self {
-            api: monad_wireauth::API::new(metric_names, config, signing_key, context),
-        }
-    }
-}
-
-impl AuthenticationProtocol for WireAuthProtocol {
-    type PublicKey = monad_secp::PubKey;
-    type Error = monad_wireauth::Error;
-    type Header = monad_wireauth::messages::DataPacketHeader;
-
-    const HEADER_SIZE: u16 = DataPacketHeader::SIZE as u16;
-
-    fn connect(
-        &mut self,
-        remote_public_key: &Self::PublicKey,
-        remote_addr: SocketAddr,
-        retry_attempts: u64,
-    ) -> Result<(), Self::Error> {
-        self.api
-            .connect(*remote_public_key, remote_addr, retry_attempts)
-    }
-
-    fn dispatch(
-        &mut self,
-        packet: &mut [u8],
-        remote_addr: SocketAddr,
-    ) -> Result<Option<(Bytes, Option<Self::PublicKey>)>, Self::Error> {
-        match Packet::try_from(packet).map_err(monad_wireauth::Error::from)? {
-            Packet::Control(control_packet) => {
-                self.api.dispatch_control(control_packet, remote_addr)?;
-                Ok(None)
-            }
-            Packet::Data(data_packet) => {
-                let (plaintext, public_key) = self.api.decrypt(data_packet, remote_addr)?;
-                Ok(Some((
-                    Bytes::copy_from_slice(plaintext.as_ref()),
-                    Some(public_key),
-                )))
-            }
-        }
-    }
-
-    fn encrypt_by_public_key(
-        &mut self,
-        public_key: &Self::PublicKey,
-        plaintext: &mut [u8],
-    ) -> Result<Self::Header, Self::Error> {
-        self.api.encrypt_by_public_key(public_key, plaintext)
-    }
-
-    fn encrypt_by_socket(
-        &mut self,
-        socket_addr: &SocketAddr,
-        plaintext: &mut [u8],
-    ) -> Result<Self::Header, Self::Error> {
-        self.api.encrypt_by_socket(socket_addr, plaintext)
-    }
-
-    fn buffer_message(
-        &mut self,
-        public_key: &Self::PublicKey,
-        message: Bytes,
-    ) -> Result<(), Self::Error> {
-        self.api.buffer_message(public_key, message)
-    }
-
-    fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)> {
-        self.api.next_packet()
-    }
-
-    fn tick(&mut self) {
-        self.api.tick();
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        self.api.next_deadline()
-    }
-
-    fn is_connected_public_key(&self, public_key: &Self::PublicKey) -> bool {
-        self.api.is_connected_public_key(public_key)
-    }
-
-    fn is_connected_socket_and_public_key(
-        &self,
-        socket_addr: &SocketAddr,
-        public_key: &Self::PublicKey,
-    ) -> bool {
-        self.api
-            .is_connected_socket_and_public_key(socket_addr, public_key)
-    }
-
-    fn get_socket_by_public_key(&self, public_key: &Self::PublicKey) -> Option<SocketAddr> {
-        self.api.get_socket_by_public_key(public_key)
-    }
-
-    fn has_any_session_by_public_key(&self, public_key: &Self::PublicKey) -> bool {
-        self.api.has_any_session_by_public_key(public_key)
-    }
-
-    fn has_initiator_session_by_public_key(&self, public_key: &Self::PublicKey) -> bool {
-        self.api.has_initiator_session_by_public_key(public_key)
-    }
-
-    fn has_initiator_session_by_socket_and_public_key(
-        &self,
-        socket_addr: &SocketAddr,
-        public_key: &Self::PublicKey,
-    ) -> bool {
-        self.api
-            .has_initiator_session_by_socket_and_public_key(socket_addr, public_key)
-    }
-
-    fn metrics(&self) -> ExecutorMetricsChain<'_> {
-        self.api.metrics()
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -240,7 +44,7 @@ impl<P: PubKey> Default for NoopAuthProtocol<P> {
     }
 }
 
-impl<P: PubKey> AuthenticationProtocol for NoopAuthProtocol<P> {
+impl<P: PubKey> monad_dataplane::auth::AuthenticationProtocol for NoopAuthProtocol<P> {
     type PublicKey = P;
     type Error = std::convert::Infallible;
     type Header = NoopHeader;
@@ -278,14 +82,6 @@ impl<P: PubKey> AuthenticationProtocol for NoopAuthProtocol<P> {
         _plaintext: &mut [u8],
     ) -> Result<Self::Header, Self::Error> {
         Ok(NoopHeader)
-    }
-
-    fn buffer_message(
-        &mut self,
-        _public_key: &Self::PublicKey,
-        _message: Bytes,
-    ) -> Result<(), Self::Error> {
-        Ok(())
     }
 
     fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)> {

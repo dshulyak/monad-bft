@@ -666,6 +666,10 @@ async fn test_rate_limiting_basic() {
         NUM_MESSAGES,
     );
 
+    // The warmup also verifies ordinary signatures. With authentication now
+    // progressing independently, startup can complete before that budget has
+    // refilled. Isolate the burst from warmup token consumption.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let non_validator_idx = 2;
     let non_validator_nodeid = validator_infos[non_validator_idx].nodeid;
     let target_validator_idx = 0;

@@ -30,8 +30,8 @@ pub trait Context {
     fn convert_duration_since_start_to_deadline(&self, duration: Duration) -> Instant;
 }
 
-pub struct StdContext {
-    rng: ThreadRng,
+pub struct StdContext<R = ThreadRng> {
+    rng: R,
     start_instant: Instant,
 }
 
@@ -44,8 +44,17 @@ impl StdContext {
     }
 }
 
-impl Context for StdContext {
-    type Rng = ThreadRng;
+impl<R> StdContext<R> {
+    pub fn with_rng(rng: R) -> Self {
+        Self {
+            rng,
+            start_instant: Instant::now(),
+        }
+    }
+}
+
+impl<R: secp256k1::rand::Rng + secp256k1::rand::CryptoRng> Context for StdContext<R> {
+    type Rng = R;
 
     fn system_time(&self) -> SystemTime {
         SystemTime::now()

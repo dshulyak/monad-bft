@@ -871,7 +871,7 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
     // Build a unicast raptorcast packet signed by the validator, targeted at the
     // fullnode.
     let segment_size = DEFAULT_SEGMENT_SIZE
-        - <monad_raptorcast::auth::WireAuthProtocol as monad_raptorcast::auth::AuthenticationProtocol>::HEADER_SIZE;
+        - <monad_raptorcast::auth::WireAuthProtocol as monad_dataplane::auth::AuthenticationProtocol>::HEADER_SIZE;
     let packets = build_messages::<SignatureType>(
         &validator_keypair,
         segment_size,

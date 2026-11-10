@@ -652,7 +652,7 @@ fn setup_node(
             monad_dataplane::UdpSocketId::AuthenticatedRaptorcast,
             authenticated_udp_addr,
         )])
-        .build();
+        .build_with_identity::<monad_secp::PubKey>();
 
     let tcp_socket = dataplane
         .tcp_sockets

@@ -225,6 +225,11 @@ impl<'a> From<&'a ExecutorMetrics> for ExecutorMetricsChain<'a> {
 pub struct ExecutorMetricsChain<'a>(Vec<&'a ExecutorMetrics>);
 
 impl<'a> ExecutorMetricsChain<'a> {
+    /// Clone the shared metric handles when moving their owner to another thread.
+    pub fn cloned_metrics(&self) -> Vec<ExecutorMetrics> {
+        self.0.iter().map(|metrics| (*metrics).clone()).collect()
+    }
+
     pub fn push(mut self, metrics: &'a ExecutorMetrics) -> Self {
         self.0.push(metrics);
         self

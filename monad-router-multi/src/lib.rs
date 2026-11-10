@@ -108,7 +108,7 @@ where
         let pdd = PeerDiscoveryDriver::new(peer_discovery_builder);
         let shared_pdd = Arc::new(Mutex::new(pdd));
 
-        let mut dp = dataplane_builder.build();
+        let mut dp = dataplane_builder.build_with_identity::<AP::PublicKey>();
         assert!(dp.block_until_ready(Duration::from_secs(1)));
         let dataplane_metrics = dp.metrics().clone();
 
