@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -19,11 +19,12 @@ use crate::{
 };
 
 struct Socket<I: Identity> {
+    id: UdpSocketId,
     backend: Option<Box<dyn Backend<I>>>,
     ingress: Ingress<I>,
 }
 pub(super) struct Runtime<I: Identity> {
-    sockets: HashMap<UdpSocketId, Socket<I>>,
+    sockets: [Option<Socket<I>>; 3],
     ready: [VecDeque<UdpMsg<I>>; 2],
     ready_bytes: [usize; 2],
     pub(super) ready_limit: usize,
@@ -44,7 +45,7 @@ impl<I: Identity> Runtime<I> {
         let (timer_notify, timer_rx) = async_channel::bounded(1);
         (
             Rc::new(RefCell::new(Self {
-                sockets: HashMap::new(),
+                sockets: std::array::from_fn(|_| None),
                 ready: std::array::from_fn(|_| VecDeque::new()),
                 ready_bytes: [0; 2],
                 ready_limit: crate::DEFAULT_UDP_MAX_QUEUED_BYTES,
@@ -58,13 +59,11 @@ impl<I: Identity> Runtime<I> {
         )
     }
     pub(super) fn add_socket(&mut self, id: UdpSocketId, ingress: Ingress<I>) {
-        self.sockets.insert(
+        self.sockets[id as usize] = Some(Socket {
             id,
-            Socket {
-                backend: None,
-                ingress,
-            },
-        );
+            backend: None,
+            ingress,
+        });
     }
     fn enqueue(&mut self, output: impl IntoIterator<Item = UdpMsg<I>>) {
         for msg in output {
@@ -96,14 +95,50 @@ impl<I: Identity> Runtime<I> {
         }
         result
     }
+    pub(super) fn ready_payload_bytes(&self) -> [usize; 2] {
+        std::array::from_fn(|priority| {
+            self.ready_bytes[priority]
+                - self.ready[priority].len() * std::mem::size_of::<UdpMsg<I>>()
+        })
+    }
+    pub(super) fn has_ready_fitting(&self, capacity: [usize; 2]) -> bool {
+        self.ready.iter().enumerate().any(|(priority, queue)| {
+            queue
+                .front()
+                .is_some_and(|msg| msg.payload.len() <= capacity[priority])
+        })
+    }
+    /// Keep FIFO within each priority and leave messages without pacing space buffered.
+    pub(super) fn take_ready_fitting(
+        &mut self,
+        limit: usize,
+        mut capacity: [usize; 2],
+    ) -> Vec<UdpMsg<I>> {
+        let mut result = Vec::with_capacity(limit);
+        for (priority, queue) in self.ready.iter_mut().enumerate() {
+            while result.len() < limit {
+                let Some(msg) = queue.front() else { break };
+                if msg.payload.len() > capacity[priority] {
+                    break;
+                }
+                let msg = queue.pop_front().unwrap();
+                capacity[priority] -= msg.payload.len();
+                self.ready_bytes[priority] -= msg.payload.len() + std::mem::size_of::<UdpMsg<I>>();
+                result.push(msg);
+            }
+        }
+        if self.has_ready_fitting(capacity) {
+            let _ = self.ready_notify.try_send(());
+        }
+        result
+    }
     pub(super) fn command(&mut self, command: UdpCommand<I>) {
         let mut output = Vec::new();
         let id = match command {
             UdpCommand::Send(msg) => {
                 if self.require_auth
-                    || self
-                        .sockets
-                        .get(&msg.socket_id)
+                    || self.sockets[msg.socket_id as usize]
+                        .as_ref()
                         .is_some_and(|socket| socket.backend.is_some())
                 {
                     self.metrics.udp_egress_messages_dropped.inc();
@@ -113,31 +148,34 @@ impl<I: Identity> Runtime<I> {
                 return;
             }
             UdpCommand::Install(id, backend, installed) => {
-                self.sockets.get_mut(&id).unwrap().backend = Some(backend);
-                let _ = installed.send(());
+                let (backend, metrics) = backend();
+                self.sockets[id as usize].as_mut().unwrap().backend = Some(backend);
+                let _ = installed.send(metrics);
                 id
             }
             UdpCommand::Connect(id, key, addr, attempts) => {
-                if let Some(backend) = self.sockets.get_mut(&id).unwrap().backend.as_mut() {
+                if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut()
+                {
                     backend.connect(key, addr, attempts);
                 }
                 id
             }
             UdpCommand::Plaintext(id, plaintext) => {
-                if let Some(backend) = self.sockets.get_mut(&id).unwrap().backend.as_mut() {
+                if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut()
+                {
                     backend.prepare(id, plaintext, &mut output);
                 }
                 id
             }
         };
-        if let Some(backend) = self.sockets.get_mut(&id).unwrap().backend.as_mut() {
+        if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut() {
             backend.drain(id, &mut output);
         }
         self.enqueue(output);
         let _ = self.timer_notify.try_send(());
     }
     pub(super) fn receive(&mut self, id: UdpSocketId, src_addr: SocketAddr, packet: &mut [u8]) {
-        let socket = self.sockets.get_mut(&id).unwrap();
+        let socket = self.sockets[id as usize].as_mut().unwrap();
         let mut output = Vec::new();
         if let Some(backend) = socket.backend.as_mut() {
             let result = backend.receive(packet, src_addr);
@@ -171,25 +209,25 @@ impl<I: Identity> Runtime<I> {
         }
         self.enqueue(output);
     }
-    pub(super) fn encrypt(
+    pub(super) fn writer(
         &mut self,
         id: UdpSocketId,
         encryption: Encryption<I>,
         addr: SocketAddr,
-        bytes: Bytes,
-        stride: u16,
-    ) -> Option<Bytes> {
-        let backend = self.sockets.get_mut(&id)?.backend.as_mut()?;
-        let result = backend.encrypt(encryption, addr, bytes, stride);
+        plaintext_len: usize,
+    ) -> Option<monad_wireauth::Writer> {
+        let backend = self.sockets[id as usize].as_mut()?.backend.as_mut()?;
+        let writer = backend.writer(encryption, addr, plaintext_len);
         let mut output = Vec::new();
         backend.drain(id, &mut output);
         self.enqueue(output);
         let _ = self.timer_notify.try_send(());
-        result
+        writer
     }
     fn next_deadline(&self) -> Option<Instant> {
         self.sockets
-            .values()
+            .iter()
+            .flatten()
             .filter_map(|socket| {
                 socket
                     .backend
@@ -201,11 +239,11 @@ impl<I: Identity> Runtime<I> {
     fn tick(&mut self) {
         let mut output = Vec::new();
         let now = Instant::now();
-        for (id, socket) in &mut self.sockets {
+        for socket in self.sockets.iter_mut().flatten() {
             if let Some(backend) = socket.backend.as_mut() {
                 if backend.deadline().is_some_and(|deadline| deadline <= now) {
                     backend.tick();
-                    backend.drain(*id, &mut output);
+                    backend.drain(socket.id, &mut output);
                 }
             }
         }

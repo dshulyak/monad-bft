@@ -28,12 +28,14 @@ pub struct NoopHeader;
 // TODO(dshulyak): Remove NoopAuthProtocol after migrating its test and simulation users.
 pub struct NoopAuthProtocol<P: PubKey> {
     _phantom: std::marker::PhantomData<P>,
+    writer: monad_wireauth::Writer,
 }
 
 impl<P: PubKey> NoopAuthProtocol<P> {
     pub fn new() -> Self {
         Self {
             _phantom: std::marker::PhantomData,
+            writer: std::sync::Arc::new(NoopWriter),
         }
     }
 }
@@ -44,12 +46,37 @@ impl<P: PubKey> Default for NoopAuthProtocol<P> {
     }
 }
 
+struct NoopWriter;
+impl monad_wireauth::PacketWriter for NoopWriter {
+    fn encrypt_into(
+        &self,
+        plaintext: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), monad_wireauth::WriterError> {
+        output.copy_from_slice(plaintext);
+        Ok(())
+    }
+}
+
 impl<P: PubKey> monad_dataplane::auth::AuthenticationProtocol for NoopAuthProtocol<P> {
     type PublicKey = P;
     type Error = std::convert::Infallible;
     type Header = NoopHeader;
 
     const HEADER_SIZE: u16 = 0;
+
+    fn into_initializer(self) -> Box<dyn FnOnce() -> Self + Send> {
+        Box::new(move || self)
+    }
+
+    fn writer_for_peer(
+        &mut self,
+        _: &Self::PublicKey,
+        _: SocketAddr,
+        _: usize,
+    ) -> Option<monad_wireauth::Writer> {
+        Some(self.writer.clone())
+    }
 
     fn connect(
         &mut self,

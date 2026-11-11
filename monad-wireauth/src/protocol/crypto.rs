@@ -30,6 +30,18 @@ pub fn encrypt_in_place(
     cipher.encrypt_in_place(data, ad)
 }
 
+/// Encrypt shared plaintext directly into caller-owned storage.
+pub fn encrypt_into(
+    key: &CipherKey,
+    nonce: &CipherNonce,
+    plaintext: &[u8],
+    ciphertext: &mut [u8],
+    ad: &[u8],
+) -> [u8; 16] {
+    let cipher = aegis::aegis128l::Aegis128L::<16>::new(key.as_ref(), nonce.as_ref());
+    cipher.encrypt_into(plaintext, ciphertext, ad)
+}
+
 pub fn decrypt_in_place(
     key: &CipherKey,
     nonce: &CipherNonce,
@@ -122,5 +134,45 @@ pub fn verify_mac2<M: crate::messages::MacMessage>(
         Ok(())
     } else {
         Err(CryptoError::MacVerificationFailed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_into_matches_aegis_05_wire_bytes() {
+        let key = CipherKey::from(&HashOutput([7; 32]));
+        let plaintext = b"wireauth shared plaintext";
+        let mut ciphertext = vec![0xa5; plaintext.len()];
+        let tag = encrypt_into(&key, &9.into(), plaintext, &mut ciphertext, b"header");
+        // Generated with the previous aegis 0.5.0 one-shot implementation.
+        assert_eq!(
+            hex::encode(&ciphertext),
+            "114029c2d59d15f572af6723e95a148dca1746069671d4e09e"
+        );
+        assert_eq!(hex::encode(tag), "b9f0bd4703fa55c5efa22b06d31f0239");
+        decrypt_in_place(&key, &9.into(), &mut ciphertext, &tag, b"header").unwrap();
+        assert_eq!(ciphertext, plaintext);
+    }
+
+    #[test]
+    fn encrypt_into_matches_one_shot_at_block_and_packet_boundaries() {
+        let key = CipherKey::from(&HashOutput([7; 32]));
+        for size in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1440, 1472, 65_507] {
+            let plaintext: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            for ad in [&b""[..], &b"header"[..]] {
+                for nonce in [0_u64, 1, u64::MAX] {
+                    let nonce = nonce.into();
+                    let mut in_place = plaintext.clone();
+                    let expected_tag = encrypt_in_place(&key, &nonce, &mut in_place, ad);
+                    let mut output = vec![0xa5; size];
+                    let tag = encrypt_into(&key, &nonce, &plaintext, &mut output, ad);
+                    assert_eq!(tag, expected_tag, "size={size}");
+                    assert_eq!(output, in_place, "size={size}");
+                }
+            }
+        }
     }
 }

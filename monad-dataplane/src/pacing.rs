@@ -304,6 +304,10 @@ impl<T: PacingItem> PacingQueue<T> {
         self.pending == 0
     }
 
+    pub(crate) fn remaining_capacity(&self) -> [usize; PRIORITY_COUNT] {
+        self.memory.map(|memory| memory.limit - memory.used)
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.epoch.elapsed()
     }

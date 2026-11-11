@@ -24,7 +24,7 @@ use monad_executor::ExecutorMetrics;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    metrics::{init_filter_executor_metrics, MetricNames},
+    metrics::{init_filter_executor_metrics, FilterMetrics, MetricNames},
     state::State,
 };
 
@@ -47,7 +47,7 @@ pub struct Filter {
     ip_rate_limit_window: Duration,
     high_watermark_sessions: usize,
     metrics: ExecutorMetrics,
-    metric_names: &'static MetricNames,
+    gauges: FilterMetrics,
 }
 
 impl Filter {
@@ -64,6 +64,8 @@ impl Filter {
         ip_history_capacity: usize,
         high_watermark_sessions: usize,
     ) -> Self {
+        let mut metrics = init_filter_executor_metrics(metric_names);
+        let gauges = FilterMetrics::new(&mut metrics, metric_names);
         Self {
             cookie_unverified_counter: 0,
             cookie_verified_counter: 0,
@@ -74,8 +76,8 @@ impl Filter {
             ip_request_history: LruCache::new(NonZeroUsize::new(ip_history_capacity).unwrap()),
             ip_rate_limit_window,
             high_watermark_sessions,
-            metrics: init_filter_executor_metrics(metric_names),
-            metric_names,
+            metrics,
+            gauges,
         }
     }
 
@@ -194,8 +196,8 @@ impl Filter {
 
         self.ip_request_history
             .put(remote_addr.ip(), duration_since_start);
-        self.metrics
-            .gauge(self.metric_names.filter_ip_request_history_size)
+        self.gauges
+            .filter_ip_request_history_size
             .set(self.ip_request_history.len() as u64);
         FilterAction::Pass
     }
@@ -212,11 +214,11 @@ impl Filter {
 
     fn record_metric(&mut self, action: FilterAction) {
         let metric = match action {
-            FilterAction::Pass => self.metric_names.filter_pass,
-            FilterAction::SendCookie => self.metric_names.filter_send_cookie,
-            FilterAction::Drop => self.metric_names.filter_drop,
+            FilterAction::Pass => &self.gauges.filter_pass,
+            FilterAction::SendCookie => &self.gauges.filter_send_cookie,
+            FilterAction::Drop => &self.gauges.filter_drop,
         };
-        self.metrics.gauge(metric).inc();
+        metric.inc();
     }
 }
 

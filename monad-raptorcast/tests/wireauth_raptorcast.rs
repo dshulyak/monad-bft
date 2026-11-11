@@ -15,7 +15,7 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddrV4},
     num::ParseIntError,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -311,9 +311,11 @@ fn spawn_wireauth_validator(
                 }
                 _ = check_interval.tick(), if check_connections => {
                     if let Some(tx) = ready_tx.take() {
-                        let all_connected = peers_to_check.iter().all(|(addr, pubkey)| {
-                            validator_rc.is_connected_to(&SocketAddr::V4(*addr), pubkey)
-                        });
+                        // Metrics are shared independently of the protocol engine.
+                        // Warmup delivery below verifies the individual peers.
+                        let all_connected = validator_rc.metrics().metric_handles().into_iter()
+                            .find(|(name, _, _)| *name == "monad.wireauth.udp.state.sessions_by_public_key")
+                            .is_some_and(|(_, gauge, _)| gauge.get() >= peers_to_check.len() as u64);
 
                         if all_connected {
                             let _ = tx.send(());

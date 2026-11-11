@@ -15,6 +15,7 @@
 
 use std::{
     ops::{Deref, DerefMut},
+    sync::Arc,
     time::Duration,
 };
 
@@ -27,15 +28,13 @@ use super::{
 use crate::{
     config::Config,
     protocol::{
-        common::{CipherKey, SessionIndex},
+        common::{CipherKey, CipherNonce, SessionIndex},
         messages::{DataPacket, DataPacketHeader, Plaintext},
     },
 };
 
 pub struct TransportState {
-    pub remote_index: SessionIndex,
-    pub send_key: CipherKey,
-    pub send_nonce: u64,
+    send: Arc<crate::writer::SendState>,
     pub recv_key: CipherKey,
     pub replay_filter: ReplayFilter,
     pub common: SessionState,
@@ -49,9 +48,7 @@ impl TransportState {
         common: SessionState,
     ) -> Self {
         TransportState {
-            remote_index,
-            send_key,
-            send_nonce: 0,
+            send: Arc::new(crate::writer::SendState::new(send_key, remote_index)),
             recv_key,
             replay_filter: ReplayFilter::new(),
             common,
@@ -64,19 +61,72 @@ impl TransportState {
         config: &Config,
         duration_since_start: Duration,
         plaintext: &mut [u8],
-    ) -> (DataPacketHeader, RenewedTimer) {
-        use crate::protocol::crypto;
+    ) -> Result<(DataPacketHeader, RenewedTimer), crate::WriterError> {
+        self.encrypt_with(
+            rng,
+            config,
+            duration_since_start,
+            plaintext.len(),
+            |key, nonce| crate::protocol::crypto::encrypt_in_place(key, nonce, plaintext, &[]),
+        )
+    }
 
-        let header = DataPacketHeader {
-            receiver_index: self.remote_index.as_u32().into(),
-            nonce: self.send_nonce.into(),
-            tag: crypto::encrypt_in_place(&self.send_key, &self.send_nonce.into(), plaintext, &[]),
-            ..Default::default()
-        };
+    pub fn encrypt_into<R: secp256k1::rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        config: &Config,
+        duration_since_start: Duration,
+        plaintext: &[u8],
+        ciphertext: &mut [u8],
+    ) -> Result<(DataPacketHeader, RenewedTimer), crate::WriterError> {
+        self.encrypt_with(
+            rng,
+            config,
+            duration_since_start,
+            plaintext.len(),
+            |key, nonce| {
+                crate::protocol::crypto::encrypt_into(key, nonce, plaintext, ciphertext, &[])
+            },
+        )
+    }
 
-        self.send_nonce += 1;
+    fn encrypt_with<R: secp256k1::rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        config: &Config,
+        duration_since_start: Duration,
+        plaintext_len: usize,
+        encrypt: impl FnOnce(&CipherKey, &CipherNonce) -> [u8; 16],
+    ) -> Result<(DataPacketHeader, RenewedTimer), crate::WriterError> {
+        let header = self.send.encrypt_header(encrypt)?;
+        let timer = self.note_send(rng, config, duration_since_start, plaintext_len);
+        Ok((header, timer))
+    }
 
-        if !plaintext.is_empty() {
+    pub(crate) fn writer<R: secp256k1::rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        config: &Config,
+        duration_since_start: Duration,
+        plaintext_len: usize,
+    ) -> Result<(crate::Writer, RenewedTimer), crate::WriterError> {
+        self.send.check_active()?;
+        let timer = self.note_send(rng, config, duration_since_start, plaintext_len);
+        Ok((self.send.clone(), timer))
+    }
+
+    pub(crate) fn invalidate_writer(&self) {
+        self.send.invalidate();
+    }
+
+    fn note_send<R: secp256k1::rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        config: &Config,
+        duration_since_start: Duration,
+        plaintext_len: usize,
+    ) -> RenewedTimer {
+        if plaintext_len != 0 {
             self.common
                 .reset_gc_deadline(duration_since_start, config.gc_idle_timeout);
         }
@@ -91,12 +141,10 @@ impl TransportState {
             .get_next_deadline()
             .expect("expected at least one timer to be set");
 
-        let timer = RenewedTimer {
+        RenewedTimer {
             previous: keepalive_timer.previous,
             current: next_deadline,
-        };
-
-        (header, timer)
+        }
     }
 
     pub fn decrypt<'a>(
@@ -229,7 +277,10 @@ impl TransportState {
                 remote_addr = ?self.common.remote_addr,
                 "sending keepalive packet"
             );
-            let (header, _) = self.encrypt(rng, config, duration_since_start, &mut []);
+            let Ok((header, _)) = self.encrypt(rng, config, duration_since_start, &mut []) else {
+                let (terminated, rekey) = self.common.handle_session_timeout();
+                return (None, None, rekey, Some(terminated));
+            };
             message = Some(MessageEvent {
                 remote_addr: self.common.remote_addr,
                 header,
@@ -270,5 +321,11 @@ impl Deref for TransportState {
 impl DerefMut for TransportState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.common
+    }
+}
+
+impl Drop for TransportState {
+    fn drop(&mut self) {
+        self.invalidate_writer();
     }
 }

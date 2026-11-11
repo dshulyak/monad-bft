@@ -280,7 +280,7 @@ async fn valid_rebroadcast() {
         for (_, payload) in &packets {
             sender.write(
                 &receiver_id.pubkey(),
-                Some(receiver_addr),
+                receiver_addr,
                 payload.clone(),
                 deterministic::DEFAULT_SEGMENT_LEN as u16,
                 UdpPriority::Regular,
@@ -706,7 +706,7 @@ async fn udp_receive_priority_tracks_validator_set_updates() {
         ) {
             socket.write(
                 &receiver_id.pubkey(),
-                Some(receiver_addr),
+                receiver_addr,
                 packet,
                 segment_size,
                 UdpPriority::Regular,
@@ -903,7 +903,7 @@ async fn raptorcast_forwards_fullnodes_group_invite_at_cold_start() {
     for (target_addr, payload) in &packets {
         tx_socket.write(
             &fullnode_nodeid.pubkey(),
-            Some(*target_addr),
+            *target_addr,
             payload.clone(),
             segment_size,
             UdpPriority::Regular,

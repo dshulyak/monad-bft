@@ -14,15 +14,18 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    ops::{Deref, DerefMut},
+    rc::Rc,
     time::Duration,
 };
 
 use monad_executor::ExecutorMetrics;
 
 use crate::{
-    metrics::{init_state_executor_metrics, MetricNames},
+    metrics::{init_state_executor_metrics, MetricNames, StateMetrics},
     protocol::tai64::Tai64N,
     session::{InitiatorState, ResponderState, SessionIndex, TransportState},
 };
@@ -65,12 +68,12 @@ impl RoleSessions {
 }
 
 #[derive(Default)]
-struct EstablishedSessions {
+struct SessionRoles {
     initiator: RoleSessions,
     responder: RoleSessions,
 }
 
-impl EstablishedSessions {
+impl SessionRoles {
     fn get_latest(&self) -> Option<SessionIndex> {
         match (self.initiator.current, self.responder.current) {
             (Some((id0, ts0)), Some((id1, ts1))) => {
@@ -91,6 +94,34 @@ impl EstablishedSessions {
     }
 }
 
+// The role history retains old sessions for reordered RX packets. The latest
+// handle is maintained on control-path changes, so encryption needs one lookup.
+#[derive(Default)]
+struct EstablishedSessions {
+    roles: SessionRoles,
+    latest: Option<Rc<RefCell<TransportState>>>,
+}
+impl Deref for EstablishedSessions {
+    type Target = SessionRoles;
+    fn deref(&self) -> &SessionRoles {
+        &self.roles
+    }
+}
+impl DerefMut for EstablishedSessions {
+    fn deref_mut(&mut self) -> &mut SessionRoles {
+        &mut self.roles
+    }
+}
+impl EstablishedSessions {
+    fn refresh(&mut self, transports: &HashMap<SessionIndex, Rc<RefCell<TransportState>>>) {
+        self.latest = self
+            .roles
+            .get_latest()
+            .and_then(|id| transports.get(&id))
+            .cloned();
+    }
+}
+
 pub(crate) struct SessionIndexReservation<'a, M> {
     state: &'a mut State<M>,
     index: SessionIndex,
@@ -106,8 +137,8 @@ impl<M> SessionIndexReservation<'_, M> {
         self.state.next_session_index.increment();
         self.state.allocated_indices.insert(self.index);
         self.state
-            .metrics
-            .gauge(self.state.metric_names.state_allocated_indices)
+            .gauges
+            .state_allocated_indices
             .set(self.state.allocated_indices.len() as u64);
     }
 }
@@ -115,7 +146,7 @@ impl<M> SessionIndexReservation<'_, M> {
 pub struct State<M = ()> {
     initiating_sessions: HashMap<SessionIndex, InitiatorState<M>>,
     responding_sessions: HashMap<SessionIndex, ResponderState>,
-    transport_sessions: HashMap<SessionIndex, TransportState>,
+    transport_sessions: HashMap<SessionIndex, Rc<RefCell<TransportState>>>,
     last_established_session_by_public_key: HashMap<monad_secp::PubKey, EstablishedSessions>,
     last_established_session_by_socket: HashMap<SocketAddr, EstablishedSessions>,
     allocated_indices: HashSet<SessionIndex>,
@@ -125,11 +156,13 @@ pub struct State<M = ()> {
     ip_session_counts: HashMap<IpAddr, usize>,
     total_sessions: usize,
     metrics: ExecutorMetrics,
-    metric_names: &'static MetricNames,
+    gauges: StateMetrics,
 }
 
 impl<M> State<M> {
     pub fn new_with_metadata(metric_names: &'static MetricNames) -> Self {
+        let mut metrics = init_state_executor_metrics(metric_names);
+        let gauges = StateMetrics::new(&mut metrics, metric_names);
         Self {
             initiating_sessions: HashMap::new(),
             responding_sessions: HashMap::new(),
@@ -142,8 +175,8 @@ impl<M> State<M> {
             accepted_sessions_by_peer: BTreeSet::new(),
             ip_session_counts: HashMap::new(),
             total_sessions: 0,
-            metrics: init_state_executor_metrics(metric_names),
-            metric_names,
+            metrics,
+            gauges,
         }
     }
 
@@ -152,23 +185,51 @@ impl<M> State<M> {
     }
 
     #[cfg(test)]
-    pub fn get_transport(&self, session_index: &SessionIndex) -> Option<&TransportState> {
-        self.transport_sessions.get(session_index)
+    pub fn get_transport(
+        &self,
+        index: &SessionIndex,
+    ) -> Option<std::cell::Ref<'_, TransportState>> {
+        self.transport_sessions
+            .get(index)
+            .map(|session| session.borrow())
     }
-
+    #[cfg(test)]
     pub fn get_transport_mut(
-        &mut self,
-        session_index: &SessionIndex,
-    ) -> Option<&mut TransportState> {
-        self.transport_sessions.get_mut(session_index)
+        &self,
+        index: &SessionIndex,
+    ) -> Option<std::cell::RefMut<'_, TransportState>> {
+        self.transport_sessions
+            .get(index)
+            .map(|session| session.borrow_mut())
     }
-
-    pub fn has_transport_by_public_key(&self, public_key: &monad_secp::PubKey) -> bool {
+    pub(crate) fn transport_session(
+        &self,
+        index: &SessionIndex,
+    ) -> Option<Rc<RefCell<TransportState>>> {
+        self.transport_sessions.get(index).cloned()
+    }
+    pub(crate) fn transport_by_public_key(
+        &self,
+        key: &monad_secp::PubKey,
+    ) -> Option<Rc<RefCell<TransportState>>> {
         self.last_established_session_by_public_key
-            .get(public_key)
-            .and_then(|sessions| sessions.get_latest())
-            .map(|session_id| self.transport_sessions.contains_key(&session_id))
-            .unwrap_or(false)
+            .get(key)?
+            .latest
+            .clone()
+    }
+    pub(crate) fn transport_by_socket(
+        &self,
+        addr: &SocketAddr,
+    ) -> Option<Rc<RefCell<TransportState>>> {
+        self.last_established_session_by_socket
+            .get(addr)?
+            .latest
+            .clone()
+    }
+    pub fn has_transport_by_public_key(&self, key: &monad_secp::PubKey) -> bool {
+        self.last_established_session_by_public_key
+            .get(key)
+            .is_some_and(|sessions| sessions.latest.is_some())
     }
 
     pub fn has_any_session_by_public_key(&self, public_key: &monad_secp::PubKey) -> bool {
@@ -202,57 +263,49 @@ impl<M> State<M> {
             .unwrap_or(false)
     }
 
-    pub fn has_transport_by_socket(&self, socket_addr: &SocketAddr) -> bool {
+    pub fn has_transport_by_socket(&self, addr: &SocketAddr) -> bool {
         self.last_established_session_by_socket
-            .get(socket_addr)
-            .and_then(|sessions| sessions.get_latest())
-            .map(|session_id| self.transport_sessions.contains_key(&session_id))
-            .unwrap_or(false)
+            .get(addr)
+            .is_some_and(|sessions| sessions.latest.is_some())
     }
-
     pub fn has_transport_by_socket_and_public_key(
         &self,
-        socket_addr: &SocketAddr,
-        public_key: &monad_secp::PubKey,
+        addr: &SocketAddr,
+        key: &monad_secp::PubKey,
     ) -> bool {
         self.last_established_session_by_socket
-            .get(socket_addr)
-            .and_then(|sessions| sessions.get_latest())
-            .and_then(|session_id| self.transport_sessions.get(&session_id))
-            .map(|transport| &transport.remote_public_key == public_key)
-            .unwrap_or(false)
+            .get(addr)
+            .and_then(|sessions| sessions.latest.as_ref())
+            .is_some_and(|session| session.borrow().remote_public_key == *key)
     }
-
+    #[cfg(test)]
     pub fn get_transport_by_public_key(
-        &mut self,
-        public_key: &monad_secp::PubKey,
-    ) -> Option<&mut TransportState> {
-        let session_id = self
-            .last_established_session_by_public_key
-            .get(public_key)
-            .and_then(|sessions| sessions.get_latest())?;
-        self.transport_sessions.get_mut(&session_id)
+        &self,
+        key: &monad_secp::PubKey,
+    ) -> Option<std::cell::RefMut<'_, TransportState>> {
+        self.last_established_session_by_public_key
+            .get(key)?
+            .latest
+            .as_ref()
+            .map(|session| session.borrow_mut())
     }
-
-    pub fn get_socket_by_public_key(&self, public_key: &monad_secp::PubKey) -> Option<SocketAddr> {
-        let session_id = self
-            .last_established_session_by_public_key
-            .get(public_key)
-            .and_then(|sessions| sessions.get_latest())?;
-        self.transport_sessions
-            .get(&session_id)
-            .map(|t| t.remote_addr)
+    pub fn get_socket_by_public_key(&self, key: &monad_secp::PubKey) -> Option<SocketAddr> {
+        self.last_established_session_by_public_key
+            .get(key)?
+            .latest
+            .as_ref()
+            .map(|session| session.borrow().remote_addr)
     }
-
+    #[cfg(test)]
     pub fn get_transport_by_socket(
-        &mut self,
-        socket_addr: &SocketAddr,
-    ) -> Option<&mut TransportState> {
-        let session_id = self
-            .last_established_session_by_socket
-            .get(socket_addr)
-            .and_then(|sessions| sessions.get_latest())?;
-        self.transport_sessions.get_mut(&session_id)
+        &self,
+        addr: &SocketAddr,
+    ) -> Option<std::cell::RefMut<'_, TransportState>> {
+        self.last_established_session_by_socket
+            .get(addr)?
+            .latest
+            .as_ref()
+            .map(|session| session.borrow_mut())
     }
 
     pub(crate) fn reserve_session_index(&mut self) -> Option<SessionIndexReservation<'_, M>> {
@@ -275,34 +328,32 @@ impl<M> State<M> {
     }
 
     pub fn insert_transport(&mut self, session_id: SessionIndex, transport: TransportState) {
-        let remote_public_key = &transport.remote_public_key;
+        let remote_public_key = transport.remote_public_key;
         let remote_addr = transport.remote_addr;
         let created = transport.created;
         let is_initiator = transport.is_initiator;
 
         if is_initiator {
-            self.metrics
-                .gauge(self.metric_names.state_session_established_initiator)
-                .inc();
+            self.gauges.state_session_established_initiator.inc();
             self.initiating_sessions.remove(&session_id);
-            self.metrics
-                .gauge(self.metric_names.state_initiating_sessions)
+            self.gauges
+                .state_initiating_sessions
                 .set(self.initiating_sessions.len() as u64);
         } else {
-            self.metrics
-                .gauge(self.metric_names.state_session_established_responder)
-                .inc();
+            self.gauges.state_session_established_responder.inc();
             self.responding_sessions.remove(&session_id);
-            self.metrics
-                .gauge(self.metric_names.state_responding_sessions)
+            self.gauges
+                .state_responding_sessions
                 .set(self.responding_sessions.len() as u64);
         }
 
+        self.transport_sessions
+            .insert(session_id, Rc::new(RefCell::new(transport)));
         let mut evicted_sessions = Vec::new();
 
         let sessions = self
             .last_established_session_by_public_key
-            .entry(*remote_public_key)
+            .entry(remote_public_key)
             .or_default();
 
         let evicted = if is_initiator {
@@ -310,11 +361,12 @@ impl<M> State<M> {
         } else {
             sessions.responder.push(session_id, created)
         };
+        sessions.refresh(&self.transport_sessions);
         if let Some(evicted_id) = evicted {
             evicted_sessions.push(evicted_id);
         }
-        self.metrics
-            .gauge(self.metric_names.state_sessions_by_public_key)
+        self.gauges
+            .state_sessions_by_public_key
             .set(self.last_established_session_by_public_key.len() as u64);
 
         let sessions = self
@@ -327,19 +379,22 @@ impl<M> State<M> {
         } else {
             sessions.responder.push(session_id, created)
         };
+        sessions.refresh(&self.transport_sessions);
         if let Some(evicted_id) = evicted {
             if !evicted_sessions.contains(&evicted_id) {
                 evicted_sessions.push(evicted_id);
             }
         }
-        self.metrics
-            .gauge(self.metric_names.state_sessions_by_socket)
+        self.gauges
+            .state_sessions_by_socket
             .set(self.last_established_session_by_socket.len() as u64);
 
         for evicted_session_id in evicted_sessions {
             if let Some(session) = self.transport_sessions.get(&evicted_session_id) {
+                let session = session.borrow();
                 let evicted_remote_public_key = session.remote_public_key;
                 let evicted_remote_addr = session.remote_addr;
+                drop(session);
                 self.terminate_session(
                     evicted_session_id,
                     &evicted_remote_public_key,
@@ -348,9 +403,8 @@ impl<M> State<M> {
             }
         }
 
-        self.transport_sessions.insert(session_id, transport);
-        self.metrics
-            .gauge(self.metric_names.state_transport_sessions)
+        self.gauges
+            .state_transport_sessions
             .set(self.transport_sessions.len() as u64);
     }
 
@@ -360,46 +414,46 @@ impl<M> State<M> {
         remote_public_key: &monad_secp::PubKey,
         remote_addr: SocketAddr,
     ) {
-        self.metrics
-            .gauge(self.metric_names.state_session_terminated)
-            .inc();
+        self.gauges.state_session_terminated.inc();
 
         if let Some(count) = self.ip_session_counts.get_mut(&remote_addr.ip()) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.ip_session_counts.remove(&remote_addr.ip());
-                self.metrics
-                    .gauge(self.metric_names.state_ip_session_counts_size)
+                self.gauges
+                    .state_ip_session_counts_size
                     .set(self.ip_session_counts.len() as u64);
             }
         }
         self.total_sessions = self.total_sessions.saturating_sub(1);
-        self.metrics
-            .gauge(self.metric_names.state_total_sessions)
+        self.gauges
+            .state_total_sessions
             .set(self.total_sessions as u64);
 
         let transport = self.transport_sessions.remove(&session_id);
-        self.metrics
-            .gauge(self.metric_names.state_transport_sessions)
+        self.gauges
+            .state_transport_sessions
             .set(self.transport_sessions.len() as u64);
         if let Some(initiator) = self.initiating_sessions.remove(&session_id) {
-            self.metrics
-                .gauge(self.metric_names.initiator_messages_dropped_from_buffer)
+            self.gauges
+                .initiator_messages_dropped_from_buffer
                 .add(initiator.buffered_message_count() as u64);
         }
-        self.metrics
-            .gauge(self.metric_names.state_initiating_sessions)
+        self.gauges
+            .state_initiating_sessions
             .set(self.initiating_sessions.len() as u64);
         self.responding_sessions.remove(&session_id);
-        self.metrics
-            .gauge(self.metric_names.state_responding_sessions)
+        self.gauges
+            .state_responding_sessions
             .set(self.responding_sessions.len() as u64);
         self.allocated_indices.remove(&session_id);
-        self.metrics
-            .gauge(self.metric_names.state_allocated_indices)
+        self.gauges
+            .state_allocated_indices
             .set(self.allocated_indices.len() as u64);
 
         if let Some(transport) = transport {
+            let transport = transport.borrow();
+            transport.invalidate_writer();
             if let Some(sessions) = self
                 .last_established_session_by_socket
                 .get_mut(&remote_addr)
@@ -410,10 +464,11 @@ impl<M> State<M> {
                     sessions.responder.remove(session_id);
                 }
 
+                sessions.refresh(&self.transport_sessions);
                 if sessions.is_empty() {
                     self.last_established_session_by_socket.remove(&remote_addr);
-                    self.metrics
-                        .gauge(self.metric_names.state_sessions_by_socket)
+                    self.gauges
+                        .state_sessions_by_socket
                         .set(self.last_established_session_by_socket.len() as u64);
                 }
             }
@@ -428,11 +483,12 @@ impl<M> State<M> {
                     sessions.responder.remove(session_id);
                 }
 
+                sessions.refresh(&self.transport_sessions);
                 if sessions.is_empty() {
                     self.last_established_session_by_public_key
                         .remove(remote_public_key);
-                    self.metrics
-                        .gauge(self.metric_names.state_sessions_by_public_key)
+                    self.gauges
+                        .state_sessions_by_public_key
                         .set(self.last_established_session_by_public_key.len() as u64);
                 }
             }
@@ -441,16 +497,16 @@ impl<M> State<M> {
         if let Some(&initiated_id) = self.initiated_session_by_peer.get(remote_public_key) {
             if initiated_id == session_id {
                 self.initiated_session_by_peer.remove(remote_public_key);
-                self.metrics
-                    .gauge(self.metric_names.state_initiated_session_by_peer_size)
+                self.gauges
+                    .state_initiated_session_by_peer_size
                     .set(self.initiated_session_by_peer.len() as u64);
             }
         }
 
         self.accepted_sessions_by_peer
             .remove(&(*remote_public_key, session_id));
-        self.metrics
-            .gauge(self.metric_names.state_accepted_sessions_by_peer_size)
+        self.gauges
+            .state_accepted_sessions_by_peer_size
             .set(self.accepted_sessions_by_peer.len() as u64);
     }
 
@@ -488,16 +544,16 @@ impl<M> State<M> {
 
     pub fn remove_initiator(&mut self, session_index: &SessionIndex) -> Option<InitiatorState<M>> {
         let session = self.initiating_sessions.remove(session_index)?;
-        self.metrics
-            .gauge(self.metric_names.state_initiating_sessions)
+        self.gauges
+            .state_initiating_sessions
             .set(self.initiating_sessions.len() as u64);
         let remote_public_key = session.remote_public_key;
         if let Some(&stored_session_index) = self.initiated_session_by_peer.get(&remote_public_key)
         {
             if stored_session_index == *session_index {
                 self.initiated_session_by_peer.remove(&remote_public_key);
-                self.metrics
-                    .gauge(self.metric_names.state_initiated_session_by_peer_size)
+                self.gauges
+                    .state_initiated_session_by_peer_size
                     .set(self.initiated_session_by_peer.len() as u64);
             }
         }
@@ -506,14 +562,14 @@ impl<M> State<M> {
 
     pub fn remove_responder(&mut self, session_index: &SessionIndex) -> Option<ResponderState> {
         let session = self.responding_sessions.remove(session_index)?;
-        self.metrics
-            .gauge(self.metric_names.state_responding_sessions)
+        self.gauges
+            .state_responding_sessions
             .set(self.responding_sessions.len() as u64);
         let remote_public_key = session.remote_public_key;
         self.accepted_sessions_by_peer
             .remove(&(remote_public_key, *session_index));
-        self.metrics
-            .gauge(self.metric_names.state_accepted_sessions_by_peer_size)
+        self.gauges
+            .state_accepted_sessions_by_peer_size
             .set(self.accepted_sessions_by_peer.len() as u64);
         Some(session)
     }
@@ -526,25 +582,23 @@ impl<M> State<M> {
     ) {
         let remote_addr = session.remote_addr;
         self.initiating_sessions.insert(session_index, session);
-        self.metrics
-            .gauge(self.metric_names.state_initiating_sessions)
+        self.gauges
+            .state_initiating_sessions
             .set(self.initiating_sessions.len() as u64);
         self.initiated_session_by_peer
             .insert(remote_key, session_index);
-        self.metrics
-            .gauge(self.metric_names.state_initiated_session_by_peer_size)
+        self.gauges
+            .state_initiated_session_by_peer_size
             .set(self.initiated_session_by_peer.len() as u64);
         *self.ip_session_counts.entry(remote_addr.ip()).or_insert(0) += 1;
-        self.metrics
-            .gauge(self.metric_names.state_ip_session_counts_size)
+        self.gauges
+            .state_ip_session_counts_size
             .set(self.ip_session_counts.len() as u64);
         self.total_sessions += 1;
-        self.metrics
-            .gauge(self.metric_names.state_total_sessions)
+        self.gauges
+            .state_total_sessions
             .set(self.total_sessions as u64);
-        self.metrics
-            .gauge(self.metric_names.state_session_index_allocated)
-            .inc();
+        self.gauges.state_session_index_allocated.inc();
     }
 
     pub fn insert_responder(
@@ -555,21 +609,21 @@ impl<M> State<M> {
     ) {
         let remote_addr = session.remote_addr;
         self.responding_sessions.insert(session_index, session);
-        self.metrics
-            .gauge(self.metric_names.state_responding_sessions)
+        self.gauges
+            .state_responding_sessions
             .set(self.responding_sessions.len() as u64);
         self.accepted_sessions_by_peer
             .insert((remote_key, session_index));
-        self.metrics
-            .gauge(self.metric_names.state_accepted_sessions_by_peer_size)
+        self.gauges
+            .state_accepted_sessions_by_peer_size
             .set(self.accepted_sessions_by_peer.len() as u64);
         *self.ip_session_counts.entry(remote_addr.ip()).or_insert(0) += 1;
-        self.metrics
-            .gauge(self.metric_names.state_ip_session_counts_size)
+        self.gauges
+            .state_ip_session_counts_size
             .set(self.ip_session_counts.len() as u64);
         self.total_sessions += 1;
-        self.metrics
-            .gauge(self.metric_names.state_total_sessions)
+        self.gauges
+            .state_total_sessions
             .set(self.total_sessions as u64);
     }
 
@@ -613,7 +667,7 @@ impl<M> State<M> {
             .and_then(|sessions| sessions.responder.current)
             .map(|(session_id, _)| session_id)
             .and_then(|session_id| self.transport_sessions.get(&session_id))
-            .and_then(|s| s.initiator_timestamp());
+            .and_then(|s| s.borrow().initiator_timestamp());
 
         match (accepted_max, open_max) {
             (Some(a), Some(o)) => Some(a.max(o)),
@@ -654,7 +708,7 @@ impl<M> State<M> {
             let remote_addr = self
                 .transport_sessions
                 .get(&session_id)
-                .map(|t| t.remote_addr)
+                .map(|t| t.borrow().remote_addr)
                 .or_else(|| {
                     self.initiating_sessions
                         .get(&session_id)
@@ -918,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_public_key_empty() {
-        let mut state = State::new(DEFAULT_METRICS);
+        let state = State::new(DEFAULT_METRICS);
         let mut rng = rng();
         let keypair = monad_secp::KeyPair::generate(&mut rng);
         let public_key = keypair.pubkey();
@@ -1005,7 +1059,7 @@ mod tests {
 
     #[test]
     fn test_get_transport_by_socket_empty() {
-        let mut state = State::new(DEFAULT_METRICS);
+        let state = State::new(DEFAULT_METRICS);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 51820);
         assert!(state.get_transport_by_socket(&addr).is_none());
     }

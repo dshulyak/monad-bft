@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["monad-*"]
-exclude = ["monad-execution", "monad-fuzz", "monad-scripts"]
+exclude = ["monad-execution", "monad-fuzz", "monad-scripts", "local-patches/aegis"]
 
 [workspace.metadata.cargo-shear]
 ignored = ["alloy-transport-http", "getrandom", "monad-peer-disc-swarm"]
@@ -89,7 +89,7 @@ actix-server = "2.5.1"
 actix-test = { version = "0.1", default-features = false }
 actix-web = { version = "4.12.1", default-features = false, features = ["macros", "http2", "unicode", "ws"] }
 actix-ws = "0.3.0"
-aegis = "0.5"
+aegis = "0.9.20"
 aes = "0.8.3"
 agent = { git = "https://github.com/category-labs/manytrace.git", tag = "v0.1.1" }
 alloy-consensus = "2.0"
@@ -236,3 +236,7 @@ opt-level = 1
 debug = true
 lto = "thin"
 panic = "abort"
+
+# Local experiment: nonallocating one-shot encryption into supplied output.
+[patch.crates-io]
+aegis = { path = "local-patches/aegis" }

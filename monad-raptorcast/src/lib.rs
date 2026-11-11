@@ -101,7 +101,6 @@ pub mod udp;
 pub mod util;
 
 const SIGNATURE_SIZE: usize = 65;
-const DEFAULT_RETRY_ATTEMPTS: u64 = 3;
 const TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES: usize = 512 * 1024;
 
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
@@ -394,15 +393,6 @@ where
         &self.full_node_groups
     }
 
-    pub fn is_connected_to(
-        &self,
-        socket_addr: &SocketAddr,
-        public_key: &CertificateSignaturePubKey<ST>,
-    ) -> bool {
-        self.udp_socket
-            .is_connected_socket_and_public_key(socket_addr, public_key)
-    }
-
     fn enqueue_message_to_self(
         message: OM,
         pending_events: &mut VecDeque<RaptorCastEvent<M::Event, ST>>,
@@ -693,35 +683,23 @@ where
         };
 
         let target_pubkey = target.pubkey();
-        if !socket.has_any_session_by_public_key(&target_pubkey) {
-            let discovered_addr = self
-                .peer_discovery_driver
-                .lock()
-                .ok()
-                .and_then(|pd| pd.get_direct_udp_addr(&target));
-
-            // Fall back when peer discovery doesn't have a direct UDP address for the target.
-            let Some(discovered_addr) = discovered_addr else {
-                self.metrics
-                    .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
-                    .inc();
-                self.handle_publish(
-                    RouterTarget::PointToPoint(target),
-                    message,
-                    priority,
-                    self_id,
-                );
-                return;
-            };
-
-            if let Err(err) =
-                socket.connect(&target_pubkey, discovered_addr, DEFAULT_RETRY_ATTEMPTS)
-            {
-                warn!(?target, ?discovered_addr, ?err, "direct udp connect failed");
-                return;
-            }
-            socket.flush();
-        }
+        let discovered_addr = self
+            .peer_discovery_driver
+            .lock()
+            .ok()
+            .and_then(|pd| pd.get_direct_udp_addr(&target));
+        let Some(discovered_addr) = discovered_addr else {
+            self.metrics
+                .gauge(COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK)
+                .inc();
+            self.handle_publish(
+                RouterTarget::PointToPoint(target),
+                message,
+                priority,
+                self_id,
+            );
+            return;
+        };
 
         let outbound_message =
             match OutboundRouterMessage::<OM, ST>::AppMessage(message).try_serialize() {
@@ -751,7 +729,7 @@ where
         }
         // buffer will be drained when session is established or dropped on timeout
         if socket
-            .write_buffered(&target_pubkey, outbound_message, priority)
+            .write_buffered(&target_pubkey, discovered_addr, outbound_message, priority)
             .is_ok()
         {
             self.metrics
@@ -1851,9 +1829,7 @@ where
 
             self.udp_socket.write(
                 &public_key,
-                Some(SocketAddr::V4(
-                    target_name_record.name_record.authenticated_udp_socket(),
-                )),
+                SocketAddr::V4(target_name_record.name_record.authenticated_udp_socket()),
                 item.payload,
                 stride,
                 self.priority,
@@ -1861,32 +1837,24 @@ where
             return;
         }
 
-        let auth_addr = if self
-            .udp_socket
-            .get_socket_by_public_key(&public_key)
-            .is_some()
-        {
-            None
-        } else {
-            let Ok(peer_discovery) = self.peer_disc_driver.lock() else {
-                return;
-            };
-            let node_id = item.recipient.node_id();
-            let Some(addr) = peer_discovery
-                .get_name_record(node_id)
-                .map(|record| SocketAddr::V4(record.authenticated_udp_address()))
-                .or_else(|| {
-                    peer_discovery
-                        .get_known_auth_udp_addrs()
-                        .get(node_id)
-                        .copied()
-                })
-            else {
-                warn!(peer = ?item.recipient.node_id(), "authenticated UDP address unknown");
-                return;
-            };
-            Some(addr)
+        let Ok(peer_discovery) = self.peer_disc_driver.lock() else {
+            return;
         };
+        let node_id = item.recipient.node_id();
+        let Some(auth_addr) = peer_discovery
+            .get_name_record(node_id)
+            .map(|record| SocketAddr::V4(record.authenticated_udp_address()))
+            .or_else(|| {
+                peer_discovery
+                    .get_known_auth_udp_addrs()
+                    .get(node_id)
+                    .copied()
+            })
+        else {
+            warn!(peer = ?node_id, "authenticated UDP address unknown");
+            return;
+        };
+        drop(peer_discovery);
 
         self.udp_socket
             .write(&public_key, auth_addr, item.payload, stride, self.priority);
@@ -1905,27 +1873,23 @@ fn rebroadcast_packet<ST, PD, AP>(
     AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     let public_key = target.pubkey();
-    let auth_addr = if udp_socket.get_socket_by_public_key(&public_key).is_some() {
-        None
-    } else {
-        let Ok(peer_discovery) = peer_discovery_driver.lock() else {
-            return;
-        };
-        let Some(addr) = peer_discovery
-            .get_name_record(target)
-            .map(|record| SocketAddr::V4(record.authenticated_udp_address()))
-            .or_else(|| {
-                peer_discovery
-                    .get_known_auth_udp_addrs()
-                    .get(target)
-                    .copied()
-            })
-        else {
-            warn!(?target, "authenticated UDP address unknown");
-            return;
-        };
-        Some(addr)
+    let Ok(peer_discovery) = peer_discovery_driver.lock() else {
+        return;
     };
+    let Some(auth_addr) = peer_discovery
+        .get_name_record(target)
+        .map(|record| SocketAddr::V4(record.authenticated_udp_address()))
+        .or_else(|| {
+            peer_discovery
+                .get_known_auth_udp_addrs()
+                .get(target)
+                .copied()
+        })
+    else {
+        warn!(?target, "authenticated UDP address unknown");
+        return;
+    };
+    drop(peer_discovery);
 
     udp_socket.write(
         &public_key,

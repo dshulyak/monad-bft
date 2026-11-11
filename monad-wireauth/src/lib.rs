@@ -24,6 +24,7 @@ mod error;
 mod filter;
 mod metrics;
 mod state;
+mod writer;
 
 pub use api::API;
 pub use config::{Config, DEFAULT_RETRY_ATTEMPTS, RETRY_ALWAYS};
@@ -32,3 +33,4 @@ pub use error::{Error, Result};
 pub use metrics::{MetricNames, DEFAULT_METRICS};
 pub use monad_secp::PubKey as PublicKey;
 pub use protocol::{crypto, messages};
+pub use writer::{PacketWriter, Writer, WriterError};

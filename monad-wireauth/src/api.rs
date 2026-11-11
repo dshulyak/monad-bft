@@ -32,12 +32,14 @@ use crate::{
     error::{Error, Result},
     filter::{Filter, FilterAction},
     messages::MacMessage,
-    metrics::{init_api_executor_metrics, MetricNames},
+    metrics::{init_api_executor_metrics, ApiMetrics, MetricNames},
     protocol::messages::{
         ControlPacket, CookieReply, DataPacket, DataPacketHeader, HandshakeInitiation,
         HandshakeResponse, Plaintext,
     },
-    session::{InitiatorState, RenewedTimer, ResponderState, SessionError, SessionIndex},
+    session::{
+        InitiatorState, RenewedTimer, ResponderState, SessionError, SessionIndex, TransportState,
+    },
     state::State,
 };
 
@@ -53,7 +55,7 @@ pub struct API<C: Context, K: AsRef<monad_secp::KeyPair> = monad_secp::KeyPair, 
     filter: Filter,
     context: C,
     metrics: ExecutorMetrics,
-    metric_names: &'static MetricNames,
+    gauges: ApiMetrics,
     last_tick: Option<Duration>,
     connect_rate_counter: u64,
     connect_rate_last_reset: Duration,
@@ -67,6 +69,8 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         local_static_key: K,
         mut context: C,
     ) -> Self {
+        let mut metrics = init_api_executor_metrics(metric_names);
+        let gauges = ApiMetrics::new(&mut metrics, metric_names);
         let local_static_public = local_static_key.as_ref().pubkey();
         let cookies = Cookies::new(
             context.rng(),
@@ -95,8 +99,8 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             cookies,
             filter,
             context,
-            metrics: init_api_executor_metrics(metric_names),
-            metric_names,
+            metrics,
+            gauges,
             last_tick: None,
             connect_rate_counter: 0,
             connect_rate_last_reset: Duration::ZERO,
@@ -116,18 +120,18 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
     /// queue for pacing.
     #[instrument(level = Level::TRACE, skip(self), fields(local_public_key = ?self.local_serialized_public))]
     pub fn next_packet_with_metadata(&mut self) -> Option<(SocketAddr, Bytes, Option<M>)> {
-        self.metrics.gauge(self.metric_names.api_next_packet).inc();
+        self.gauges.api_next_packet.inc();
         let result = self.packet_queue.pop_front();
-        self.metrics
-            .gauge(self.metric_names.state_packet_queue_size)
+        self.gauges
+            .state_packet_queue_size
             .set(self.packet_queue.len() as u64);
         result
     }
 
     fn enqueue_packet(&mut self, addr: SocketAddr, pkt: impl Into<Bytes>, metadata: Option<M>) {
         self.packet_queue.push_back((addr, pkt.into(), metadata));
-        self.metrics
-            .gauge(self.metric_names.state_packet_queue_size)
+        self.gauges
+            .state_packet_queue_size
             .set(self.packet_queue.len() as u64);
     }
 
@@ -151,9 +155,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
 
     fn insert_timer(&mut self, timer: Duration, session_id: SessionIndex) {
         self.timers.insert((timer, session_id));
-        self.metrics
-            .gauge(self.metric_names.state_timers_size)
-            .set(self.timers.len() as u64);
+        self.gauges.state_timers_size.set(self.timers.len() as u64);
     }
 
     fn replace_timer(&mut self, timer: RenewedTimer, session_index: SessionIndex) {
@@ -161,14 +163,12 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             self.timers.remove(&(previous, session_index));
         }
         self.timers.insert((timer.current, session_index));
-        self.metrics
-            .gauge(self.metric_names.state_timers_size)
-            .set(self.timers.len() as u64);
+        self.gauges.state_timers_size.set(self.timers.len() as u64);
     }
 
     #[instrument(level = Level::TRACE, skip(self), fields(local_public_key = ?self.local_serialized_public))]
     pub fn tick(&mut self) {
-        self.metrics.gauge(self.metric_names.api_tick).inc();
+        self.gauges.api_tick.inc();
         let duration_since_start = self.context.duration_since_start();
 
         self.filter.tick(duration_since_start);
@@ -203,9 +203,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
                 .timers
                 .pop_first()
                 .expect("timer disappeared after checking it exists");
-            self.metrics
-                .gauge(self.metric_names.state_timers_size)
-                .set(self.timers.len() as u64);
+            self.gauges.state_timers_size.set(self.timers.len() as u64);
             processed_timers += 1;
 
             if let Some(elapsed) = duration_since_start.checked_sub(duration) {
@@ -237,7 +235,8 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             } else if let Some(s) = self.state.get_responder_mut(&session_id) {
                 s.tick(duration_since_start)
                     .map(|(timer, r)| (timer, None, r.rekey, Some(r.terminated)))
-            } else if let Some(transport) = self.state.get_transport_mut(&session_id) {
+            } else if let Some(transport) = self.state.transport_session(&session_id) {
+                let mut transport = transport.borrow_mut();
                 Some(transport.tick(self.context.rng(), &self.config, duration_since_start))
             } else {
                 None
@@ -248,9 +247,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             };
 
             if let Some(message) = message {
-                self.metrics
-                    .gauge(self.metric_names.enqueued_keepalive)
-                    .inc();
+                self.gauges.enqueued_keepalive.inc();
                 self.enqueue_packet(message.remote_addr, message.header, None);
             }
 
@@ -261,9 +258,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
                     rekey.stored_cookie,
                     rekey.retry_attempts,
                 ) {
-                    self.metrics
-                        .gauge(self.metric_names.enqueued_handshake_init)
-                        .inc();
+                    self.gauges.enqueued_handshake_init.inc();
                     self.enqueue_packet(rekey.remote_addr, message, None);
                     self.insert_timer(timer, new_session_index);
                 }
@@ -302,13 +297,13 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         remote_addr: SocketAddr,
         retry_attempts: u64,
     ) -> Result<()> {
-        self.metrics.gauge(self.metric_names.api_connect).inc();
+        self.gauges.api_connect.inc();
         debug!(retry_attempts, "initiating connection");
 
         self.check_connect_rate_limit()?;
         let initiated_count = self.state.initiated_sessions_count();
         if initiated_count >= self.config.max_initiated_sessions {
-            self.metrics.gauge(self.metric_names.error_connect).inc();
+            self.gauges.error_connect.inc();
             return Err(Error::TooManyInitiatedSessions {
                 limit: self.config.max_initiated_sessions,
             });
@@ -323,12 +318,10 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         let (local_index, timer, message) = self
             .init_session_with_cookie(remote_static_key, remote_addr, cookie, retry_attempts)
             .inspect_err(|_| {
-                self.metrics.gauge(self.metric_names.error_connect).inc();
+                self.gauges.error_connect.inc();
             })?;
 
-        self.metrics
-            .gauge(self.metric_names.enqueued_handshake_init)
-            .inc();
+        self.gauges.enqueued_handshake_init.inc();
         self.enqueue_packet(remote_addr, message, None);
         self.insert_timer(timer, local_index);
 
@@ -344,10 +337,8 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         }
 
         if self.connect_rate_counter >= self.config.connect_rate_limit {
-            self.metrics
-                .gauge(self.metric_names.rate_limit_connect)
-                .inc();
-            self.metrics.gauge(self.metric_names.error_connect).inc();
+            self.gauges.rate_limit_connect.inc();
+            self.gauges.error_connect.inc();
             return Err(Error::ConnectRateLimited {
                 limit: self.config.connect_rate_limit,
                 interval: self.config.connect_rate_reset_interval,
@@ -369,9 +360,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
 
         // reservation should be committed when code is no longer fallible
         let reservation = self.state.reserve_session_index().ok_or_else(|| {
-            self.metrics
-                .gauge(self.metric_names.error_session_exhausted)
-                .inc();
+            self.gauges.error_session_exhausted.inc();
             Error::SessionIndexExhausted
         })?;
         trace!(local_session_id=?reservation.index(), "allocating session index for new connection");
@@ -424,14 +413,12 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
                     message,
                     duration_since_start,
                 );
-                self.metrics
-                    .gauge(self.metric_names.enqueued_cookie_reply)
-                    .inc();
+                self.gauges.enqueued_cookie_reply.inc();
                 self.enqueue_packet(remote_addr, reply, None);
                 false
             }
             FilterAction::Drop => {
-                self.metrics.gauge(self.metric_names.rate_limit_drop).inc();
+                self.gauges.rate_limit_drop.inc();
                 false
             }
         }
@@ -447,9 +434,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             &self.local_static_key.as_ref().pubkey(),
         )
         .inspect_err(|_| {
-            self.metrics
-                .gauge(self.metric_names.error_mac1_verification_failed)
-                .inc();
+            self.gauges.error_mac1_verification_failed.inc();
         })?;
 
         if !self.is_under_load(
@@ -466,9 +451,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         let validated_init =
             ResponderState::validate_init(self.local_static_key.as_ref(), handshake_packet)
                 .inspect_err(|_| {
-                    self.metrics
-                        .gauge(self.metric_names.error_handshake_init_validation)
-                        .inc();
+                    self.gauges.error_handshake_init_validation.inc();
                 })?;
 
         let remote_key = validated_init.remote_public_key;
@@ -477,9 +460,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             .get_max_timestamp(&remote_key)
             .is_some_and(|max| validated_init.timestamp <= max)
         {
-            self.metrics
-                .gauge(self.metric_names.error_timestamp_replay)
-                .inc();
+            self.gauges.error_timestamp_replay.inc();
             debug!(?remote_addr, ?remote_key, "timestamp replay detected");
             return Err(Error::TimestampReplay);
         }
@@ -492,9 +473,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         // Reservation should be committed only when code is no longer fallible
         // TODO(dshulyak): Get rid of reservation; code was refactored to be non-fallible when index is allocated
         let reservation = self.state.reserve_session_index().ok_or_else(|| {
-            self.metrics
-                .gauge(self.metric_names.error_session_exhausted)
-                .inc();
+            self.gauges.error_session_exhausted.inc();
             Error::SessionIndexExhausted
         })?;
         let local_index = reservation.index();
@@ -513,9 +492,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         self.state
             .insert_responder(local_index, session, remote_key);
 
-        self.metrics
-            .gauge(self.metric_names.enqueued_handshake_response)
-            .inc();
+        self.gauges.enqueued_handshake_response.inc();
         self.enqueue_packet(remote_addr, message, None);
         self.insert_timer(timer, local_index);
 
@@ -527,15 +504,11 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
 
         if let Some(session) = self.state.get_initiator_mut(&receiver_session_index) {
             session.handle_cookie(cookie_reply).inspect_err(|_| {
-                self.metrics
-                    .gauge(self.metric_names.error_cookie_reply)
-                    .inc();
+                self.gauges.error_cookie_reply.inc();
             })?;
         } else if let Some(session) = self.state.get_responder_mut(&receiver_session_index) {
             session.handle_cookie(cookie_reply).inspect_err(|_| {
-                self.metrics
-                    .gauge(self.metric_names.error_cookie_reply)
-                    .inc();
+                self.gauges.error_cookie_reply.inc();
             })?;
         }
         Ok(())
@@ -551,44 +524,32 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         control: ControlPacket,
         remote_addr: SocketAddr,
     ) -> Result<()> {
-        self.metrics
-            .gauge(self.metric_names.api_dispatch_control)
-            .inc();
+        self.gauges.api_dispatch_control.inc();
         let result = match control {
             ControlPacket::HandshakeInitiation(handshake) => {
                 debug!("processing handshake initiation");
-                self.metrics
-                    .gauge(self.metric_names.dispatch_handshake_init)
-                    .inc();
+                self.gauges.dispatch_handshake_init.inc();
                 self.accept_handshake_init(handshake, remote_addr)
             }
             ControlPacket::HandshakeResponse(response) => {
                 debug!("processing handshake response");
-                self.metrics
-                    .gauge(self.metric_names.dispatch_handshake_response)
-                    .inc();
+                self.gauges.dispatch_handshake_response.inc();
                 self.complete_handshake(response, remote_addr)
             }
             ControlPacket::CookieReply(cookie_reply) => {
                 debug!("processing cookie reply");
-                self.metrics
-                    .gauge(self.metric_names.dispatch_cookie_reply)
-                    .inc();
+                self.gauges.dispatch_cookie_reply.inc();
                 self.accept_cookie(cookie_reply)
             }
             ControlPacket::Keepalive(data_packet) => {
                 trace!("processing keepalive packet");
-                self.metrics
-                    .gauge(self.metric_names.dispatch_keepalive)
-                    .inc();
+                self.gauges.dispatch_keepalive.inc();
                 self.decrypt(data_packet, remote_addr)?;
                 Ok(())
             }
         };
         if result.is_err() {
-            self.metrics
-                .gauge(self.metric_names.error_dispatch_control)
-                .inc();
+            self.gauges.error_dispatch_control.inc();
         }
         result
     }
@@ -600,21 +561,23 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         data_packet: DataPacket<'a>,
         remote_addr: SocketAddr,
     ) -> Result<(Plaintext<'a>, PubKey)> {
-        self.metrics.gauge(self.metric_names.api_decrypt).inc();
+        self.gauges.api_decrypt.inc();
         let receiver_index = data_packet.header().receiver_index.into();
         let nonce: u64 = data_packet.header().nonce.into();
         trace!(local_session_id=?receiver_index, nonce, "decrypting data packet");
 
         let (remote_public_key, plaintext) = if let Some(transport) =
-            self.state.get_transport_mut(&receiver_index)
+            self.state.transport_session(&receiver_index)
         {
+            let mut transport = transport.borrow_mut();
             let duration_since_start = self.context.duration_since_start();
             let (timer, plaintext) = transport
                 .decrypt(&self.config, duration_since_start, data_packet)
                 .inspect_err(|e| {
-                    track_decrypt_error_metrics(&mut self.metrics, self.metric_names, e);
+                    track_decrypt_error_metrics(&self.gauges, e);
                 })?;
             let remote_public_key = transport.remote_public_key;
+            drop(transport);
             self.replace_timer(timer, receiver_index);
             (remote_public_key, plaintext)
         } else if let Some(responder) = self.state.get_responder_mut(&receiver_index) {
@@ -632,21 +595,17 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
                     debug!(local_session_id=?receiver_index, "responder session established");
                     self.state.insert_transport(receiver_index, transport);
                     self.timers.insert((establish_timer, receiver_index));
-                    self.metrics
-                        .gauge(self.metric_names.state_timers_size)
-                        .set(self.timers.len() as u64);
+                    self.gauges.state_timers_size.set(self.timers.len() as u64);
                     (remote_public_key, plaintext)
                 }
                 Err(e) => {
-                    track_decrypt_error_metrics(&mut self.metrics, self.metric_names, &e);
+                    track_decrypt_error_metrics(&self.gauges, &e);
                     return Err(e.into());
                 }
             }
         } else {
-            self.metrics.gauge(self.metric_names.error_decrypt).inc();
-            self.metrics
-                .gauge(self.metric_names.error_session_index_not_found)
-                .inc();
+            self.gauges.error_decrypt.inc();
+            self.gauges.error_session_index_not_found.inc();
             return Err(Error::SessionIndexNotFound {
                 index: receiver_index,
             });
@@ -664,9 +623,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         // All validators and other fallible actions must be done before removing the initiator from state.
         crate::protocol::crypto::verify_mac1(response, &self.local_static_key.as_ref().pubkey())
             .inspect_err(|_| {
-                self.metrics
-                    .gauge(self.metric_names.error_mac1_verification_failed)
-                    .inc();
+                self.gauges.error_mac1_verification_failed.inc();
             })?;
 
         if !self.is_under_load(remote_addr, response.sender_index.get(), response) {
@@ -680,18 +637,14 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             .state
             .get_initiator_mut(&receiver_session_index)
             .ok_or_else(|| {
-                self.metrics
-                    .gauge(self.metric_names.error_session_index_not_found)
-                    .inc();
+                self.gauges.error_session_index_not_found.inc();
                 Error::InvalidReceiverIndex {
                     index: receiver_session_index,
                 }
             })?;
         let expected_remote_addr = initiator.remote_addr;
         if remote_addr != expected_remote_addr {
-            self.metrics
-                .gauge(self.metric_names.error_handshake_response_validation)
-                .inc();
+            self.gauges.error_handshake_response_validation.inc();
             return Err(Error::HandshakeResponseAddressMismatch {
                 expected: expected_remote_addr,
                 actual: remote_addr,
@@ -701,9 +654,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         let validated_response = initiator
             .validate_response(&self.config, self.local_static_key.as_ref(), response)
             .inspect_err(|_| {
-                self.metrics
-                    .gauge(self.metric_names.error_handshake_response_validation)
-                    .inc();
+                self.gauges.error_handshake_response_validation.inc();
             })?;
 
         // Code should not be fallible after this point
@@ -737,22 +688,22 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
 
             let transport = self
                 .state
-                .get_transport_mut(&receiver_session_index)
+                .transport_session(&receiver_session_index)
                 .expect("transport was just inserted");
+            let mut transport = transport.borrow_mut();
             let (header, timer) = transport.encrypt(
                 self.context.rng(),
                 &self.config,
                 duration_since_start,
                 &mut packet[DataPacketHeader::SIZE..],
-            );
+            )?;
             packet[..DataPacketHeader::SIZE].copy_from_slice(header.as_bytes());
 
+            drop(transport);
             self.replace_timer(timer, receiver_session_index);
             self.enqueue_packet(remote_addr, packet.freeze(), metadata);
             if is_buffered {
-                self.metrics
-                    .gauge(self.metric_names.initiator_messages_sent_from_buffer)
-                    .inc();
+                self.gauges.initiator_messages_sent_from_buffer.inc();
             }
         }
 
@@ -766,29 +717,82 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         public_key: &monad_secp::PubKey,
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
-        self.metrics
-            .gauge(self.metric_names.api_encrypt_by_public_key)
-            .inc();
-        let transport = self
+        self.encrypt_for_peer(public_key, None, plaintext)
+    }
+
+    /// Resolve the current peer session once, including destination validation.
+    /// The handle is local to this synchronous call, never cached on a packet.
+    pub fn encrypt_for_peer(
+        &mut self,
+        public_key: &monad_secp::PubKey,
+        expected_addr: Option<SocketAddr>,
+        plaintext: &mut [u8],
+    ) -> Result<DataPacketHeader> {
+        self.encrypt_for_peer_with(public_key, expected_addr, |transport, context, config| {
+            let now = context.duration_since_start();
+            transport.encrypt(context.rng(), config, now, plaintext)
+        })
+    }
+
+    /// Encrypt shared plaintext into caller-owned output with one session lookup.
+    pub fn encrypt_for_peer_into(
+        &mut self,
+        public_key: &monad_secp::PubKey,
+        expected_addr: Option<SocketAddr>,
+        plaintext: &[u8],
+        ciphertext: &mut [u8],
+    ) -> Result<DataPacketHeader> {
+        assert_eq!(plaintext.len(), ciphertext.len());
+        self.encrypt_for_peer_with(public_key, expected_addr, |transport, context, config| {
+            let now = context.duration_since_start();
+            transport.encrypt_into(context.rng(), config, now, plaintext, ciphertext)
+        })
+    }
+
+    /// Resolve and validate one session generation for a paced send. Activity
+    /// bookkeeping runs here; the returned capability can encrypt on a worker.
+    pub fn writer_for_peer(
+        &mut self,
+        public_key: &monad_secp::PubKey,
+        expected_addr: Option<SocketAddr>,
+        plaintext_len: usize,
+    ) -> Result<crate::Writer> {
+        self.encrypt_for_peer_with(public_key, expected_addr, |transport, context, config| {
+            let now = context.duration_since_start();
+            transport.writer(context.rng(), config, now, plaintext_len)
+        })
+    }
+
+    fn encrypt_for_peer_with<T>(
+        &mut self,
+        public_key: &monad_secp::PubKey,
+        expected_addr: Option<SocketAddr>,
+        encrypt: impl FnOnce(
+            &mut TransportState,
+            &mut C,
+            &Config,
+        ) -> std::result::Result<(T, RenewedTimer), crate::WriterError>,
+    ) -> Result<T> {
+        self.gauges.api_encrypt_by_public_key.inc();
+        let session = self
             .state
-            .get_transport_by_public_key(public_key)
+            .transport_by_public_key(public_key)
             .ok_or_else(|| {
-                self.metrics
-                    .gauge(self.metric_names.error_encrypt_by_public_key)
-                    .inc();
-                self.metrics
-                    .gauge(self.metric_names.error_session_not_found)
-                    .inc();
+                self.gauges.error_encrypt_by_public_key.inc();
+                self.gauges.error_session_not_found.inc();
                 Error::SessionNotFound
             })?;
-        let duration_since_start = self.context.duration_since_start();
-        let (header, timer) = transport.encrypt(
-            self.context.rng(),
-            &self.config,
-            duration_since_start,
-            plaintext,
-        );
+        let mut transport = session.borrow_mut();
+        if expected_addr.is_some_and(|addr| addr != transport.remote_addr) {
+            self.gauges.error_encrypt_by_public_key.inc();
+            return Err(Error::SessionNotEstablishedForAddress {
+                addr: expected_addr.unwrap(),
+            });
+        }
+        let (header, timer) = encrypt(&mut transport, &mut self.context, &self.config)
+            .inspect_err(|_| self.gauges.error_encrypt_by_public_key.inc())?;
         let session_id = transport.common.local_index;
+        drop(transport);
         self.replace_timer(timer, session_id);
         Ok(header)
     }
@@ -800,26 +804,21 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
         socket_addr: &SocketAddr,
         plaintext: &mut [u8],
     ) -> Result<DataPacketHeader> {
-        self.metrics
-            .gauge(self.metric_names.api_encrypt_by_socket)
-            .inc();
-        let transport = self
-            .state
-            .get_transport_by_socket(socket_addr)
-            .ok_or_else(|| {
-                self.metrics
-                    .gauge(self.metric_names.error_encrypt_by_socket)
-                    .inc();
-                Error::SessionNotEstablishedForAddress { addr: *socket_addr }
-            })?;
+        self.gauges.api_encrypt_by_socket.inc();
+        let transport = self.state.transport_by_socket(socket_addr).ok_or_else(|| {
+            self.gauges.error_encrypt_by_socket.inc();
+            Error::SessionNotEstablishedForAddress { addr: *socket_addr }
+        })?;
+        let mut transport = transport.borrow_mut();
         let duration_since_start = self.context.duration_since_start();
         let (header, timer) = transport.encrypt(
             self.context.rng(),
             &self.config,
             duration_since_start,
             plaintext,
-        );
+        )?;
         let session_id = transport.common.local_index;
+        drop(transport);
         self.replace_timer(timer, session_id);
         Ok(header)
     }
@@ -840,18 +839,14 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
             .ok_or(Error::SessionNotFound)?;
         let new_size = initiator.buffered_bytes().saturating_add(message.len());
         if new_size > self.config.max_buffered_bytes_per_session {
-            self.metrics
-                .gauge(self.metric_names.error_buffer_limit_exceeded)
-                .inc();
+            self.gauges.error_buffer_limit_exceeded.inc();
             return Err(Error::BufferLimitExceeded {
                 size: new_size,
                 limit: self.config.max_buffered_bytes_per_session,
             });
         }
         initiator.buffer_message(message, metadata);
-        self.metrics
-            .gauge(self.metric_names.initiator_buffered_messages)
-            .inc();
+        self.gauges.initiator_buffered_messages.inc();
         trace!(
             buffered_message_count = initiator.buffered_message_count(),
             public_key = ?CompressedPublicKey::from(public_key),
@@ -863,7 +858,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>, M> API<C, K, M> {
     /// Disconnects and removes all sessions with the given public key.
     #[instrument(level = Level::TRACE, skip(self, public_key), fields(local_public_key = ?self.local_serialized_public))]
     pub fn disconnect(&mut self, public_key: &monad_secp::PubKey) {
-        self.metrics.gauge(self.metric_names.api_disconnect).inc();
+        self.gauges.api_disconnect.inc();
         self.state.terminate_by_public_key(public_key);
     }
 
@@ -957,25 +952,17 @@ impl std::fmt::Debug for CompressedPublicKey {
     }
 }
 
-fn track_decrypt_error_metrics(
-    metrics: &mut ExecutorMetrics,
-    metric_names: &'static MetricNames,
-    e: &SessionError,
-) {
-    metrics.gauge(metric_names.error_decrypt).inc();
+fn track_decrypt_error_metrics(metrics: &ApiMetrics, e: &SessionError) {
+    metrics.error_decrypt.inc();
     match e {
         SessionError::NonceOutsideWindow { .. } => {
-            metrics
-                .gauge(metric_names.error_decrypt_nonce_outside_window)
-                .inc();
+            metrics.error_decrypt_nonce_outside_window.inc();
         }
         SessionError::NonceDuplicate { .. } => {
-            metrics
-                .gauge(metric_names.error_decrypt_nonce_duplicate)
-                .inc();
+            metrics.error_decrypt_nonce_duplicate.inc();
         }
         SessionError::InvalidMac(_) => {
-            metrics.gauge(metric_names.error_decrypt_mac).inc();
+            metrics.error_decrypt_mac.inc();
         }
         _ => {
             warn!(error=?e, "unexpected decrypt error variant");

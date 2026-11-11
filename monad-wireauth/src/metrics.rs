@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use monad_executor::{ExecutorMetrics, MetricDef};
+use monad_executor::{ExecutorMetrics, Gauge, MetricDef};
 
 pub struct MetricNames {
     pub state_initiating_sessions: &'static MetricDef,
@@ -454,3 +454,82 @@ macro_rules! define_metric_names {
 define_metric_names!(pub(crate) DEFAULT_METRIC_NAMES, "udp");
 
 pub static DEFAULT_METRICS: &MetricNames = &DEFAULT_METRIC_NAMES;
+
+// Resolve metric names once; packet processing only touches cached handles.
+macro_rules! cached_metrics {
+    ($name:ident { $($field:ident),+ $(,)? }) => {
+        pub(crate) struct $name { $(pub(crate) $field: Gauge,)+ }
+        impl $name {
+            pub(crate) fn new(metrics: &mut ExecutorMetrics, names: &'static MetricNames) -> Self {
+                Self { $($field: metrics.gauge(names.$field).clone(),)+ }
+            }
+        }
+    };
+}
+
+cached_metrics! { ApiMetrics {
+    state_timers_size,
+    state_packet_queue_size,
+    api_connect,
+    api_decrypt,
+    api_encrypt_by_public_key,
+    api_encrypt_by_socket,
+    api_disconnect,
+    api_dispatch_control,
+    api_next_packet,
+    api_tick,
+    dispatch_handshake_init,
+    dispatch_handshake_response,
+    dispatch_cookie_reply,
+    dispatch_keepalive,
+    error_connect,
+    error_decrypt,
+    error_decrypt_nonce_outside_window,
+    error_decrypt_nonce_duplicate,
+    error_decrypt_mac,
+    error_encrypt_by_public_key,
+    error_encrypt_by_socket,
+    error_dispatch_control,
+    error_session_exhausted,
+    error_buffer_limit_exceeded,
+    error_mac1_verification_failed,
+    error_timestamp_replay,
+    error_session_not_found,
+    error_session_index_not_found,
+    error_handshake_init_validation,
+    error_cookie_reply,
+    error_handshake_response_validation,
+    enqueued_handshake_init,
+    enqueued_handshake_response,
+    enqueued_cookie_reply,
+    enqueued_keepalive,
+    rate_limit_drop,
+    rate_limit_connect,
+    initiator_buffered_messages,
+    initiator_messages_sent_from_buffer,
+} }
+
+cached_metrics! { StateMetrics {
+    state_initiating_sessions,
+    state_responding_sessions,
+    state_transport_sessions,
+    state_total_sessions,
+    state_allocated_indices,
+    state_sessions_by_public_key,
+    state_sessions_by_socket,
+    state_session_index_allocated,
+    state_session_established_initiator,
+    state_session_established_responder,
+    state_session_terminated,
+    state_initiated_session_by_peer_size,
+    state_accepted_sessions_by_peer_size,
+    state_ip_session_counts_size,
+    initiator_messages_dropped_from_buffer,
+} }
+
+cached_metrics! { FilterMetrics {
+    filter_pass,
+    filter_send_cookie,
+    filter_drop,
+    filter_ip_request_history_size,
+} }

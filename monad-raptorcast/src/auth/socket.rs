@@ -22,7 +22,7 @@ use std::{
 use bytes::Bytes;
 use monad_crypto::certificate_signature::PubKey;
 use monad_dataplane::{RecvUdpMsg, UdpSocketHandle};
-use monad_executor::{ExecutorMetrics, ExecutorMetricsChain, MetricDef};
+use monad_executor::{ExecutorMetrics, ExecutorMetricsChain, Gauge};
 use monad_peer_score::IdentityScore;
 use monad_types::{NodeId, UdpPriority};
 use thiserror::Error;
@@ -54,8 +54,8 @@ pub struct AuthRecvMsg<P: PubKey> {
 pub struct AuthenticatedSocketHandle<AP: AuthenticationProtocol<PublicKey: PubKey>> {
     socket: monad_dataplane::auth::AuthenticatedUdpSocket<AP>,
     metrics: ExecutorMetrics,
-    bytes_written_metric: &'static MetricDef,
-    bytes_read_metric: &'static MetricDef,
+    bytes_written: Gauge,
+    bytes_read: Gauge,
     receive_buffer: Vec<RecvUdpMsg<AP::PublicKey>>,
 }
 impl<AP: AuthenticationProtocol<PublicKey: PubKey>> Unpin for AuthenticatedSocketHandle<AP> {}
@@ -74,18 +74,31 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> RecvMany for AuthenticatedSo
 }
 impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP> {
     pub fn new(socket: UdpSocketHandle<AP::PublicKey>, protocol: AP) -> Self {
+        let mut metrics = init_socket_executor_metrics();
+        let bytes_written = metrics
+            .gauge(GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN)
+            .clone();
+        let bytes_read = metrics
+            .gauge(GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ)
+            .clone();
         Self {
             socket: monad_dataplane::auth::AuthenticatedUdpSocket::new(socket, protocol),
-            metrics: init_socket_executor_metrics(),
-            bytes_written_metric: GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
-            bytes_read_metric: GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ,
+            metrics,
+            bytes_written,
+            bytes_read,
             receive_buffer: Vec::with_capacity(RECEIVE_BATCH_SIZE),
         }
     }
     fn with_direct_metrics(mut self) -> Self {
         self.metrics = init_direct_udp_executor_metrics();
-        self.bytes_written_metric = GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_WRITTEN;
-        self.bytes_read_metric = GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_READ;
+        self.bytes_written = self
+            .metrics
+            .gauge(GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_WRITTEN)
+            .clone();
+        self.bytes_read = self
+            .metrics
+            .gauge(GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_READ)
+            .clone();
         self
     }
     pub fn segment_size(&self, mtu: u16) -> u16 {
@@ -94,7 +107,7 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
     pub fn write(
         &mut self,
         public_key: &AP::PublicKey,
-        addr: Option<SocketAddr>,
+        addr: SocketAddr,
         msg: Bytes,
         stride: u16,
         priority: UdpPriority,
@@ -104,7 +117,7 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
     fn try_write(
         &mut self,
         public_key: &AP::PublicKey,
-        addr: Option<SocketAddr>,
+        addr: SocketAddr,
         msg: Bytes,
         stride: u16,
         priority: UdpPriority,
@@ -112,9 +125,7 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
         let bytes = msg.len();
         self.socket
             .write(*public_key, addr, msg, stride, priority)?;
-        self.metrics
-            .gauge(self.bytes_written_metric)
-            .add(bytes as u64);
+        self.bytes_written.add(bytes as u64);
         Ok(())
     }
     pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
@@ -131,9 +142,7 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
         if AP::HEADER_SIZE > 0 && message.sender.is_none() {
             return None;
         }
-        self.metrics
-            .gauge(self.bytes_read_metric)
-            .add(message.payload.len() as u64);
+        self.bytes_read.add(message.payload.len() as u64);
         Some(AuthRecvMsg {
             src_addr: message.src_addr,
             payload: message.payload,
@@ -163,26 +172,6 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
             }
         }
         self.receive_buffer = batch;
-    }
-    pub fn is_connected_public_key(&self, public_key: &AP::PublicKey) -> bool {
-        self.socket.is_connected_public_key(public_key)
-    }
-    pub fn is_connected_socket_and_public_key(
-        &self,
-        addr: &SocketAddr,
-        public_key: &AP::PublicKey,
-    ) -> bool {
-        self.socket
-            .is_connected_socket_and_public_key(addr, public_key)
-    }
-    pub fn get_socket_by_public_key(&self, public_key: &AP::PublicKey) -> Option<SocketAddr> {
-        self.socket.get_socket_by_public_key(public_key)
-    }
-    pub fn has_any_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
-        self.socket.has_any_session_by_public_key(public_key)
-    }
-    pub fn has_initiator_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
-        self.socket.has_initiator_session_by_public_key(public_key)
     }
     pub fn connect(
         &mut self,
@@ -313,6 +302,7 @@ where
     pub fn write_buffered(
         &mut self,
         public_key: &AP::PublicKey,
+        addr: SocketAddr,
         plaintext: Bytes,
         priority: UdpPriority,
     ) -> Result<(), ()> {
@@ -330,7 +320,7 @@ where
             }
             let stride = packet.len().try_into().map_err(|_| ())?;
             self.socket
-                .try_write(public_key, None, packet, stride, priority)
+                .try_write(public_key, addr, packet, stride, priority)
                 .map_err(|_| ())?;
         }
 
@@ -352,10 +342,6 @@ where
     }
     pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
         self.socket.set_priority_identities(identities);
-    }
-
-    pub fn has_any_session_by_public_key(&self, public_key: &AP::PublicKey) -> bool {
-        self.socket.has_any_session_by_public_key(public_key)
     }
 
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
@@ -493,29 +479,20 @@ mod tests {
     }
 
     async fn exchange_handshake(peer1: &mut PeerNode, peer2: &mut PeerNode) {
-        let timeout = Duration::from_secs(3);
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < timeout {
-            tokio::select! {
-                result1 = tokio::time::timeout(Duration::from_millis(100), peer1.socket.recv()) => {
-                    if let Ok(Ok(msg)) = result1 {
-                        tracing::info!(src=?msg.src_addr, len=msg.payload.len(), "peer1 received");
-                    }
-                }
-                result2 = tokio::time::timeout(Duration::from_millis(100), peer2.socket.recv()) => {
-                    if let Ok(Ok(msg)) = result2 {
-                        tracing::info!(src=?msg.src_addr, len=msg.payload.len(), "peer2 received");
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    if peer1.socket.is_connected_socket_and_public_key(&peer2.auth_addr, &peer2.public_key) {
-                        tracing::info!("handshake complete");
-                        break;
-                    }
-                }
-            }
-        }
+        let probe = Bytes::from_static(b"handshake ready");
+        peer1.socket.write(
+            &peer2.public_key,
+            peer2.auth_addr,
+            probe.clone(),
+            probe.len() as u16,
+            UdpPriority::High,
+        );
+        let message = tokio::time::timeout(Duration::from_secs(3), peer2.socket.recv())
+            .await
+            .expect("handshake and buffered delivery timeout")
+            .expect("authenticated probe");
+        assert_eq!(message.sender.unwrap().pubkey(), peer1.public_key);
+        assert_eq!(message.payload, probe);
     }
 
     #[tokio::test]
@@ -535,7 +512,7 @@ mod tests {
         for value in 0..144_u64 {
             alice.socket.write(
                 &bob.public_key,
-                Some(bob.auth_addr),
+                bob.auth_addr,
                 Bytes::copy_from_slice(&value.to_le_bytes()),
                 8,
                 UdpPriority::Regular,
@@ -571,7 +548,7 @@ mod tests {
         assert!(messages.is_empty());
         alice.socket.write(
             &bob.public_key,
-            Some(bob.auth_addr),
+            bob.auth_addr,
             Bytes::from_static(b"after cancellation"),
             18,
             UdpPriority::Regular,
@@ -599,7 +576,7 @@ mod tests {
 
         alice.socket.write(
             &bob.public_key,
-            Some(bob_addr),
+            bob_addr,
             Bytes::from_static(b"hello from alice"),
             16,
             UdpPriority::Regular,
@@ -614,7 +591,7 @@ mod tests {
 
         bob.socket.write(
             &alice.public_key,
-            Some(alice_addr),
+            alice_addr,
             Bytes::from_static(b"hello from bob"),
             14,
             UdpPriority::Regular,
@@ -629,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_send_uses_existing_session_without_address() {
+    async fn normal_send_reuses_session_at_supplied_address() {
         let mut alice = PeerNode::new(1);
         let mut bob = PeerNode::new(2);
 
@@ -638,7 +615,7 @@ mod tests {
 
         alice.socket.write(
             &bob.public_key,
-            None,
+            bob.auth_addr,
             Bytes::from_static(b"existing session"),
             16,
             UdpPriority::Regular,
@@ -674,10 +651,11 @@ mod tests {
             1,
         );
         let payload = Bytes::from_static(b"authenticated path");
+        let before = alice.socket.bytes_written.get();
 
         alice.socket.write(
             &bob.public_key,
-            Some(SocketAddr::V4(bob_name_record.authenticated_udp_socket())),
+            SocketAddr::V4(bob_name_record.authenticated_udp_socket()),
             payload.clone(),
             payload.len() as u16,
             UdpPriority::Regular,
@@ -693,7 +671,7 @@ mod tests {
                     .then_some(value)
             })
             .unwrap_or_default();
-        assert_eq!(authenticated_bytes, payload.len() as u64);
+        assert_eq!(authenticated_bytes - before, payload.len() as u64);
     }
 
     #[tokio::test]
@@ -716,7 +694,7 @@ mod tests {
         );
         alice.socket.write(
             &bob.public_key,
-            Some(SocketAddr::V4(record.authenticated_udp_socket())),
+            SocketAddr::V4(record.authenticated_udp_socket()),
             Bytes::from_static(b"buffered"),
             8,
             UdpPriority::Regular,
@@ -763,7 +741,7 @@ mod tests {
         let mut alice = PeerNode::new(1);
         alice.socket.write(
             &bob.public_key,
-            Some(bob.auth_addr),
+            bob.auth_addr,
             Bytes::from_static(b"authenticated"),
             13,
             UdpPriority::Regular,
@@ -835,7 +813,7 @@ mod tests {
 
         alice.socket.write(
             &bob.public_key,
-            Some(SocketAddr::V4(bob_name_record.authenticated_udp_socket())),
+            SocketAddr::V4(bob_name_record.authenticated_udp_socket()),
             Bytes::from_static(b"helloworld"),
             5,
             UdpPriority::Regular,

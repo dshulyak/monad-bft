@@ -1407,3 +1407,177 @@ fn test_gc_terminate_has_no_side_effects() {
     assert!(!peer1.is_connected_public_key(&peer2_pubkey));
     assert!(!peer2.is_connected_public_key(&peer1_pubkey));
 }
+
+#[test]
+fn checked_encrypt_rejects_stale_route_without_consuming_nonce() {
+    let (mut sender, _, _, _) = create_manager();
+    let (mut receiver, key, _, _) = create_manager();
+    let sender_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+    let receiver_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+    sender
+        .connect(key, receiver_addr, DEFAULT_RETRY_ATTEMPTS)
+        .unwrap();
+    dispatch(
+        &mut receiver,
+        &collect::<HandshakeInitiation>(&mut sender),
+        sender_addr,
+    );
+    dispatch(
+        &mut sender,
+        &collect::<HandshakeResponse>(&mut receiver),
+        receiver_addr,
+    );
+    // The handshake confirmation consumes nonce zero.
+    dispatch(
+        &mut receiver,
+        &collect::<DataPacketHeader>(&mut sender),
+        sender_addr,
+    );
+    let plaintext = b"route checked";
+    let mut payload = vec![0xa5; plaintext.len()];
+    assert!(sender
+        .encrypt_for_peer_into(&key, Some(sender_addr), plaintext, &mut payload)
+        .is_err());
+    assert_eq!(payload, vec![0xa5; plaintext.len()]);
+    let header = sender
+        .encrypt_for_peer_into(&key, Some(receiver_addr), plaintext, &mut payload)
+        .unwrap();
+    assert_eq!(header.nonce.get(), 1);
+    let mut packet = header.as_bytes().to_vec();
+    packet.extend_from_slice(&payload);
+    assert_eq!(decrypt(&mut receiver, &packet, sender_addr), plaintext);
+    // Both API indexes must refer to the same nonce/replay state.
+    let header = sender
+        .encrypt_by_socket(&receiver_addr, &mut payload)
+        .unwrap();
+    assert_eq!(header.nonce.get(), 2);
+}
+
+#[test]
+fn shared_writers_follow_session_generations_and_disconnect() {
+    let (mut sender, _, context, _) = create_manager();
+    let (mut receiver, key, _, _) = create_manager();
+    let sender_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+    let receiver_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+    let handshake = |sender: &mut API<TestContext>, receiver: &mut API<TestContext>| {
+        sender
+            .connect(key, receiver_addr, DEFAULT_RETRY_ATTEMPTS)
+            .unwrap();
+        dispatch(
+            receiver,
+            &collect::<HandshakeInitiation>(sender),
+            sender_addr,
+        );
+        dispatch(
+            sender,
+            &collect::<HandshakeResponse>(receiver),
+            receiver_addr,
+        );
+        dispatch(receiver, &collect::<DataPacketHeader>(sender), sender_addr);
+    };
+    handshake(&mut sender, &mut receiver);
+    assert!(sender.writer_for_peer(&key, Some(sender_addr), 7).is_err());
+    let first = sender
+        .writer_for_peer(&key, Some(receiver_addr), 7)
+        .unwrap();
+    let mut packet = vec![0; DataPacketHeader::SIZE + 7];
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| first.encrypt_into(b"payload", &mut packet).unwrap())
+            .join()
+            .unwrap();
+    });
+    assert_eq!(u64::from_le_bytes(packet[8..16].try_into().unwrap()), 1);
+    assert_eq!(decrypt(&mut receiver, &packet, sender_addr), b"payload");
+    let mut legacy = *b"payload";
+    let header = sender
+        .encrypt_by_socket(&receiver_addr, &mut legacy)
+        .unwrap();
+    assert_eq!(header.nonce.get(), 2);
+    let mut legacy_packet = header.as_bytes().to_vec();
+    legacy_packet.extend_from_slice(&legacy);
+    assert_eq!(
+        decrypt(&mut receiver, &legacy_packet, sender_addr),
+        b"payload"
+    );
+
+    context.advance_time(Duration::from_secs(1));
+    handshake(&mut sender, &mut receiver);
+    let second = sender
+        .writer_for_peer(&key, Some(receiver_addr), 7)
+        .unwrap();
+    second.encrypt_into(b"payload", &mut packet).unwrap();
+    assert_eq!(u64::from_le_bytes(packet[8..16].try_into().unwrap()), 1);
+    assert_eq!(decrypt(&mut receiver, &packet, sender_addr), b"payload");
+    first.encrypt_into(b"payload", &mut packet).unwrap();
+    assert_eq!(u64::from_le_bytes(packet[8..16].try_into().unwrap()), 3);
+    assert_eq!(decrypt(&mut receiver, &packet, sender_addr), b"payload");
+    sender.disconnect(&key);
+    for writer in [first, second] {
+        packet.fill(0xa5);
+        assert_eq!(
+            writer.encrypt_into(b"payload", &mut packet),
+            Err(monad_wireauth::WriterError::SessionTerminated)
+        );
+        assert!(packet.iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
+fn dropping_engine_revokes_retained_shared_writer() {
+    let (mut sender, _, _, _) = create_manager();
+    let (mut receiver, key, _, _) = create_manager();
+    let sender_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+    let receiver_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+    sender
+        .connect(key, receiver_addr, DEFAULT_RETRY_ATTEMPTS)
+        .unwrap();
+    dispatch(
+        &mut receiver,
+        &collect::<HandshakeInitiation>(&mut sender),
+        sender_addr,
+    );
+    dispatch(
+        &mut sender,
+        &collect::<HandshakeResponse>(&mut receiver),
+        receiver_addr,
+    );
+    let writer = sender
+        .writer_for_peer(&key, Some(receiver_addr), 0)
+        .unwrap();
+    drop(sender);
+    assert_eq!(
+        writer.encrypt_into(&[], &mut [0; DataPacketHeader::SIZE]),
+        Err(monad_wireauth::WriterError::SessionTerminated)
+    );
+}
+
+#[test]
+fn session_expiry_revokes_retained_shared_writer() {
+    let (mut sender, _, context, config) = create_manager();
+    let (mut receiver, key, _, _) = create_manager();
+    let sender_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+    let receiver_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+    sender
+        .connect(key, receiver_addr, DEFAULT_RETRY_ATTEMPTS)
+        .unwrap();
+    dispatch(
+        &mut receiver,
+        &collect::<HandshakeInitiation>(&mut sender),
+        sender_addr,
+    );
+    dispatch(
+        &mut sender,
+        &collect::<HandshakeResponse>(&mut receiver),
+        receiver_addr,
+    );
+    let writer = sender
+        .writer_for_peer(&key, Some(receiver_addr), 0)
+        .unwrap();
+    context.advance_time(config.max_session_duration + Duration::from_secs(1));
+    sender.tick();
+    assert_eq!(
+        writer.encrypt_into(&[], &mut [0; DataPacketHeader::SIZE]),
+        Err(monad_wireauth::WriterError::SessionTerminated)
+    );
+}

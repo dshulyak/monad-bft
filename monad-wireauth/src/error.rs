@@ -24,6 +24,9 @@ use crate::{
 
 #[derive(ThisError, Debug)]
 pub enum Error {
+    #[error("writer error: {0}")]
+    Writer(#[from] crate::WriterError),
+
     #[error("session error: {0}")]
     Session(#[from] SessionError),
 

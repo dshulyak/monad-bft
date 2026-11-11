@@ -52,6 +52,10 @@ macro_rules! define_metrics {
 }
 
 define_metrics! {
+    udp_tx_encrypted_packets => UDP_TX_ENCRYPTED_PACKETS("monad.dataplane.udp.tx.encrypted_packets", "Packets successfully encrypted by UDP transmit workers"),
+    udp_tx_encryption_errors => UDP_TX_ENCRYPTION_ERRORS("monad.dataplane.udp.tx.encryption_errors", "UDP transmit worker encryption failures"),
+    udp_tx_buffer_allocations => UDP_TX_BUFFER_ALLOCATIONS("monad.dataplane.udp.tx.buffer_allocations", "UDP transmit worker output buffer allocations"),
+    udp_tx_commands_during_dispatch_wait => UDP_TX_COMMANDS_DURING_DISPATCH_WAIT("monad.dataplane.udp.tx.commands_during_dispatch_wait", "UDP commands received while waiting for transmit worker capacity"),
     udp_auth_packets_rejected => UDP_AUTH_PACKETS_REJECTED("monad.dataplane.udp.auth.packets_rejected", "Packets rejected by UDP authentication"),
     udp_ingress_queued_bytes => UDP_INGRESS_QUEUED_BYTES("monad.dataplane.udp.ingress.current_queued_bytes", "Accounted UDP receive queue bytes"),
     udp_ingress_packets_dropped => UDP_INGRESS_PACKETS_DROPPED("monad.dataplane.udp.ingress.total_packets_dropped", "Packets dropped from UDP receive queues"),
