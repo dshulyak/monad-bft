@@ -54,3 +54,30 @@ cap because of bounded pacing bursts, scheduling, and counter sampling.
 The throughput tool's `tcp-writer`, `tcp-reader`, and `reader` commands can also be
 run independently; use `--help` for their options. `tcp-reader` is a stream sink,
 so it counts bytes without decoding dataplane frames. It is not a protocol reader.
+
+## Periodic large TCP obligations
+
+To offer 100 MiB of TCP response payload per second alongside approximately
+20 MiB of UDP every 330 ms under one 2 Gbps cap:
+
+```bash
+RUST_LOG=off python3 monad-dataplane/examples/pacing_experiment.py \
+  --output reports/tcp-pacing-periodic --duration 34 \
+  --bandwidth-mbps 2000 --receivers 1 --message-size 1048576 \
+  --tcp-burst-bytes 104857600 --tcp-burst-interval-ms 1000 \
+  --burst-bytes 20971520 --burst-interval-ms 330
+```
+
+`--tcp-burst-bytes` is an aggregate logical obligation, split across TCP targets.
+It is streamed as legal-sized frames controlled by `--message-size` and
+`--in-flight-per-receiver`; it is not a single oversized TCP frame. Each target
+has an independent producer. A slow target accumulates schedule lateness while
+retaining bounded outstanding payload. TCP completion log records include burst
+number, bytes, duration and schedule lateness. `--tcp-priority high` permits an
+equal-priority control; TCP defaults to regular. Omitting `--tcp-burst-bytes`
+retains continuous TCP traffic.
+
+The UDP traffic in this example is synthetic. Testing receive, validation,
+WireAuth and Raptorcast fanout together requires the separate real-rebroadcast
+harness. Pacing accounts for UDP IP/UDP headers and TCP framing, but excludes TCP/IP
+network headers. Short counter windows can also move in whole-frame steps.

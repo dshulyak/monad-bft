@@ -31,7 +31,9 @@ use std::{
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures::{channel::oneshot, executor::block_on, stream::FuturesUnordered, StreamExt};
-use monad_dataplane::{DataplaneBuilder, TcpMsg, TcpSocketId, UdpSocketId, UnicastMsg};
+use monad_dataplane::{
+    DataplaneBuilder, TcpMsg, TcpSocketId, TcpSocketWriter, UdpSocketId, UnicastMsg,
+};
 use monad_executor::ExecutorMetrics;
 use monad_types::UdpPriority;
 use tracing::info;
@@ -180,6 +182,15 @@ struct TcpWriterArgs {
     peer_bandwidth_mbps: Option<NonZeroU64>,
     #[arg(long, default_value = "2")]
     in_flight_per_receiver: usize,
+    #[arg(long, default_value = "regular", value_parser = parse_udp_priority)]
+    tcp_priority: UdpPriority,
+    #[arg(
+        long,
+        help = "aggregate bytes per periodic TCP burst, split across targets; omit for continuous traffic"
+    )]
+    tcp_burst_bytes: Option<usize>,
+    #[arg(long, default_value = "1000")]
+    tcp_burst_interval_ms: NonZeroU64,
     #[arg(long, default_value = "4")]
     udp_tx_workers: usize,
     #[arg(long, value_delimiter = ',')]
@@ -531,6 +542,12 @@ fn run_tcp_writer(options: TcpWriterArgs) {
             .is_some_and(|bytes| bytes <= 4 * 1024 * 1024),
         "outstanding messages must fit the per-peer TCP queue"
     );
+    if let Some(bytes) = options.tcp_burst_bytes {
+        assert!(
+            bytes >= options.target.len(),
+            "TCP bursts must provide at least one byte per target"
+        );
+    }
     assert!((1..=1472).contains(&options.udp_burst_packet_size));
     assert!(options.udp_burst_bytes > 0);
     for (index, target) in options.target.iter().enumerate() {
@@ -591,6 +608,17 @@ fn run_tcp_writer(options: TcpWriterArgs) {
     }
 
     let payload = Bytes::from(vec![0; options.message_size]);
+    if let Some(bytes) = options.tcp_burst_bytes {
+        run_periodic_tcp(
+            tcp_socket.writer().clone(),
+            options.target,
+            payload,
+            options.in_flight_per_receiver,
+            options.tcp_priority,
+            bytes,
+            Duration::from_millis(options.tcp_burst_interval_ms.get()),
+        );
+    }
     block_on(async {
         let submit = |addr| {
             let (complete, completion) = oneshot::channel();
@@ -600,7 +628,7 @@ fn run_tcp_writer(options: TcpWriterArgs) {
                     msg: payload.clone(),
                     completion: Some(complete),
                 },
-                UdpPriority::Regular,
+                options.tcp_priority,
             );
             async move { (addr, completion.await) }
         };
@@ -615,6 +643,86 @@ fn run_tcp_writer(options: TcpWriterArgs) {
             pending.push(submit(addr));
         }
     });
+}
+
+/// Stream a logical burst through bounded legal-sized TCP frames. Each target
+/// has its own producer so a slow peer cannot block all other targets.
+fn run_periodic_tcp(
+    writer: TcpSocketWriter,
+    targets: Vec<SocketAddr>,
+    payload: Bytes,
+    in_flight: usize,
+    priority: UdpPriority,
+    burst_bytes: usize,
+    interval: Duration,
+) -> ! {
+    let epoch = Instant::now();
+    let target_count = targets.len();
+    for (index, target) in targets.into_iter().enumerate() {
+        let writer = writer.clone();
+        let payload = payload.clone();
+        let bytes = burst_bytes / target_count + usize::from(index < burst_bytes % target_count);
+        thread::spawn(move || {
+            let mut next = epoch;
+            let mut burst = 0_u64;
+            loop {
+                thread::sleep(next.saturating_duration_since(Instant::now()));
+                let started = Instant::now();
+                block_on(async {
+                    let submit = |message| {
+                        let (complete, completion) = oneshot::channel();
+                        writer.write_with_priority(
+                            target,
+                            TcpMsg {
+                                msg: message,
+                                completion: Some(complete),
+                            },
+                            priority,
+                        );
+                        completion
+                    };
+                    let mut remaining = bytes;
+                    let mut pending = FuturesUnordered::new();
+                    for _ in 0..in_flight {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let size = remaining.min(payload.len());
+                        remaining -= size;
+                        pending.push(submit(payload.slice(..size)));
+                    }
+                    while let Some(result) = pending.next().await {
+                        if result.is_err() {
+                            eprintln!(
+                                "TCP message to {target} dropped before periodic burst completion"
+                            );
+                            std::process::exit(1);
+                        }
+                        if remaining != 0 {
+                            let size = remaining.min(payload.len());
+                            remaining -= size;
+                            pending.push(submit(payload.slice(..size)));
+                        }
+                    }
+                });
+                info!(
+                    ?target,
+                    burst,
+                    bytes,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    schedule_lateness_ms = started.saturating_duration_since(next).as_millis(),
+                    "TCP burst completed"
+                );
+                // Keep the original schedule. Slow peers accrue schedule delay
+                // rather than allocating an unbounded queue of response payloads.
+                next += interval;
+                burst += 1;
+            }
+        });
+    }
+    loop {
+        thread::park();
+    }
 }
 
 fn run_tcp_reader(bind_addr: SocketAddr, sampling: SamplingArgs) {

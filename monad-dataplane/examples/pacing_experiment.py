@@ -33,7 +33,7 @@ def run(args):
         commands.append(command)
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT,
-            env={**os.environ, "RUST_LOG": "info"},
+            env={**os.environ, "RUST_LOG": os.environ.get("RUST_LOG", "info")},
         )
         processes.append(process)
         csv = args.output / f"{name}.csv"
@@ -62,15 +62,20 @@ def run(args):
             targets.append(target)
         udp_target = address(socket.SOCK_DGRAM)
         start("udp", ["reader", "--bind-addr", udp_target, *sampling("udp")])
-        writer = start("writer", [
+        writer_command = [
             "tcp-writer", ",".join(targets), "--db", args.bandwidth_mbps,
             "--message-size", args.message_size,
+            "--tcp-priority", args.tcp_priority,
             "--udp-burst-target", udp_target,
             "--udp-burst-priority", args.udp_priority,
             "--udp-burst-bytes", args.burst_bytes,
             "--udp-burst-interval-ms", args.burst_interval_ms,
             *sampling("writer"),
-        ])
+        ]
+        if args.tcp_burst_bytes is not None:
+            writer_command.extend(["--tcp-burst-bytes", args.tcp_burst_bytes,
+                                   "--tcp-burst-interval-ms", args.tcp_burst_interval_ms])
+        writer = start("writer", writer_command)
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
             if any(process.poll() is not None for process in processes):
@@ -222,6 +227,10 @@ def main():
     parser.add_argument("--receivers", type=int, default=10)
     parser.add_argument("--bandwidth-mbps", type=int, default=1000)
     parser.add_argument("--message-size", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--tcp-priority", choices=["regular", "high"], default="regular")
+    parser.add_argument("--tcp-burst-bytes", type=int,
+                        help="aggregate logical TCP burst bytes across all receivers; omit for continuous TCP")
+    parser.add_argument("--tcp-burst-interval-ms", type=int, default=1000)
     parser.add_argument("--burst-bytes", type=int, default=50 * 1024 * 1024)
     parser.add_argument("--burst-interval-ms", type=int, default=2000)
     parser.add_argument("--udp-priority", choices=["high", "regular"], default="high")
@@ -229,6 +238,10 @@ def main():
     parser.add_argument("--window-ms", type=float, default=50)
     parser.add_argument("--plot-only", action="store_true")
     args = parser.parse_args()
+    if args.tcp_burst_bytes is not None and args.tcp_burst_bytes < args.receivers:
+        parser.error("TCP bursts must provide at least one byte per receiver")
+    if args.tcp_burst_interval_ms <= 0:
+        parser.error("TCP burst interval must be positive")
     if min(args.receivers, args.bandwidth_mbps, args.message_size, args.burst_bytes,
            args.burst_interval_ms, args.sample_ms, args.window_ms) <= 0:
         parser.error("counts, sizes, rates and intervals must be positive")
