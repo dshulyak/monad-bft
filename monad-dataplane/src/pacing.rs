@@ -54,6 +54,18 @@ pub trait PacingItem {
     }
 }
 
+impl<T: PacingItem> PacingItem for Box<T> {
+    fn queued_bytes(&self) -> usize {
+        (**self).queued_bytes()
+    }
+    fn next_payload_bytes(&self) -> usize {
+        (**self).next_payload_bytes()
+    }
+    fn next_pacing_bytes(&self) -> usize {
+        (**self).next_pacing_bytes()
+    }
+}
+
 impl PacingItem for Bytes {
     fn queued_bytes(&self) -> usize {
         self.len()
@@ -1102,15 +1114,15 @@ mod tests {
     fn udp_memory_accounts_for_remaining_payload_not_next_packet() {
         let metrics = DataplaneMetrics::new();
         let mut queue = PacingQueue::new(rate(UNLIMITED), rate(UNLIMITED), 6, metrics.clone());
-        let message = |bytes| -> crate::UdpMsg {
-            crate::UdpMsg {
+        let message = |bytes| -> Box<crate::UdpMsg> {
+            Box::new(crate::UdpMsg {
                 socket_id: crate::UdpSocketId::Raptorcast,
                 dst: key(1).into(),
                 payload: Bytes::from(vec![0; bytes]),
                 stride: 2,
                 priority: UdpPriority::Regular,
                 encryption: None,
-            }
+            })
         };
         assert!(queue
             .enqueue(key(1), UdpPriority::Regular, message(7))

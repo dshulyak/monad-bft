@@ -560,14 +560,14 @@ impl<I: Identity> UdpSocketHandle<I> {
 impl<I: Identity> UdpSocketWriter<I> {
     pub fn write(&self, dst: SocketAddr, payload: Bytes, stride: u16) {
         let msg_length = payload.len();
-        let result = self.egress_tx.try_send(UdpCommand::Send(UdpMsg {
+        let result = self.egress_tx.try_send(UdpCommand::Send(Box::new(UdpMsg {
             socket_id: self.socket_id,
             dst,
             payload,
             stride,
             priority: UdpPriority::Regular,
             encryption: None,
-        }));
+        })));
 
         match result {
             Ok(()) => {}
@@ -844,19 +844,21 @@ impl BroadcastMsg {
         self,
         socket_id: UdpSocketId,
         priority: UdpPriority,
-    ) -> impl Iterator<Item = UdpMsg<I>> {
+    ) -> impl Iterator<Item = Box<UdpMsg<I>>> {
         let Self {
             targets,
             payload,
             stride,
         } = self;
-        targets.into_iter().map(move |dst| UdpMsg {
-            socket_id,
-            dst,
-            payload: payload.clone(),
-            stride,
-            priority,
-            encryption: None,
+        targets.into_iter().map(move |dst| {
+            Box::new(UdpMsg {
+                socket_id,
+                dst,
+                payload: payload.clone(),
+                stride,
+                priority,
+                encryption: None,
+            })
         })
     }
 }
@@ -876,15 +878,17 @@ impl UnicastMsg {
         self,
         socket_id: UdpSocketId,
         priority: UdpPriority,
-    ) -> impl Iterator<Item = UdpMsg<I>> {
+    ) -> impl Iterator<Item = Box<UdpMsg<I>>> {
         let Self { msgs, stride } = self;
-        msgs.into_iter().map(move |(dst, payload)| UdpMsg {
-            socket_id,
-            dst,
-            payload,
-            stride,
-            priority,
-            encryption: None,
+        msgs.into_iter().map(move |(dst, payload)| {
+            Box::new(UdpMsg {
+                socket_id,
+                dst,
+                payload,
+                stride,
+                priority,
+                encryption: None,
+            })
         })
     }
 }

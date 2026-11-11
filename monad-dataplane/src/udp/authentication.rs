@@ -25,7 +25,7 @@ struct Socket<I: Identity> {
 }
 pub(super) struct Runtime<I: Identity> {
     sockets: [Option<Socket<I>>; 3],
-    ready: [VecDeque<UdpMsg<I>>; 2],
+    ready: [VecDeque<Box<UdpMsg<I>>>; 2],
     ready_bytes: [usize; 2],
     pub(super) ready_limit: usize,
     ready_notify: async_channel::Sender<()>,
@@ -65,7 +65,7 @@ impl<I: Identity> Runtime<I> {
             ingress,
         });
     }
-    fn enqueue(&mut self, output: impl IntoIterator<Item = UdpMsg<I>>) {
+    fn enqueue(&mut self, output: impl IntoIterator<Item = Box<UdpMsg<I>>>) {
         for msg in output {
             let bytes = msg.payload.len() + std::mem::size_of::<UdpMsg<I>>();
             let priority = msg.priority as usize;
@@ -80,7 +80,7 @@ impl<I: Identity> Runtime<I> {
             let _ = self.ready_notify.try_send(());
         }
     }
-    pub(super) fn take_ready(&mut self, limit: usize) -> Vec<UdpMsg<I>> {
+    pub(super) fn take_ready(&mut self, limit: usize) -> Vec<Box<UdpMsg<I>>> {
         let mut result = Vec::with_capacity(limit);
         for _ in 0..limit {
             let Some(msg) = self.ready.iter_mut().find_map(|queue| queue.pop_front()) else {
@@ -113,7 +113,7 @@ impl<I: Identity> Runtime<I> {
         &mut self,
         limit: usize,
         mut capacity: [usize; 2],
-    ) -> Vec<UdpMsg<I>> {
+    ) -> Vec<Box<UdpMsg<I>>> {
         let mut result = Vec::with_capacity(limit);
         for (priority, queue) in self.ready.iter_mut().enumerate() {
             while result.len() < limit {
@@ -147,20 +147,23 @@ impl<I: Identity> Runtime<I> {
                 self.enqueue([msg]);
                 return;
             }
-            UdpCommand::Install(id, backend, installed) => {
+            UdpCommand::Install(installation) => {
+                let (id, backend, installed) = *installation;
                 let (backend, metrics) = backend();
                 self.sockets[id as usize].as_mut().unwrap().backend = Some(backend);
                 let _ = installed.send(metrics);
                 id
             }
-            UdpCommand::Connect(id, key, addr, attempts) => {
+            UdpCommand::Connect(connection) => {
+                let (id, key, addr, attempts) = *connection;
                 if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut()
                 {
                     backend.connect(key, addr, attempts);
                 }
                 id
             }
-            UdpCommand::Plaintext(id, plaintext) => {
+            UdpCommand::Plaintext(plaintext) => {
+                let id = plaintext.socket_id;
                 if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut()
                 {
                     backend.prepare(id, plaintext, &mut output);

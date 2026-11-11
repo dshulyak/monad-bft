@@ -356,23 +356,21 @@ pub(crate) struct Encryption<I: Identity> {
     pub header_size: u16,
 }
 
-pub(crate) struct Plaintext<I: Identity> {
-    pub identity: I,
-    pub address: SocketAddr,
-    pub payload: Bytes,
-    pub stride: u16,
-    pub priority: UdpPriority,
-}
+// Plaintext and paced packets share one allocation. The encryption identity is
+// present on every authenticated plaintext command, even before its session exists.
+pub(crate) type Plaintext<I> = Box<UdpMsg<I>>;
+
+pub(crate) type Installation<I> = (
+    UdpSocketId,
+    BackendInitializer<I>,
+    std::sync::mpsc::SyncSender<Vec<ExecutorMetrics>>,
+);
 
 pub(crate) enum UdpCommand<I: Identity> {
-    Send(UdpMsg<I>),
-    Install(
-        UdpSocketId,
-        BackendInitializer<I>,
-        std::sync::mpsc::SyncSender<Vec<ExecutorMetrics>>,
-    ),
-    Connect(UdpSocketId, I, SocketAddr, u64),
-    Plaintext(UdpSocketId, Plaintext<I>),
+    Send(Box<UdpMsg<I>>),
+    Install(Box<Installation<I>>),
+    Connect(Box<(UdpSocketId, I, SocketAddr, u64)>),
+    Plaintext(Plaintext<I>),
 }
 
 /// The bounded application-to-dataplane command queue has no available slot.
@@ -414,11 +412,11 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
         });
         let (installed, ready) = std::sync::mpsc::sync_channel(1);
         assert!(
-            socket.command(UdpCommand::Install(
+            socket.command(UdpCommand::Install(Box::new((
                 socket.writer.socket_id,
                 backend,
                 installed
-            )),
+            )))),
             "UDP authentication install queue is full"
         );
         let metrics = ready
@@ -444,16 +442,17 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
         }
         assert!(stride > 0);
         self.socket
-            .command(UdpCommand::Plaintext(
-                self.socket.writer.socket_id,
-                Plaintext {
+            .command(UdpCommand::Plaintext(Box::new(UdpMsg {
+                socket_id: self.socket.writer.socket_id,
+                dst: address,
+                payload,
+                stride,
+                priority,
+                encryption: Some(Encryption {
                     identity,
-                    address,
-                    payload,
-                    stride,
-                    priority,
-                },
-            ))
+                    header_size: AP::HEADER_SIZE,
+                }),
+            })))
             .then_some(())
             .ok_or(CommandQueueFull)
     }
@@ -465,12 +464,12 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
         attempts: u64,
     ) -> Result<(), CommandQueueFull> {
         self.socket
-            .command(UdpCommand::Connect(
+            .command(UdpCommand::Connect(Box::new((
                 self.socket.writer.socket_id,
                 identity,
                 address,
                 attempts,
-            ))
+            ))))
             .then_some(())
             .ok_or(CommandQueueFull)
     }
@@ -530,7 +529,7 @@ pub(crate) trait Backend<I: Identity> {
         &mut self,
         socket_id: UdpSocketId,
         plaintext: Plaintext<I>,
-        output: &mut Vec<UdpMsg<I>>,
+        output: &mut Vec<Box<UdpMsg<I>>>,
     );
     fn writer(
         &mut self,
@@ -540,7 +539,7 @@ pub(crate) trait Backend<I: Identity> {
     ) -> Option<monad_wireauth::Writer>;
     fn deadline(&self) -> Option<Instant>;
     fn tick(&mut self);
-    fn drain(&mut self, socket_id: UdpSocketId, output: &mut Vec<UdpMsg<I>>);
+    fn drain(&mut self, socket_id: UdpSocketId, output: &mut Vec<Box<UdpMsg<I>>>);
 }
 
 struct ProtocolBackend<AP: AuthenticationProtocol> {
@@ -555,25 +554,24 @@ struct ProtocolBackend<AP: AuthenticationProtocol> {
 impl<AP: AuthenticationProtocol> ProtocolBackend<AP> {
     fn route(&self, plaintext: &Plaintext<AP::PublicKey>) -> Option<SocketAddr> {
         self.protocol
-            .is_connected_socket_and_public_key(&plaintext.address, &plaintext.identity)
-            .then_some(plaintext.address)
+            .is_connected_socket_and_public_key(
+                &plaintext.dst,
+                &plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+            )
+            .then_some(plaintext.dst)
     }
     fn routed(
         socket_id: UdpSocketId,
-        plaintext: Plaintext<AP::PublicKey>,
+        mut plaintext: Plaintext<AP::PublicKey>,
         addr: SocketAddr,
-    ) -> UdpMsg<AP::PublicKey> {
-        UdpMsg {
-            socket_id,
-            dst: addr,
-            payload: plaintext.payload,
-            stride: plaintext.stride,
-            priority: plaintext.priority,
-            encryption: Some(Encryption {
-                identity: plaintext.identity,
-                header_size: AP::HEADER_SIZE,
-            }),
-        }
+    ) -> Box<UdpMsg<AP::PublicKey>> {
+        debug_assert_eq!(socket_id, plaintext.socket_id);
+        plaintext.dst = addr;
+        plaintext
     }
 }
 
@@ -604,7 +602,7 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
         &mut self,
         socket_id: UdpSocketId,
         plaintext: Plaintext<AP::PublicKey>,
-        output: &mut Vec<UdpMsg<AP::PublicKey>>,
+        output: &mut Vec<Box<UdpMsg<AP::PublicKey>>>,
     ) {
         if let Some(addr) = self.route(&plaintext) {
             output.push(Self::routed(socket_id, plaintext, addr));
@@ -612,9 +610,24 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
         }
         if !self
             .protocol
-            .has_initiator_session_by_socket_and_public_key(&plaintext.address, &plaintext.identity)
+            .has_initiator_session_by_socket_and_public_key(
+                &plaintext.dst,
+                &plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+            )
         {
-            self.connect(plaintext.identity, plaintext.address, 2);
+            self.connect(
+                plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+                plaintext.dst,
+                2,
+            );
         }
         if let Some(addr) = self.route(&plaintext) {
             output.push(Self::routed(socket_id, plaintext, addr));
@@ -622,14 +635,27 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
         }
         if !self
             .protocol
-            .has_initiator_session_by_socket_and_public_key(&plaintext.address, &plaintext.identity)
+            .has_initiator_session_by_socket_and_public_key(
+                &plaintext.dst,
+                &plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+            )
         {
             return;
         }
-        let bytes = plaintext.payload.len() + std::mem::size_of_val(&plaintext);
+        let bytes = plaintext.payload.len() + std::mem::size_of_val(&*plaintext);
         let used = self
             .pending_bytes
-            .get(&plaintext.identity)
+            .get(
+                &plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+            )
             .copied()
             .unwrap_or(0);
         // Handshake buffering stays plaintext outside WireAuth's own buffering,
@@ -640,7 +666,16 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
         {
             return;
         }
-        *self.pending_bytes.entry(plaintext.identity).or_default() += bytes;
+        *self
+            .pending_bytes
+            .entry(
+                plaintext
+                    .encryption
+                    .as_ref()
+                    .expect("authenticated plaintext")
+                    .identity,
+            )
+            .or_default() += bytes;
         self.total_pending += bytes;
         self.pending.push_back(plaintext);
     }
@@ -660,16 +695,16 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
         self.protocol.tick();
         self.pending_ready = true;
     }
-    fn drain(&mut self, socket_id: UdpSocketId, output: &mut Vec<UdpMsg<AP::PublicKey>>) {
+    fn drain(&mut self, socket_id: UdpSocketId, output: &mut Vec<Box<UdpMsg<AP::PublicKey>>>) {
         while let Some((dst, payload)) = self.protocol.next_packet() {
-            output.push(UdpMsg {
+            output.push(Box::new(UdpMsg {
                 socket_id,
                 dst,
                 stride: payload.len().max(1).try_into().unwrap(),
                 payload,
                 priority: UdpPriority::High,
                 encryption: None,
-            });
+            }));
         }
         if !std::mem::take(&mut self.pending_ready) {
             return;
@@ -680,18 +715,37 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
             let has_session = self
                 .protocol
                 .has_initiator_session_by_socket_and_public_key(
-                    &plaintext.address,
-                    &plaintext.identity,
+                    &plaintext.dst,
+                    &plaintext
+                        .encryption
+                        .as_ref()
+                        .expect("authenticated plaintext")
+                        .identity,
                 );
             if route.is_none() && has_session {
                 self.pending.push_back(plaintext);
                 continue;
             }
-            let bytes = plaintext.payload.len() + std::mem::size_of_val(&plaintext);
-            let used = self.pending_bytes.get_mut(&plaintext.identity).unwrap();
+            let bytes = plaintext.payload.len() + std::mem::size_of_val(&*plaintext);
+            let used = self
+                .pending_bytes
+                .get_mut(
+                    &plaintext
+                        .encryption
+                        .as_ref()
+                        .expect("authenticated plaintext")
+                        .identity,
+                )
+                .unwrap();
             *used -= bytes;
             if *used == 0 {
-                self.pending_bytes.remove(&plaintext.identity);
+                self.pending_bytes.remove(
+                    &plaintext
+                        .encryption
+                        .as_ref()
+                        .expect("authenticated plaintext")
+                        .identity,
+                );
             }
             self.total_pending -= bytes;
             if let Some(addr) = route {
@@ -841,13 +895,17 @@ mod tests {
         let mut output = Vec::new();
         backend.prepare(
             UdpSocketId::AuthenticatedRaptorcast,
-            Plaintext {
-                identity: 1,
-                address: destination,
+            Box::new(UdpMsg {
+                socket_id: UdpSocketId::AuthenticatedRaptorcast,
+                dst: destination,
                 payload: Bytes::from_static(b"plaintext"),
                 stride: 9,
                 priority: UdpPriority::Regular,
-            },
+                encryption: Some(Encryption {
+                    identity: 1,
+                    header_size: 8,
+                }),
+            }),
             &mut output,
         );
         assert!(output.is_empty());

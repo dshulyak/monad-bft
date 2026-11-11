@@ -90,7 +90,7 @@ impl<I: Identity> PacingItem for UdpMsg<I> {
     }
 }
 
-impl<I: Identity> Scheduled<UdpMsg<I>> {
+impl<I: Identity> Scheduled<Box<UdpMsg<I>>> {
     pub(crate) fn take_chunk(&mut self) -> Bytes {
         self.item.payload.split_to(
             self.batch_bytes
@@ -405,9 +405,9 @@ async fn rx_multishot_socket<I: Identity>(
 }
 
 fn enqueue_udp_msg<I: Identity>(
-    queue: &mut PacingQueue<UdpMsg<I>>,
+    queue: &mut PacingQueue<Box<UdpMsg<I>>>,
     metrics: &DataplaneMetrics,
-    msg: UdpMsg<I>,
+    msg: Box<UdpMsg<I>>,
 ) {
     let SocketAddr::V4(destination) = msg.dst else {
         metrics.udp_egress_messages_dropped.inc();
@@ -418,7 +418,10 @@ fn enqueue_udp_msg<I: Identity>(
     let _ = queue.enqueue(destination, priority, msg);
 }
 
-fn can_receive_egress<I: Identity>(queue: &PacingQueue<UdpMsg<I>>, runtime: &Runtime<I>) -> bool {
+fn can_receive_egress<I: Identity>(
+    queue: &PacingQueue<Box<UdpMsg<I>>>,
+    runtime: &Runtime<I>,
+) -> bool {
     let pending = runtime.ready_payload_bytes();
     queue
         .remaining_capacity()
@@ -437,7 +440,7 @@ impl<I: Identity> EgressIntake<'_, I> {
     async fn wait<F: Future>(
         &mut self,
         future: F,
-        queue: &mut PacingQueue<UdpMsg<I>>,
+        queue: &mut PacingQueue<Box<UdpMsg<I>>>,
         metrics: &DataplaneMetrics,
         wake: &wake::WakeBridge,
     ) -> F::Output {
@@ -781,15 +784,15 @@ mod tests {
 
     use super::*;
 
-    fn queued_message(value: u8, bytes: usize) -> UdpMsg<()> {
-        UdpMsg {
+    fn queued_message(value: u8, bytes: usize) -> Box<UdpMsg<()>> {
+        Box::new(UdpMsg {
             socket_id: UdpSocketId::Raptorcast,
             dst: "127.0.0.1:1".parse().unwrap(),
             payload: vec![value; bytes].into(),
             stride: bytes.try_into().unwrap(),
             priority: monad_types::UdpPriority::Regular,
             encryption: None,
-        }
+        })
     }
 
     fn paced_message() -> UdpSend {
@@ -992,14 +995,14 @@ mod tests {
         let (dispatch_tx, dispatch_rx) = async_channel::bounded(1);
         dispatch_tx.try_send(Vec::new()).unwrap();
         let message = || {
-            UdpCommand::Send(UdpMsg {
+            UdpCommand::Send(Box::new(UdpMsg {
                 socket_id: UdpSocketId::Raptorcast,
                 dst: "127.0.0.1:1".parse().unwrap(),
                 payload: Bytes::from_static(&[1]),
                 stride: 1,
                 priority: monad_types::UdpPriority::High,
                 encryption: None,
-            })
+            }))
         };
         assert!(sender.try_send(message()).is_ok());
         let (done, finished) = async_channel::bounded(1);
@@ -1053,14 +1056,14 @@ mod tests {
         let (sender, receiver) = mpsc::channel(4);
         for _ in 0..2 {
             assert!(sender
-                .try_send(UdpCommand::Send(UdpMsg {
+                .try_send(UdpCommand::Send(Box::new(UdpMsg {
                     socket_id: UdpSocketId::Raptorcast,
                     dst: regular.local_addr().unwrap(),
                     payload: vec![1; 60_000].into(),
                     stride: 60_000,
                     priority: monad_types::UdpPriority::Regular,
                     encryption: None,
-                }))
+                })))
                 .is_ok());
         }
         let (runtime, ready_rx, _timer_rx) = Runtime::<()>::new(DataplaneMetrics::new());
@@ -1082,14 +1085,14 @@ mod tests {
         assert_eq!(result.unwrap().0, 60_000);
         // Regular traffic is cooling for about 480 ms; the new peer need not wait.
         assert!(sender
-            .try_send(UdpCommand::Send(UdpMsg {
+            .try_send(UdpCommand::Send(Box::new(UdpMsg {
                 socket_id: UdpSocketId::Raptorcast,
                 dst: high.local_addr().unwrap(),
                 payload: Bytes::from_static(&[2]),
                 stride: 1,
                 priority: monad_types::UdpPriority::High,
                 encryption: None,
-            }))
+            })))
             .is_ok());
         let (result, payload) =
             time::timeout(Duration::from_millis(100), high.recv_from(vec![0; 1]))
