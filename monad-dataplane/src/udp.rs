@@ -22,6 +22,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     rc::Rc,
     sync::mpsc as std_mpsc,
+    task::Poll,
     thread,
     time::Instant,
 };
@@ -530,15 +531,19 @@ async fn tx_pacing<I: Identity>(
     let max_batch_bytes = max_write_size_for_segment_size(DEFAULT_SEGMENT_SIZE) as usize;
     let max_batch_items = MAX_AGGREGATED_SEGMENTS as usize;
     let wake = wake::WakeBridge::new();
+    let mut commands = Vec::with_capacity(MAX_CHANNEL_DRAIN);
 
     loop {
         ingress::yield_receive().await;
-        for _ in 0..MAX_CHANNEL_DRAIN {
-            match udp_egress_rx.try_recv() {
-                Ok(command) => runtime.borrow_mut().command(command),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+        match wake.poll_once(udp_egress_rx.recv_many(&mut commands, MAX_CHANNEL_DRAIN)) {
+            Poll::Ready(0) => return,
+            Poll::Ready(_) => {
+                let mut runtime = runtime.borrow_mut();
+                for command in commands.drain(..) {
+                    runtime.command(command);
+                }
             }
+            Poll::Pending => {}
         }
         for msg in runtime.borrow_mut().take_ready(MAX_CHANNEL_DRAIN) {
             enqueue_udp_msg(&mut queue, &metrics, msg);
@@ -793,6 +798,55 @@ mod tests {
             priority: monad_types::UdpPriority::Regular,
             encryption: None,
         })
+    }
+
+    #[monoio::test]
+    async fn batch_intake_is_bounded_immediate_and_preserves_fifo() {
+        let (sender, mut receiver) = mpsc::channel(128);
+        let wake = wake::WakeBridge::new();
+        let mut commands = Vec::with_capacity(MAX_CHANNEL_DRAIN);
+        assert!(wake
+            .poll_once(receiver.recv_many(&mut commands, MAX_CHANNEL_DRAIN))
+            .is_pending());
+        sender
+            .try_send(UdpCommand::Send(queued_message(1, 1)))
+            .unwrap_or_else(|_| panic!("queue full"));
+        assert_eq!(
+            wake.poll_once(receiver.recv_many(&mut commands, MAX_CHANNEL_DRAIN)),
+            Poll::Ready(1)
+        );
+        commands.clear();
+        for value in 0..100 {
+            sender
+                .try_send(UdpCommand::Send(queued_message(value, 1)))
+                .unwrap_or_else(|_| panic!("queue full"));
+        }
+        assert_eq!(
+            wake.poll_once(receiver.recv_many(&mut commands, MAX_CHANNEL_DRAIN)),
+            Poll::Ready(64)
+        );
+        assert_eq!(commands.len(), 64);
+        for (value, command) in commands.drain(..).enumerate() {
+            let UdpCommand::Send(message) = command else {
+                panic!("expected packet")
+            };
+            assert_eq!(message.payload[0], value as u8);
+        }
+        drop(sender);
+        assert_eq!(
+            wake.poll_once(receiver.recv_many(&mut commands, MAX_CHANNEL_DRAIN)),
+            Poll::Ready(36)
+        );
+        for (value, command) in commands.drain(..).enumerate() {
+            let UdpCommand::Send(message) = command else {
+                panic!("expected packet")
+            };
+            assert_eq!(message.payload[0], (value + 64) as u8);
+        }
+        assert_eq!(
+            wake.poll_once(receiver.recv_many(&mut commands, MAX_CHANNEL_DRAIN)),
+            Poll::Ready(0)
+        );
     }
 
     fn paced_message() -> UdpSend {

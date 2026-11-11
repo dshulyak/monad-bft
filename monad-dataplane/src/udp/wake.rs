@@ -70,6 +70,15 @@ impl WakeBridge {
         }
     }
 
+    /// Poll ready work without parking, using the same bridge as the next wait.
+    /// A pending channel poll must keep this waker so cross-runtime notifications
+    /// cannot get stuck behind a continuously busy Monoio runtime.
+    pub(super) fn poll_once<F: Future>(&self, future: F) -> Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let waker = waker_ref(&self.signal);
+        future.as_mut().poll(&mut Context::from_waker(&waker))
+    }
+
     pub(super) async fn wait<F: Future>(&self, future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let waker = waker_ref(&self.signal);
