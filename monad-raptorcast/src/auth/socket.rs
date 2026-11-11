@@ -13,19 +13,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{
-    future::Future,
-    net::SocketAddr,
-    task::{Context, Poll},
-};
+use std::{collections::HashSet, net::SocketAddr};
 
 use bytes::Bytes;
 use monad_crypto::certificate_signature::PubKey;
-use monad_dataplane::{RecvUdpMsg, UdpSocketHandle};
+use monad_dataplane::{
+    auth::{AuthenticatedUdpSocket, CommandQueueFull, AUTHENTICATED_HEADER_SIZE},
+    RecvUdpMsg,
+};
 use monad_executor::{ExecutorMetrics, ExecutorMetricsChain, Gauge};
 use monad_peer_score::IdentityScore;
 use monad_types::{NodeId, UdpPriority};
-use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::{
@@ -37,43 +35,29 @@ use super::{
         GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_READ,
         GAUGE_RAPTORCAST_AUTH_DIRECT_UDP_BYTES_WRITTEN,
     },
-    priority_queue::{RecvMany, RECEIVE_BATCH_SIZE},
-    protocol::AuthenticationProtocol,
 };
 
-// Allow two retries so a cookie-challenged handshake can resend its initiation.
+const RECEIVE_BATCH_SIZE: usize = 128;
 
 #[derive(Clone)]
 pub struct AuthRecvMsg<P: PubKey> {
     pub src_addr: SocketAddr,
     pub payload: Bytes,
     pub stride: u16,
-    pub sender: Option<NodeId<P>>,
+    pub sender: NodeId<P>,
 }
 
-pub struct AuthenticatedSocketHandle<AP: AuthenticationProtocol<PublicKey: PubKey>> {
-    socket: monad_dataplane::auth::AuthenticatedUdpSocket<AP>,
+/// Raptorcast framing and accounting around an authenticated dataplane handle.
+pub struct AuthenticatedSocketHandle<P: PubKey> {
+    socket: AuthenticatedUdpSocket<P>,
     metrics: ExecutorMetrics,
     bytes_written: Gauge,
     bytes_read: Gauge,
-    receive_buffer: Vec<RecvUdpMsg<AP::PublicKey>>,
+    receive_buffer: Vec<RecvUdpMsg<P>>,
 }
-impl<AP: AuthenticationProtocol<PublicKey: PubKey>> Unpin for AuthenticatedSocketHandle<AP> {}
-impl<AP: AuthenticationProtocol<PublicKey: PubKey>> RecvMany for AuthenticatedSocketHandle<AP> {
-    type Item = Result<AuthRecvMsg<AP::PublicKey>, AP::Error>;
-    fn poll_recv_many(
-        &mut self,
-        cx: &mut Context<'_>,
-        messages: &mut Vec<Self::Item>,
-        limit: usize,
-    ) -> Poll<Option<()>> {
-        std::pin::pin!(self.recv_many(messages, limit))
-            .poll(cx)
-            .map(|_| Some(()))
-    }
-}
-impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP> {
-    pub fn new(socket: UdpSocketHandle<AP::PublicKey>, protocol: AP) -> Self {
+
+impl<P: PubKey> AuthenticatedSocketHandle<P> {
+    pub fn new(socket: AuthenticatedUdpSocket<P>) -> Self {
         let mut metrics = init_socket_executor_metrics();
         let bytes_written = metrics
             .gauge(GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN)
@@ -82,7 +66,7 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
             .gauge(GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_READ)
             .clone();
         Self {
-            socket: monad_dataplane::auth::AuthenticatedUdpSocket::new(socket, protocol),
+            socket,
             metrics,
             bytes_written,
             bytes_read,
@@ -102,11 +86,11 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
         self
     }
     pub fn segment_size(&self, mtu: u16) -> u16 {
-        monad_dataplane::udp::segment_size_for_mtu(mtu) - AP::HEADER_SIZE
+        monad_dataplane::udp::segment_size_for_mtu(mtu) - AUTHENTICATED_HEADER_SIZE
     }
     pub fn write(
         &mut self,
-        public_key: &AP::PublicKey,
+        public_key: &P,
         addr: SocketAddr,
         msg: Bytes,
         stride: u16,
@@ -116,204 +100,114 @@ impl<AP: AuthenticationProtocol<PublicKey: PubKey>> AuthenticatedSocketHandle<AP
     }
     fn try_write(
         &mut self,
-        public_key: &AP::PublicKey,
+        public_key: &P,
         addr: SocketAddr,
         msg: Bytes,
         stride: u16,
         priority: UdpPriority,
-    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
+    ) -> Result<(), CommandQueueFull> {
         let bytes = msg.len();
         self.socket
             .write(*public_key, addr, msg, stride, priority)?;
         self.bytes_written.add(bytes as u64);
         Ok(())
     }
-    pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
+    pub fn set_priority_identities(&self, identities: HashSet<P>) {
         self.socket.set_priority_identities(identities);
     }
     pub fn set_prioritize(&self, enabled: bool) {
         self.socket.set_prioritize(enabled);
     }
-    fn received(
-        &mut self,
-        message: RecvUdpMsg<AP::PublicKey>,
-    ) -> Option<AuthRecvMsg<AP::PublicKey>> {
-        // Never expose raw packets queued before authentication was installed.
-        if AP::HEADER_SIZE > 0 && message.sender.is_none() {
-            return None;
-        }
+    fn received(&mut self, message: RecvUdpMsg<P>) -> Option<AuthRecvMsg<P>> {
+        // Discard raw packets buffered before authentication was installed.
+        let sender = NodeId::new(message.sender?);
         self.bytes_read.add(message.payload.len() as u64);
         Some(AuthRecvMsg {
             src_addr: message.src_addr,
             payload: message.payload,
             stride: message.stride,
-            sender: message.sender.map(NodeId::new),
+            sender,
         })
     }
-    pub async fn recv(&mut self) -> Result<AuthRecvMsg<AP::PublicKey>, AP::Error> {
+    pub async fn recv(&mut self) -> AuthRecvMsg<P> {
         loop {
             let message = self.socket.recv().await;
             if let Some(message) = self.received(message) {
-                return Ok(message);
+                return message;
             }
         }
     }
-    pub async fn recv_many(
-        &mut self,
-        messages: &mut Vec<Result<AuthRecvMsg<AP::PublicKey>, AP::Error>>,
-        limit: usize,
-    ) {
+    pub async fn recv_many(&mut self, messages: &mut Vec<AuthRecvMsg<P>>, limit: usize) {
         assert!(limit > 0 && limit <= RECEIVE_BATCH_SIZE);
-        self.socket.recv_many(&mut self.receive_buffer, limit).await;
-        let mut batch = std::mem::take(&mut self.receive_buffer);
-        for message in batch.drain(..) {
-            if let Some(message) = self.received(message) {
-                messages.push(Ok(message));
+        let before = messages.len();
+        while messages.len() == before {
+            self.socket.recv_many(&mut self.receive_buffer, limit).await;
+            let mut batch = std::mem::take(&mut self.receive_buffer);
+            for message in batch.drain(..) {
+                if let Some(message) = self.received(message) {
+                    messages.push(message);
+                }
             }
+            self.receive_buffer = batch;
         }
-        self.receive_buffer = batch;
     }
     pub fn connect(
         &mut self,
-        public_key: &AP::PublicKey,
+        public_key: &P,
         addr: SocketAddr,
         attempts: u64,
-    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
+    ) -> Result<(), CommandQueueFull> {
         self.socket.connect(*public_key, addr, attempts)
     }
-    /// Protocol control and timers are serviced independently by the dataplane.
-    pub fn flush(&mut self) {}
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
         self.socket.metrics().push(&self.metrics)
     }
 }
 
-pub struct FramedAuthenticatedSocketHandle<AP, F>
+pub struct FramedAuthenticatedSocketHandle<P, F>
 where
-    AP: AuthenticationProtocol<PublicKey: PubKey>,
-    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
+    P: PubKey,
+    F: AuthPacketFramer<P, Decoded = Bytes>,
 {
-    socket: AuthenticatedSocketHandle<AP>,
+    socket: AuthenticatedSocketHandle<P>,
     framer: F,
-    receive_buffer: Vec<Result<AuthRecvMsg<AP::PublicKey>, AP::Error>>,
 }
-
-// Neither the socket nor the framer is structurally pinned by this handle.
-impl<AP, F> Unpin for FramedAuthenticatedSocketHandle<AP, F>
+impl<P, F> FramedAuthenticatedSocketHandle<P, F>
 where
-    AP: AuthenticationProtocol<PublicKey: PubKey>,
-    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
+    P: PubKey,
+    F: AuthPacketFramer<P, Decoded = Bytes>,
 {
-}
-
-impl<AP, F> RecvMany for FramedAuthenticatedSocketHandle<AP, F>
-where
-    AP: AuthenticationProtocol<PublicKey: PubKey>,
-    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
-{
-    type Item = Result<AuthRecvMsg<AP::PublicKey>, FramedRecvError<AP::Error>>;
-
-    fn poll_recv_many(
-        &mut self,
-        cx: &mut Context<'_>,
-        messages: &mut Vec<Self::Item>,
-        limit: usize,
-    ) -> Poll<Option<()>> {
-        assert!(limit > 0 && limit <= RECEIVE_BATCH_SIZE);
-        std::task::ready!(self
-            .socket
-            .poll_recv_many(cx, &mut self.receive_buffer, limit));
-        for message in self.receive_buffer.drain(..) {
-            match message {
-                Err(error) => messages.push(Err(FramedRecvError::Auth(error))),
-                Ok(msg) => {
-                    let Some(sender) = msg.sender else {
-                        messages.push(Err(FramedRecvError::MissingAuthPublicKey));
-                        continue;
-                    };
-                    match self.framer.deframe(sender.pubkey(), msg.payload) {
-                        Ok(Some(payload)) => messages.push(Ok(AuthRecvMsg {
-                            src_addr: msg.src_addr,
-                            payload,
-                            sender: Some(sender),
-                            stride: msg.stride,
-                        })),
-                        Ok(None) => {}
-                        Err(err) => {
-                            debug!(addr=?msg.src_addr, error=?err, "failed to decode authenticated packet")
-                        }
-                    }
-                }
-            }
-        }
-        Poll::Ready(Some(()))
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum FramedRecvError<E: std::fmt::Debug> {
-    #[error("authenticated socket error: {0:?}")]
-    Auth(E),
-    #[error("received unauthenticated message on framed socket")]
-    MissingAuthPublicKey,
-}
-
-impl<AP, F> FramedAuthenticatedSocketHandle<AP, F>
-where
-    AP: AuthenticationProtocol<PublicKey: PubKey>,
-    F: AuthPacketFramer<AP::PublicKey, Decoded = Bytes>,
-{
-    pub fn new(socket: AuthenticatedSocketHandle<AP>, framer: F) -> Self {
+    pub fn new(socket: AuthenticatedSocketHandle<P>, framer: F) -> Self {
         Self {
             socket: socket.with_direct_metrics(),
             framer,
-            receive_buffer: Vec::with_capacity(RECEIVE_BATCH_SIZE),
         }
     }
-
-    pub async fn recv(&mut self) -> Result<AuthRecvMsg<AP::PublicKey>, FramedRecvError<AP::Error>> {
+    pub async fn recv(&mut self) -> AuthRecvMsg<P> {
         loop {
-            let msg = self.socket.recv().await.map_err(FramedRecvError::Auth)?;
-            let Some(sender) = msg.sender else {
-                return Err(FramedRecvError::MissingAuthPublicKey);
-            };
-
-            match self.framer.deframe(sender.pubkey(), msg.payload) {
-                Ok(Some(payload)) => {
-                    return Ok(AuthRecvMsg {
-                        src_addr: msg.src_addr,
-                        payload,
-                        sender: Some(sender),
-                        stride: msg.stride,
-                    });
-                }
-                Ok(None) => continue,
+            let msg = self.socket.recv().await;
+            match self.framer.deframe(msg.sender.pubkey(), msg.payload) {
+                Ok(Some(payload)) => return AuthRecvMsg { payload, ..msg },
+                Ok(None) => {}
                 Err(err) => {
-                    debug!(addr=?msg.src_addr, error=?err, "failed to decode authenticated packet");
-                    continue;
+                    debug!(addr=?msg.src_addr, error=?err, "failed to decode authenticated packet")
                 }
             }
         }
     }
-
-    /// Queues framed plaintext for asynchronous authenticated delivery.
-    /// Returns `Err(())` if framing or command-queue admission fails.
+    /// Queue framed plaintext. Framing and command admission can fail locally.
     #[allow(clippy::result_unit_err)]
     pub fn write_buffered(
         &mut self,
-        public_key: &AP::PublicKey,
+        public_key: &P,
         addr: SocketAddr,
         plaintext: Bytes,
         priority: UdpPriority,
     ) -> Result<(), ()> {
-        let packets = match self.framer.frame(plaintext) {
-            Ok(packets) => packets,
-            Err(err) => {
-                warn!(error=?err, "failed to encode message");
-                return Err(());
-            }
-        };
-
+        let packets = self
+            .framer
+            .frame(plaintext)
+            .map_err(|err| warn!(error=?err, "failed to encode message"))?;
         for packet in packets {
             if packet.is_empty() {
                 continue;
@@ -323,41 +217,29 @@ where
                 .try_write(public_key, addr, packet, stride, priority)
                 .map_err(|_| ())?;
         }
-
         Ok(())
     }
-
     pub fn connect(
         &mut self,
-        remote_public_key: &AP::PublicKey,
-        remote_addr: SocketAddr,
-        retry_attempts: u64,
-    ) -> Result<(), monad_dataplane::auth::CommandQueueFull> {
-        self.socket
-            .connect(remote_public_key, remote_addr, retry_attempts)
+        key: &P,
+        addr: SocketAddr,
+        attempts: u64,
+    ) -> Result<(), CommandQueueFull> {
+        self.socket.connect(key, addr, attempts)
     }
-
-    pub fn flush(&mut self) {
-        self.socket.flush();
-    }
-    pub fn set_priority_identities(&self, identities: std::collections::HashSet<AP::PublicKey>) {
+    pub fn set_priority_identities(&self, identities: HashSet<P>) {
         self.socket.set_priority_identities(identities);
     }
-
     pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
         self.socket.metrics().chain(self.framer.metrics())
     }
 }
-
-impl<AP, S> FramedAuthenticatedSocketHandle<AP, LeanUdpFramer<NodeId<AP::PublicKey>, S>>
+impl<P, S> FramedAuthenticatedSocketHandle<P, LeanUdpFramer<NodeId<P>, S>>
 where
-    AP: AuthenticationProtocol<PublicKey: PubKey>,
-    S: IdentityScore<Identity = NodeId<AP::PublicKey>>,
+    P: PubKey,
+    S: IdentityScore<Identity = NodeId<P>>,
 {
-    pub fn set_dedicated_identities(
-        &mut self,
-        identities: impl IntoIterator<Item = NodeId<AP::PublicKey>>,
-    ) {
+    pub fn set_dedicated_identities(&mut self, identities: impl IntoIterator<Item = NodeId<P>>) {
         self.framer.set_dedicated_identities(identities);
     }
 }
@@ -374,18 +256,18 @@ mod tests {
 
     use bytes::Bytes;
     use futures::poll;
-    use monad_dataplane::{DataplaneBuilder, UnicastMsg};
+    use monad_dataplane::{
+        auth::{AuthenticatedUdpSocket, Config, WireAuthProtocol, DEFAULT_RETRY_ATTEMPTS},
+        DataplaneBuilder, UnicastMsg,
+    };
     use monad_peer_discovery::NameRecord;
     use monad_secp::KeyPair;
     use monad_types::UdpPriority;
-    use monad_wireauth::{Config, DEFAULT_RETRY_ATTEMPTS};
     use tracing_subscriber::EnvFilter;
 
-    use super::{AuthenticatedSocketHandle, FramedAuthenticatedSocketHandle, FramedRecvError};
+    use super::{AuthenticatedSocketHandle, FramedAuthenticatedSocketHandle};
     use crate::auth::{
-        framing::AuthPacketFramer,
-        metrics::GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
-        protocol::{NoopAuthProtocol, WireAuthProtocol},
+        framing::AuthPacketFramer, metrics::GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
     };
 
     struct PanicFramer;
@@ -418,7 +300,7 @@ mod tests {
     }
 
     struct PeerNode {
-        socket: AuthenticatedSocketHandle<WireAuthProtocol>,
+        socket: AuthenticatedSocketHandle<monad_secp::PubKey>,
         auth_addr: SocketAddr,
         public_key: monad_secp::PubKey,
         _tcp_socket: monad_dataplane::TcpSocketHandle,
@@ -454,11 +336,15 @@ mod tests {
             let keypair = keypair(seed);
             let public_key = keypair.pubkey();
             let auth_protocol = WireAuthProtocol::new(
-                &crate::auth::metrics::UDP_METRICS,
+                &monad_dataplane::auth::metrics::UDP_METRICS,
                 Config::default(),
                 Arc::new(keypair),
             );
-            let socket = AuthenticatedSocketHandle::new(authenticated_socket, auth_protocol);
+            let socket =
+                AuthenticatedSocketHandle::new(monad_dataplane::auth::AuthenticatedUdpSocket::new(
+                    authenticated_socket,
+                    auth_protocol,
+                ));
 
             Self {
                 socket,
@@ -474,7 +360,6 @@ mod tests {
             self.socket
                 .connect(peer_public, peer_addr, DEFAULT_RETRY_ATTEMPTS)
                 .expect("connect failed");
-            self.socket.flush();
         }
     }
 
@@ -489,9 +374,8 @@ mod tests {
         );
         let message = tokio::time::timeout(Duration::from_secs(3), peer2.socket.recv())
             .await
-            .expect("handshake and buffered delivery timeout")
-            .expect("authenticated probe");
-        assert_eq!(message.sender.unwrap().pubkey(), peer1.public_key);
+            .expect("handshake and buffered delivery timeout");
+        assert_eq!(message.sender.pubkey(), peer1.public_key);
         assert_eq!(message.payload, probe);
     }
 
@@ -540,8 +424,7 @@ mod tests {
         }
         assert_eq!(messages.len(), 144);
         for (value, message) in messages.drain(..).enumerate() {
-            let message = message.unwrap();
-            assert_eq!(message.sender.unwrap().pubkey(), alice.public_key);
+            assert_eq!(message.sender.pubkey(), alice.public_key);
             assert_eq!(message.payload.as_ref(), &(value as u64).to_le_bytes());
         }
         assert!(poll!(pin!(bob.socket.recv_many(&mut messages, 128))).is_pending());
@@ -555,7 +438,6 @@ mod tests {
         );
         let message = tokio::time::timeout(Duration::from_secs(2), bob.socket.recv())
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(message.payload.as_ref(), b"after cancellation");
     }
@@ -584,8 +466,7 @@ mod tests {
 
         let received_bob = tokio::time::timeout(Duration::from_secs(2), bob.socket.recv())
             .await
-            .expect("timeout waiting for bob")
-            .expect("bob received");
+            .expect("timeout waiting for bob");
         assert_eq!(&received_bob.payload[..], b"hello from alice");
         assert_eq!(received_bob.src_addr, alice_addr);
 
@@ -599,8 +480,7 @@ mod tests {
 
         let received_alice = tokio::time::timeout(Duration::from_secs(2), alice.socket.recv())
             .await
-            .expect("timeout waiting for alice")
-            .expect("alice received");
+            .expect("timeout waiting for alice");
         assert_eq!(&received_alice.payload[..], b"hello from bob");
         assert_eq!(received_alice.src_addr, bob_addr);
     }
@@ -623,8 +503,7 @@ mod tests {
 
         let received = tokio::time::timeout(Duration::from_secs(2), bob.socket.recv())
             .await
-            .expect("timeout waiting for bob")
-            .expect("bob received");
+            .expect("timeout waiting for bob");
         assert_eq!(received.payload, b"existing session"[..]);
     }
 
@@ -701,15 +580,14 @@ mod tests {
         );
         let message = tokio::time::timeout(Duration::from_secs(3), async {
             tokio::select! {
-                result = alice.socket.recv() => panic!("unexpected sender input: {:?}", result.err()),
-                result = bob.socket.recv() => result.unwrap(),
+                _ = alice.socket.recv() => panic!("unexpected sender input"),
+                result = bob.socket.recv() => result,
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(message.payload, b"buffered"[..]);
-        assert_eq!(
-            message.sender,
-            Some(monad_types::NodeId::new(alice.public_key))
-        );
+        assert_eq!(message.sender, monad_types::NodeId::new(alice.public_key));
         assert_eq!(
             legacy.recv_from(&mut [0; 1024]).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -754,7 +632,7 @@ mod tests {
                     .into_inner()
                     .into_iter()
                     .find(|(name, _, _)| {
-                        *name == crate::auth::metrics::UDP_METRICS.api_decrypt.name
+                        *name == monad_dataplane::auth::metrics::UDP_METRICS.api_decrypt.name
                     })
                     .unwrap()
                     .1;
@@ -773,7 +651,7 @@ mod tests {
             .into_iter()
             .find(|(name, _, _)| {
                 *name
-                    == crate::auth::metrics::UDP_METRICS
+                    == monad_dataplane::auth::metrics::UDP_METRICS
                         .initiator_messages_sent_from_buffer
                         .name
             })
@@ -783,9 +661,9 @@ mod tests {
             buffered, 0,
             "plaintext must wait outside WireAuth's encrypt-on-handshake buffer"
         );
-        let message = bob.socket.recv().await.unwrap();
+        let message = bob.socket.recv().await;
         assert_eq!(message.payload.as_ref(), b"authenticated");
-        assert_eq!(message.sender.unwrap().pubkey(), alice.public_key);
+        assert_eq!(message.sender.pubkey(), alice.public_key);
     }
 
     #[tokio::test]
@@ -821,12 +699,10 @@ mod tests {
 
         let first = tokio::time::timeout(Duration::from_secs(2), bob.socket.recv())
             .await
-            .expect("timeout waiting for first chunk")
-            .expect("bob received first chunk");
+            .expect("timeout waiting for first chunk");
         let second = tokio::time::timeout(Duration::from_secs(2), bob.socket.recv())
             .await
-            .expect("timeout waiting for second chunk")
-            .expect("bob received second chunk");
+            .expect("timeout waiting for second chunk");
 
         assert_eq!(&first.payload[..], b"hello");
         assert_eq!(&second.payload[..], b"world");
@@ -859,18 +735,22 @@ mod tests {
         };
 
         let auth_protocol = WireAuthProtocol::new(
-            &crate::auth::metrics::UDP_METRICS,
+            &monad_dataplane::auth::metrics::UDP_METRICS,
             config,
             Arc::new(local_keypair),
         );
-        let mut handle = AuthenticatedSocketHandle::new(authenticated_socket, auth_protocol);
+        let mut handle = AuthenticatedSocketHandle::new(
+            monad_dataplane::auth::AuthenticatedUdpSocket::new(authenticated_socket, auth_protocol),
+        );
 
-        let ticks = |handle: &AuthenticatedSocketHandle<WireAuthProtocol>| {
+        let ticks = |handle: &AuthenticatedSocketHandle<monad_secp::PubKey>| {
             handle
                 .metrics()
                 .into_inner()
                 .into_iter()
-                .find(|(name, _, _)| *name == crate::auth::metrics::UDP_METRICS.api_tick.name)
+                .find(|(name, _, _)| {
+                    *name == monad_dataplane::auth::metrics::UDP_METRICS.api_tick.name
+                })
                 .unwrap()
                 .1
         };
@@ -923,10 +803,10 @@ mod tests {
             .take(monad_dataplane::UdpSocketId::Raptorcast)
             .expect("send socket");
 
-        let auth_socket = AuthenticatedSocketHandle::new(
+        let auth_socket = AuthenticatedSocketHandle::new(AuthenticatedUdpSocket::with_key(
             recv_socket,
-            NoopAuthProtocol::<monad_secp::PubKey>::new(),
-        );
+            Arc::new(keypair(1)),
+        ));
         let mut framed_socket = FramedAuthenticatedSocketHandle::new(auth_socket, PanicFramer);
 
         send_socket.write_unicast_with_priority(
@@ -937,9 +817,18 @@ mod tests {
             UdpPriority::Regular,
         );
 
-        let result = tokio::time::timeout(Duration::from_secs(2), framed_socket.recv())
-            .await
-            .expect("timeout waiting for framed recv");
-        assert!(matches!(result, Err(FramedRecvError::MissingAuthPublicKey)));
+        let result = tokio::time::timeout(Duration::from_millis(100), framed_socket.recv()).await;
+        assert!(
+            result.is_err(),
+            "unauthenticated input must not reach the framer"
+        );
+        let rejected = recv_dp
+            .metrics()
+            .metric_handles()
+            .into_iter()
+            .find(|(name, _, _)| *name == "monad.dataplane.udp.auth.packets_rejected")
+            .unwrap()
+            .1;
+        assert!(rejected.get() > 0);
     }
 }

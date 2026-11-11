@@ -23,7 +23,6 @@ monad-raptor = { workspace = true }
 monad-secp = { workspace = true }
 monad-types = { workspace = true }
 monad-validator = { workspace = true }
-monad-wireauth = { workspace = true }
 
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }

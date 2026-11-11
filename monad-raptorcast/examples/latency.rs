@@ -44,7 +44,7 @@ use monad_peer_discovery::{
     MonadNameRecord, NameRecord,
 };
 use monad_raptorcast::{
-    auth::{NopScore, WireAuthProtocol},
+    auth::NopScore,
     config::{RaptorCastConfig, RaptorCastConfigPrimary},
     raptorcast_secondary::SecondaryRaptorCastModeConfig,
     RaptorCast, RaptorCastEvent,
@@ -567,7 +567,6 @@ struct NodeSetup {
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
-        monad_raptorcast::auth::WireAuthProtocol,
         monad_raptorcast::auth::NopScore<NodeId<CertificateSignaturePubKey<SignatureType>>>,
     >,
     node_id: NodeId<CertificateSignaturePubKey<SignatureType>>,
@@ -678,9 +677,9 @@ fn setup_node(
     let pd = PeerDiscoveryDriver::new(noop_builder);
 
     let keypair_arc = Arc::new(keypair);
-    let wireauth_config = monad_wireauth::Config::default();
-    let auth_protocol = monad_raptorcast::auth::WireAuthProtocol::new(
-        &monad_raptorcast::auth::metrics::UDP_METRICS,
+    let wireauth_config = monad_dataplane::auth::Config::default();
+    let auth_protocol = monad_dataplane::auth::WireAuthProtocol::new(
+        &monad_dataplane::auth::metrics::UDP_METRICS,
         wireauth_config,
         keypair_arc.clone(),
     );
@@ -691,13 +690,12 @@ fn setup_node(
         MockMessage,
         <MockMessage as Message>::Event,
         NopDiscovery<SignatureType>,
-        WireAuthProtocol,
         NopScore<NodeId<PubKeyType>>,
     >::new(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
         tcp_socket,
-        (authenticated_socket, auth_protocol),
+        monad_dataplane::auth::AuthenticatedUdpSocket::new(authenticated_socket, auth_protocol),
         None,
         dataplane_control,
         Arc::new(std::sync::Mutex::new(pd)),

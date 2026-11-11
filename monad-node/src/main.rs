@@ -35,7 +35,7 @@ use monad_control_panel::ipc::ControlPanelIpcReceiver;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
-use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
+use monad_dataplane::{auth::WireAuthProtocol, DataplaneBuilder, TcpSocketId, UdpSocketId};
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_txpool_executor::{EthTxPoolExecutor, EthTxPoolIpcConfig};
@@ -54,10 +54,7 @@ use monad_peer_discovery::{
 };
 use monad_peer_score::{ema, IdentityScore, StdClock};
 use monad_pprof::start_pprof_server;
-use monad_raptorcast::{
-    auth::WireAuthProtocol,
-    config::{RaptorCastConfig, RaptorCastConfigPrimary},
-};
+use monad_raptorcast::config::{RaptorCastConfig, RaptorCastConfigPrimary};
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
 use monad_statesync_executor::StateSyncExecutor;
@@ -676,15 +673,7 @@ fn build_raptorcast_router<ST, SCT, M, OM, DS>(
     proposer_schedule: BoxedProposerSchedule<CertificateSignaturePubKey<ST>>,
     persisted_peers_path: PathBuf,
     direct_udp_peer_score_reader: DS,
-) -> MultiRouter<
-    ST,
-    M,
-    OM,
-    MonadEvent<ST, SCT, ExecutionProtocolType>,
-    PeerDiscovery<ST>,
-    WireAuthProtocol,
-    DS,
->
+) -> MultiRouter<ST, M, OM, MonadEvent<ST, SCT, ExecutionProtocolType>, PeerDiscovery<ST>, DS>
 where
     ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -883,15 +872,15 @@ where
     };
 
     let shared_key = Arc::new(identity);
-    let wireauth_config = monad_wireauth::Config::default();
+    let wireauth_config = monad_dataplane::auth::Config::default();
     let auth_protocol = WireAuthProtocol::new(
-        &monad_raptorcast::auth::metrics::UDP_METRICS,
+        &monad_dataplane::auth::metrics::UDP_METRICS,
         wireauth_config.clone(),
         shared_key.clone(),
     );
     let direct_udp_auth_protocol = direct_udp_bind_address.map(|_| {
         WireAuthProtocol::new(
-            &monad_raptorcast::auth::metrics::DIRECT_UDP_METRICS,
+            &monad_dataplane::auth::metrics::DIRECT_UDP_METRICS,
             wireauth_config.clone(),
             shared_key.clone(),
         )

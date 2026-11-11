@@ -251,16 +251,15 @@ fn spawn_validator(
             MockMessage,
             MockEvent<PubKeyType>,
             NopDiscovery<SecpSignature>,
-            monad_raptorcast::auth::WireAuthProtocol,
             monad_raptorcast::auth::NopScore<NodeId<PubKeyType>>,
         >::new(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
             dataplane.tcp_socket,
-            (
+            monad_dataplane::auth::AuthenticatedUdpSocket::new(
                 dataplane.authenticated_socket,
-                monad_raptorcast::auth::WireAuthProtocol::new(
-                    &monad_raptorcast::auth::metrics::UDP_METRICS,
+                monad_dataplane::auth::WireAuthProtocol::new(
+                    &monad_dataplane::auth::metrics::UDP_METRICS,
                     Default::default(),
                     keypair,
                 ),

@@ -24,10 +24,6 @@ monad_executor::metric_consts! {
         name: "monad.raptorcast.total_messages_received",
         help: "Total raptorcast messages received",
     }
-    pub GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS {
-        name: "monad.raptorcast.total_recv_errors",
-        help: "Total raptorcast receive errors",
-    }
     pub GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS {
         name: "monad.raptorcast.total_deserialize_errors",
         help: "Total raptorcast message deserialization errors",
@@ -79,7 +75,6 @@ const HISTOGRAM_CLEAR_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) fn init_router_executor_metrics() -> ExecutorMetrics {
     ExecutorMetrics::with_metric_defs(&[
         GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED,
-        GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS,
         GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS,
         COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT,
         COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,

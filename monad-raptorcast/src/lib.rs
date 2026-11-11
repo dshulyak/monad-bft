@@ -38,6 +38,7 @@ use monad_crypto::{
     signing_domain,
 };
 use monad_dataplane::{
+    auth::{AuthenticatedUdpSocket, AUTHENTICATED_HEADER_SIZE},
     udp::{segment_size_for_mtu, DEFAULT_MTU},
     DataplaneBuilder, DataplaneControl, RecvTcpMsg, TcpMsg, TcpSocketHandle, TcpSocketId,
     TcpSocketReader, TcpSocketWriter, UdpSocketHandle, UdpSocketId,
@@ -78,7 +79,6 @@ use crate::{
         init_router_executor_metrics, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_FALLBACK,
         COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_OVERSIZE, COUNTER_RAPTORCAST_DIRECT_UDP_FORWARD_SENT,
         GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS, GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED,
-        GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS,
     },
     packet::RetrofitResult as _,
     raptorcast_secondary::{
@@ -106,18 +106,17 @@ const TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES: usize = 512 * 1024;
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
 
 pub(crate) type OwnedMessageBuilder<ST> = packet::MessageBuilder<'static, ST>;
-type DirectUdpTransport<ST, AP, DS> = auth::FramedAuthenticatedSocketHandle<
-    AP,
+type DirectUdpTransport<ST, DS> = auth::FramedAuthenticatedSocketHandle<
+    CertificateSignaturePubKey<ST>,
     auth::LeanUdpFramer<NodeId<CertificateSignaturePubKey<ST>>, DS>,
 >;
 
-pub struct RaptorCast<ST, M, OM, SE, PD, AP, DS>
+pub struct RaptorCast<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     signing_key: Arc<ST::KeyPairType>,
@@ -147,8 +146,8 @@ where
 
     tcp_reader: TcpSocketReader,
     tcp_writer: TcpSocketWriter,
-    udp_socket: auth::AuthenticatedSocketHandle<AP>,
-    direct_udp_transport: Option<DirectUdpTransport<ST, AP, DS>>,
+    udp_socket: auth::AuthenticatedSocketHandle<CertificateSignaturePubKey<ST>>,
+    direct_udp_transport: Option<DirectUdpTransport<ST, DS>>,
     dataplane_control: DataplaneControl,
     pending_events: VecDeque<RaptorCastEvent<M::Event, ST>>,
 
@@ -175,13 +174,12 @@ pub enum RaptorCastEvent<E, ST: CertificateSignatureRecoverable> {
     SecondaryRaptorcastPeersUpdate(Round, Vec<NodeId<CertificateSignaturePubKey<ST>>>),
 }
 
-impl<ST, M, OM, SE, PD, AP, DS> RaptorCast<ST, M, OM, SE, PD, AP, DS>
+impl<ST, M, OM, SE, PD, DS> RaptorCast<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     #[allow(clippy::too_many_arguments)]
@@ -189,8 +187,8 @@ where
         config: config::RaptorCastConfig<ST>,
         secondary_mode: SecondaryRaptorCastModeConfig,
         tcp_socket: TcpSocketHandle,
-        authenticated: (UdpSocketHandle<AP::PublicKey>, AP),
-        direct_udp: Option<(UdpSocketHandle<AP::PublicKey>, AP, DS)>,
+        authenticated: AuthenticatedUdpSocket<CertificateSignaturePubKey<ST>>,
+        direct_udp: Option<(AuthenticatedUdpSocket<CertificateSignaturePubKey<ST>>, DS)>,
         control: DataplaneControl,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         current_epoch: Epoch,
@@ -241,16 +239,17 @@ where
             ?is_dynamic_fullnode, ?self_id, ?config.mtu, "RaptorCast::new",
         );
 
-        let udp_socket = auth::AuthenticatedSocketHandle::new(authenticated.0, authenticated.1);
-        let direct_udp_transport = direct_udp.map(|(socket, protocol, direct_udp_peer_score)| {
-            let max_fragment_payload =
-                usize::from(segment_size_for_mtu(config.mtu).saturating_sub(AP::HEADER_SIZE));
+        let udp_socket = auth::AuthenticatedSocketHandle::new(authenticated);
+        let direct_udp_transport = direct_udp.map(|(socket, direct_udp_peer_score)| {
+            let max_fragment_payload = usize::from(
+                segment_size_for_mtu(config.mtu).saturating_sub(AUTHENTICATED_HEADER_SIZE),
+            );
             let leanudp_config = monad_leanudp::Config {
                 max_message_size: TX_FORWARD_DIRECT_UDP_MAX_MESSAGE_SIZE_BYTES,
                 max_fragment_payload,
                 ..Default::default()
             };
-            let socket = auth::AuthenticatedSocketHandle::new(socket, protocol);
+            let socket = auth::AuthenticatedSocketHandle::new(socket);
             auth::FramedAuthenticatedSocketHandle::new(
                 socket,
                 auth::LeanUdpFramer::new(direct_udp_peer_score, leanudp_config),
@@ -825,7 +824,7 @@ pub fn dummy_proposer_schedule<PT: PubKey>() -> BoxedProposerSchedule<PT> {
 }
 
 pub fn new_defaulted_raptorcast_for_tests<ST, M, OM, SE>(
-    dataplane: DataplaneHandles<CertificateSignaturePubKey<ST>>,
+    dataplane: DataplaneHandles,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     shared_key: Arc<ST::KeyPairType>,
     current_epoch: Epoch,
@@ -835,11 +834,10 @@ pub fn new_defaulted_raptorcast_for_tests<ST, M, OM, SE>(
     OM,
     SE,
     NopDiscovery<ST>,
-    auth::NoopAuthProtocol<CertificateSignaturePubKey<ST>>,
     auth::NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
 >
 where
-    ST: CertificateSignatureRecoverable,
+    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
 {
@@ -853,100 +851,6 @@ where
 }
 
 pub fn new_defaulted_raptorcast_for_tests_with_name_records<ST, M, OM, SE>(
-    dataplane: DataplaneHandles<CertificateSignaturePubKey<ST>>,
-    known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
-    name_records: HashMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>>,
-    shared_key: Arc<ST::KeyPairType>,
-    current_epoch: Epoch,
-) -> RaptorCast<
-    ST,
-    M,
-    OM,
-    SE,
-    NopDiscovery<ST>,
-    auth::NoopAuthProtocol<CertificateSignaturePubKey<ST>>,
-    auth::NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
->
-where
-    ST: CertificateSignatureRecoverable,
-    M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
-    OM: Encodable + Into<M> + Clone,
-{
-    let peer_discovery_builder = NopDiscoveryBuilder {
-        known_addresses,
-        name_records,
-        ..Default::default()
-    };
-    let config = config::RaptorCastConfig {
-        shared_key,
-        mtu: DEFAULT_MTU,
-        udp_message_max_age_ms: u64::MAX, // No timestamp validation for tests
-        sig_verification_rate_limit: 10_000,
-        primary_instance: Default::default(),
-        secondary_instance: FullNodeRaptorCastConfig {
-            enable_publisher: false,
-            enable_client: false,
-            raptor10_fullnode_redundancy_factor: 2f32,
-            full_nodes_prioritized: FullNodeConfig { identities: vec![] },
-            round_span: Round(10),
-            invite_lookahead: Round(5),
-            max_invite_wait: Round(3),
-            deadline_round_dist: Round(3),
-            init_empty_round_span: Round(1),
-            max_group_size: 10,
-            max_num_group: 5,
-            invite_future_dist_min: Round(1),
-            invite_future_dist_max: Round(5),
-            invite_accept_heartbeat_ms: 100,
-        },
-    };
-    let pd = PeerDiscoveryDriver::new(peer_discovery_builder);
-    let shared_pd = Arc::new(Mutex::new(pd));
-    RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, _, NopScore<NodeId<CertificateSignaturePubKey<ST>>>>::new(
-        config,
-        SecondaryRaptorCastModeConfig::None,
-        dataplane.tcp_socket,
-        (
-            dataplane.authenticated_socket,
-            auth::NoopAuthProtocol::new(),
-        ),
-        None,
-        dataplane.control,
-        shared_pd,
-        current_epoch,
-        dummy_proposer_schedule(),
-    )
-}
-
-pub fn new_wireauth_raptorcast_for_tests<ST, M, OM, SE>(
-    dataplane: DataplaneHandles,
-    known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
-    shared_key: Arc<ST::KeyPairType>,
-    current_epoch: Epoch,
-) -> RaptorCast<
-    ST,
-    M,
-    OM,
-    SE,
-    NopDiscovery<ST>,
-    auth::WireAuthProtocol,
-    auth::NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
->
-where
-    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
-    M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
-    OM: Encodable + Into<M> + Clone,
-{
-    new_wireauth_raptorcast_for_tests_with_name_records(
-        dataplane,
-        known_addresses,
-        HashMap::new(),
-        shared_key,
-        current_epoch,
-    )
-}
-
-pub fn new_wireauth_raptorcast_for_tests_with_name_records<ST, M, OM, SE>(
     dataplane: DataplaneHandles,
     known_addresses: HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4>,
     name_records: HashMap<NodeId<CertificateSignaturePubKey<ST>>, MonadNameRecord<ST>>,
@@ -958,7 +862,6 @@ pub fn new_wireauth_raptorcast_for_tests_with_name_records<ST, M, OM, SE>(
     OM,
     SE,
     NopDiscovery<ST>,
-    auth::WireAuthProtocol,
     auth::NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
 >
 where
@@ -996,15 +899,11 @@ where
     };
     let pd = PeerDiscoveryDriver::new(peer_discovery_builder);
     let shared_pd = Arc::new(Mutex::new(pd));
-    let wireauth_config = monad_wireauth::Config::default();
-    RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, _, NopScore<NodeId<CertificateSignaturePubKey<ST>>>>::new(
+    RaptorCast::<ST, M, OM, SE, NopDiscovery<ST>, NopScore<NodeId<CertificateSignaturePubKey<ST>>>>::new(
         config,
         SecondaryRaptorCastModeConfig::None,
         dataplane.tcp_socket,
-        (
-            dataplane.authenticated_socket,
-            auth::WireAuthProtocol::new(&auth::metrics::UDP_METRICS, wireauth_config, shared_key),
-        ),
+        AuthenticatedUdpSocket::with_key(dataplane.authenticated_socket, shared_key),
         None,
         dataplane.control,
         shared_pd,
@@ -1013,13 +912,12 @@ where
     )
 }
 
-impl<ST, M, OM, SE, PD, AP, DS> Executor for RaptorCast<ST, M, OM, SE, PD, AP, DS>
+impl<ST, M, OM, SE, PD, DS> Executor for RaptorCast<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     type Command = RouterCommand<ST, OM>;
@@ -1267,14 +1165,13 @@ const RAPTORCAST_POLL_QUOTA: usize = 256;
 const DIRECT_UDP_POLL_QUOTA: usize = 64;
 const TCP_POLL_QUOTA: usize = 16;
 
-impl<ST, M, OM, E, PD, AP, DS> Stream for RaptorCast<ST, M, OM, E, PD, AP, DS>
+impl<ST, M, OM, E, PD, DS> Stream for RaptorCast<ST, M, OM, E, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     E: From<RaptorCastEvent<M::Event, ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
     PeerDiscoveryDriver<PD>: Unpin,
     Self: Unpin,
@@ -1301,16 +1198,11 @@ where
                 let mut sock = pin!(budgeted(this.udp_socket.recv(), &mut poll_quota));
 
                 match sock.poll_unpin(cx) {
-                    Poll::Ready(Ok(msg)) => {
+                    Poll::Ready(msg) => {
                         this.metrics
                             .gauge(GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED)
                             .inc();
                         msg
-                    }
-                    Poll::Ready(Err(e)) => {
-                        this.metrics.gauge(GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS).inc();
-                        trace!(error=?e, "socket recv error");
-                        continue;
                     }
                     Poll::Pending => break,
                 }
@@ -1443,10 +1335,8 @@ where
             loop {
                 let mut recv_fut = pin!(budgeted(socket.recv(), &mut poll_quota));
                 match recv_fut.poll_unpin(cx) {
-                    Poll::Ready(Ok(msg)) => {
-                        let from = msg
-                            .sender
-                            .expect("framed direct udp transport requires authenticated messages");
+                    Poll::Ready(msg) => {
+                        let from = msg.sender;
                         match InboundRouterMessage::<M, ST>::try_deserialize(&msg.payload) {
                             Ok(InboundRouterMessage::AppMessage(app_message)) => {
                                 this.pending_events
@@ -1475,10 +1365,6 @@ where
                         if let Some(event) = this.pending_events.pop_front() {
                             return Poll::Ready(Some(event.into()));
                         }
-                    }
-                    Poll::Ready(Err(err)) => {
-                        trace!(error=?err, "direct udp socket recv error");
-                        continue;
                     }
                     Poll::Pending => break,
                 }
@@ -1561,7 +1447,7 @@ where
 
         {
             let send_peer_disc_msg =
-                |this: &mut RaptorCast<ST, M, OM, E, PD, AP, DS>,
+                |this: &mut RaptorCast<ST, M, OM, E, PD, DS>,
                  target: NodeId<CertificateSignaturePubKey<ST>>,
                  target_name_record: Option<NameRecord>,
                  message: PeerDiscoveryMessage<ST>| {
@@ -1737,13 +1623,12 @@ where
     }
 }
 
-struct AuthenticatedUdpPacketSender<'a, ST, PD, AP>
+struct AuthenticatedUdpPacketSender<'a, ST, PD>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
-    udp_socket: &'a mut auth::AuthenticatedSocketHandle<AP>,
+    udp_socket: &'a mut auth::AuthenticatedSocketHandle<CertificateSignaturePubKey<ST>>,
     peer_disc_driver: &'a Arc<Mutex<PeerDiscoveryDriver<PD>>>,
     target_name_record: Option<TargetNameRecord<'a, ST>>,
     priority: UdpPriority,
@@ -1756,14 +1641,13 @@ struct TargetNameRecord<'a, ST: CertificateSignatureRecoverable> {
     name_record: &'a NameRecord,
 }
 
-impl<'a, ST, PD, AP> AuthenticatedUdpPacketSender<'a, ST, PD, AP>
+impl<'a, ST, PD> AuthenticatedUdpPacketSender<'a, ST, PD>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn new(
-        udp_socket: &'a mut auth::AuthenticatedSocketHandle<AP>,
+        udp_socket: &'a mut auth::AuthenticatedSocketHandle<CertificateSignaturePubKey<ST>>,
         peer_disc_driver: &'a Arc<Mutex<PeerDiscoveryDriver<PD>>>,
     ) -> Self {
         Self {
@@ -1775,10 +1659,7 @@ where
         }
     }
 
-    fn with_priority(
-        mut self,
-        priority: UdpPriority,
-    ) -> AuthenticatedUdpPacketSender<'a, ST, PD, AP> {
+    fn with_priority(mut self, priority: UdpPriority) -> AuthenticatedUdpPacketSender<'a, ST, PD> {
         self.priority = priority;
         self
     }
@@ -1787,7 +1668,7 @@ where
         mut self,
         target: &'a NodeId<CertificateSignaturePubKey<ST>>,
         name_record: &'a NameRecord,
-    ) -> AuthenticatedUdpPacketSender<'a, ST, PD, AP> {
+    ) -> AuthenticatedUdpPacketSender<'a, ST, PD> {
         // currently we have no use for multiple target name records
         debug_assert!(self.target_name_record.is_none());
         self.target_name_record = Some(TargetNameRecord {
@@ -1811,11 +1692,10 @@ where
     }
 }
 
-impl<'a, ST, PD, AP> Collector<UdpMessage<CertificateSignaturePubKey<ST>>>
-    for AuthenticatedUdpPacketSender<'a, ST, PD, AP>
+impl<'a, ST, PD> Collector<UdpMessage<CertificateSignaturePubKey<ST>>>
+    for AuthenticatedUdpPacketSender<'a, ST, PD>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn push(&mut self, item: UdpMessage<CertificateSignaturePubKey<ST>>) {
@@ -1861,8 +1741,8 @@ where
     }
 }
 
-fn rebroadcast_packet<ST, PD, AP>(
-    udp_socket: &mut auth::AuthenticatedSocketHandle<AP>,
+fn rebroadcast_packet<ST, PD>(
+    udp_socket: &mut auth::AuthenticatedSocketHandle<CertificateSignaturePubKey<ST>>,
     peer_discovery_driver: &Arc<Mutex<PeerDiscoveryDriver<PD>>>,
     target: &NodeId<CertificateSignaturePubKey<ST>>,
     payload: Bytes,
@@ -1870,7 +1750,6 @@ fn rebroadcast_packet<ST, PD, AP>(
 ) where
     ST: CertificateSignatureRecoverable,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     let public_key = target.pubkey();
     let Ok(peer_discovery) = peer_discovery_driver.lock() else {

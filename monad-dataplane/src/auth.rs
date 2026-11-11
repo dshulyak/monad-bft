@@ -32,6 +32,12 @@ use monad_executor::ExecutorMetricsChain;
 use monad_wireauth::messages::{DataPacketHeader, Packet};
 use zerocopy::{Immutable, IntoBytes};
 
+pub mod metrics;
+pub use monad_wireauth::{Config, DEFAULT_RETRY_ATTEMPTS};
+
+/// Authentication framing reserved by UDP application payload builders.
+pub const AUTHENTICATED_HEADER_SIZE: u16 = DataPacketHeader::SIZE as u16;
+
 /// An authenticated sender's grouping key. Transport scheduling does not depend
 /// on a particular signature scheme or application node-ID representation.
 pub trait Identity: Copy + Debug + Eq + Ord + Hash + Send + Sync + Unpin + 'static {}
@@ -189,7 +195,7 @@ impl AuthenticationProtocol for WireAuthProtocol {
     type Error = monad_wireauth::Error;
     type Header = monad_wireauth::messages::DataPacketHeader;
 
-    const HEADER_SIZE: u16 = DataPacketHeader::SIZE as u16;
+    const HEADER_SIZE: u16 = AUTHENTICATED_HEADER_SIZE;
 
     fn into_initializer(self) -> Box<dyn FnOnce() -> Self + Send> {
         let Self {
@@ -339,10 +345,7 @@ impl AuthenticationProtocol for WireAuthProtocol {
     }
 }
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    marker::PhantomData,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use monad_executor::ExecutorMetrics;
 use monad_types::UdpPriority;
@@ -385,17 +388,21 @@ impl std::error::Error for CommandQueueFull {}
 
 /// Application-side transport proxy. The protocol is moved into the dataplane;
 /// this handle only queues addressed plaintext/commands and reads shared metrics.
-pub struct AuthenticatedUdpSocket<AP: AuthenticationProtocol> {
-    socket: UdpSocketHandle<AP::PublicKey>,
+pub struct AuthenticatedUdpSocket<I: Identity> {
+    socket: UdpSocketHandle<I>,
     metrics: Vec<ExecutorMetrics>,
-    _protocol: PhantomData<fn() -> AP>,
+    header_size: u16,
 }
 
-impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
-    pub fn new(socket: UdpSocketHandle<AP::PublicKey>, protocol: AP) -> Self {
+impl<I: Identity> AuthenticatedUdpSocket<I> {
+    pub fn new<AP: AuthenticationProtocol<PublicKey = I>>(
+        socket: UdpSocketHandle<I>,
+        protocol: AP,
+    ) -> Self {
+        let header_size = AP::HEADER_SIZE;
         let initialize = protocol.into_initializer();
         let pending_limit = socket.writer.max_pending_bytes;
-        let backend: BackendInitializer<AP::PublicKey> = Box::new(move || {
+        let backend: BackendInitializer<I> = Box::new(move || {
             let protocol = initialize();
             let metrics = protocol.metrics().cloned_metrics();
             (
@@ -425,13 +432,13 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
         Self {
             socket,
             metrics,
-            _protocol: PhantomData,
+            header_size,
         }
     }
 
     pub fn write(
         &self,
-        identity: AP::PublicKey,
+        identity: I,
         address: SocketAddr,
         payload: Bytes,
         stride: u16,
@@ -450,7 +457,7 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
                 priority,
                 encryption: Some(Encryption {
                     identity,
-                    header_size: AP::HEADER_SIZE,
+                    header_size: self.header_size,
                 }),
             })))
             .then_some(())
@@ -459,7 +466,7 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
     /// Acceptance queues a connection request; handshake success is asynchronous.
     pub fn connect(
         &self,
-        identity: AP::PublicKey,
+        identity: I,
         address: SocketAddr,
         attempts: u64,
     ) -> Result<(), CommandQueueFull> {
@@ -474,7 +481,7 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
             .ok_or(CommandQueueFull)
     }
 
-    pub fn set_priority_identities(&self, identities: HashSet<AP::PublicKey>) {
+    pub fn set_priority_identities(&self, identities: HashSet<I>) {
         self.socket.reader.priority.send_if_modified(|current| {
             if current.0 == identities {
                 return false;
@@ -493,14 +500,10 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
         });
     }
 
-    pub async fn recv(&mut self) -> RecvUdpMsg<AP::PublicKey> {
+    pub async fn recv(&mut self) -> RecvUdpMsg<I> {
         self.socket.recv().await
     }
-    pub async fn recv_many(
-        &mut self,
-        messages: &mut Vec<RecvUdpMsg<AP::PublicKey>>,
-        limit: usize,
-    ) -> usize {
+    pub async fn recv_many(&mut self, messages: &mut Vec<RecvUdpMsg<I>>, limit: usize) -> usize {
         self.socket.recv_many(messages, limit).await
     }
     pub fn local_addr(&self) -> SocketAddr {
@@ -512,6 +515,21 @@ impl<AP: AuthenticationProtocol> AuthenticatedUdpSocket<AP> {
             .fold(ExecutorMetricsChain::default(), |chain, metrics| {
                 chain.push(metrics)
             })
+    }
+}
+
+impl AuthenticatedUdpSocket<monad_secp::PubKey> {
+    /// Install the default authenticated transport on this socket's dataplane.
+    pub fn with_key(
+        socket: UdpSocketHandle<monad_secp::PubKey>,
+        key: Arc<monad_secp::KeyPair>,
+    ) -> Self {
+        let names = if socket.writer.socket_id == UdpSocketId::DirectUdp {
+            &metrics::DIRECT_UDP_METRICS
+        } else {
+            &metrics::UDP_METRICS
+        };
+        Self::new(socket, WireAuthProtocol::new(names, Config::default(), key))
     }
 }
 

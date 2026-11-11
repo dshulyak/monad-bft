@@ -246,24 +246,23 @@ fn spawn_wireauth_validator(
 
     tokio::task::spawn_local(async move {
         let config = create_raptorcast_config(keypair.clone(), sig_verification_rate_limit);
-        let wireauth_config = monad_wireauth::Config::default();
-        let authenticated = (
+        let wireauth_config = monad_dataplane::auth::Config::default();
+        let authenticated = monad_dataplane::auth::AuthenticatedUdpSocket::new(
             dataplane.authenticated_socket,
-            monad_raptorcast::auth::WireAuthProtocol::new(
-                &monad_raptorcast::auth::metrics::UDP_METRICS,
+            monad_dataplane::auth::WireAuthProtocol::new(
+                &monad_dataplane::auth::metrics::UDP_METRICS,
                 wireauth_config.clone(),
                 keypair.clone(),
             ),
         );
         let direct_udp = dataplane.direct_udp_socket.map(|socket| {
-            let protocol = monad_raptorcast::auth::WireAuthProtocol::new(
-                &monad_raptorcast::auth::metrics::DIRECT_UDP_METRICS,
+            let protocol = monad_dataplane::auth::WireAuthProtocol::new(
+                &monad_dataplane::auth::metrics::DIRECT_UDP_METRICS,
                 wireauth_config.clone(),
                 keypair.clone(),
             );
             (
-                socket,
-                protocol,
+                monad_dataplane::auth::AuthenticatedUdpSocket::new(socket, protocol),
                 monad_raptorcast::auth::NopScore::<
                     NodeId<CertificateSignaturePubKey<SecpSignature>>,
                 >::new(),
@@ -275,7 +274,6 @@ fn spawn_wireauth_validator(
             MockMessage,
             MockEvent<CertificateSignaturePubKey<SecpSignature>>,
             monad_peer_discovery::mock::NopDiscovery<SecpSignature>,
-            _,
             _,
         >::new(
             config,

@@ -160,7 +160,7 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
         proposer_schedule: &dyn ProposerSchedule<CertificateSignaturePubKey<ST>>,
         chunk: &ValidatedChunk<CertificateSignaturePubKey<ST>>,
         rebroadcast_to: &mut impl FnMut(Vec<NodeId<CertificateSignaturePubKey<ST>>>),
-        sender: Option<&NodeId<CertificateSignaturePubKey<ST>>>,
+        sender: &NodeId<CertificateSignaturePubKey<ST>>,
     ) -> Option<(NodeId<CertificateSignaturePubKey<ST>>, Bytes)> {
         let Ok(group) = BroadcastGroup::from_group_id(
             chunk.group_id,
@@ -176,16 +176,14 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
             return None;
         };
 
-        if let Some(sender) = sender {
-            if !group.is_sender_valid(sender) {
-                tracing::debug!(
-                    ?chunk.group_id,
-                    author =? chunk.author,
-                    ?sender,
-                    "dropping message from invalid sender"
-                );
-                return None;
-            }
+        if !group.is_sender_valid(sender) {
+            tracing::debug!(
+                ?chunk.group_id,
+                author =? chunk.author,
+                ?sender,
+                "dropping message from invalid sender"
+            );
+            return None;
         }
 
         let validator_set = match &group {
@@ -454,12 +452,9 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
             let bypass_rate_limiter = |epoch: Epoch| {
                 // validator senders are allowed to bypass signature
                 // verification rate limiting
-                message.sender.as_ref().is_some_and(|sender| {
-                    epoch_validators
-                        .get(&epoch)
-                        .iter()
-                        .any(|ev| ev.is_member(sender))
-                })
+                epoch_validators
+                    .get(&epoch)
+                    .is_some_and(|validators| validators.is_member(&message.sender))
             };
 
             let packet = match RaptorcastPacket::parse(&payload) {
@@ -534,7 +529,7 @@ impl<ST: CertificateSignatureRecoverable> UdpState<ST> {
                         proposer_schedule,
                         &chunk,
                         rebroadcast_to,
-                        message.sender.as_ref(),
+                        &message.sender,
                     )
                 }
             };
@@ -1091,7 +1086,7 @@ mod tests {
             src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
             payload,
             stride: 1024,
-            sender: None,
+            sender: self_id,
         };
 
         udp_state.handle_message(
@@ -1584,7 +1579,7 @@ mod tests_deterministic {
             src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
             payload,
             stride: stride as u16,
-            sender: None,
+            sender: self_id,
         };
 
         udp_state.handle_message(
@@ -1747,7 +1742,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: stride as u16,
-                sender: None,
+                sender: sender_id,
             };
             let decoded = udp_state.handle_message(
                 &epoch_validators,
@@ -1883,7 +1878,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: stride as u16,
-                sender: None,
+                sender: sender_id,
             };
             decoded.extend(udp_state.handle_message(
                 &epoch_validators,
@@ -2100,7 +2095,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: deterministic::DEFAULT_SEGMENT_LEN as u16,
-                sender: None,
+                sender: sender_id,
             };
             decoded.extend(udp_state.handle_message(
                 &epoch_validators,
@@ -2147,7 +2142,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: deterministic::DEFAULT_SEGMENT_LEN as u16,
-                sender: None,
+                sender: sender_id,
             };
             decoded.extend(udp_state.handle_message(
                 &epoch_validators,
@@ -2207,7 +2202,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: stride as u16,
-                sender: None,
+                sender: proposer_id,
             };
             for (_, msg) in udp_state.handle_message(
                 &epoch_validators,
@@ -2290,7 +2285,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: packet.stride as u16,
-                sender: None,
+                sender: publisher_id,
             };
             udp_state.handle_message(
                 &group_map,
@@ -2377,7 +2372,7 @@ mod tests_deterministic {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000),
                 payload: packet.payload.clone(),
                 stride: packet.stride as u16,
-                sender: None,
+                sender: publisher_id,
             };
             decoded.extend(udp_state.handle_message(
                 &group_map,

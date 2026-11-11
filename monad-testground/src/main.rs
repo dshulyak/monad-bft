@@ -399,7 +399,7 @@ async fn run<ST, SCT>(
     mut wg_rx: tokio::sync::broadcast::Receiver<()>,
     config: Config<ST, SCT>,
 ) where
-    ST: CertificateSignatureRecoverable + Unpin,
+    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair> + Unpin,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Unpin,
     <ST as CertificateSignature>::KeyPairType: Unpin,
     <SCT as SignatureCollection>::SignatureType: Unpin,

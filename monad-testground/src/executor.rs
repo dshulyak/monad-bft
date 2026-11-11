@@ -40,9 +40,7 @@ use monad_peer_discovery::{
     mock::{NopDiscovery, NopDiscoveryBuilder},
 };
 use monad_raptorcast::{
-    auth::{NoopAuthProtocol, NopScore},
-    config::RaptorCastConfig,
-    raptorcast_secondary::SecondaryRaptorCastModeConfig,
+    auth::NopScore, config::RaptorCastConfig, raptorcast_secondary::SecondaryRaptorCastModeConfig,
     RaptorCast,
 };
 use monad_state::{Forkpoint, MonadMessage, MonadState, MonadStateBuilder, VerifiedMonadMessage};
@@ -130,7 +128,7 @@ pub fn make_monad_executor<ST, SCT>(
     MockConfigLoader<ST, SCT, MockExecutionProtocol>,
 >
 where
-    ST: CertificateSignatureRecoverable + Unpin,
+    ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair> + Unpin,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Unpin,
     <ST as CertificateSignature>::KeyPairType: Unpin,
     <SCT as SignatureCollection>::SignatureType: Unpin,
@@ -163,7 +161,7 @@ where
                     .with_udp_sockets([(UdpSocketId::AuthenticatedRaptorcast, auth_socket_addr)])
                     .with_tcp_sockets([(TcpSocketId::Raptorcast, config.local_addr)]);
 
-                let mut dp = dataplane_builder.build();
+                let mut dp = dataplane_builder.build_with_identity::<monad_secp::PubKey>();
                 assert!(dp.block_until_ready(Duration::from_secs(1)));
 
                 let tcp_socket = dp
@@ -176,14 +174,16 @@ where
                     .expect("authenticated raptorcast socket");
                 let control = dp.control;
 
-                let authenticated = (authenticated_socket, NoopAuthProtocol::new());
+                let authenticated = monad_dataplane::auth::AuthenticatedUdpSocket::with_key(
+                    authenticated_socket,
+                    cfg.shared_key.clone(),
+                );
                 Updater::boxed(RaptorCast::<
                     ST,
                     MonadMessage<ST, SCT, MockExecutionProtocol>,
                     VerifiedMonadMessage<ST, SCT, MockExecutionProtocol>,
                     MonadEvent<ST, SCT, MockExecutionProtocol>,
                     NopDiscovery<ST>,
-                    NoopAuthProtocol<CertificateSignaturePubKey<ST>>,
                     NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
                 >::new(
                     cfg,

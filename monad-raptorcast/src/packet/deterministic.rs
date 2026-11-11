@@ -21,11 +21,10 @@ use monad_crypto::{
     hasher::Hasher as _,
     signing_domain,
 };
-use monad_dataplane::udp::segment_size_for_mtu;
+use monad_dataplane::{auth::AUTHENTICATED_HEADER_SIZE, udp::segment_size_for_mtu};
 use monad_merkle::{MerkleHash, MerkleTree};
 use monad_raptor::Encoder;
 use monad_types::{Epoch, NodeId, Round, ETHERNET_MTU};
-use monad_wireauth::messages::DataPacketHeader;
 
 use super::{
     assigner::{
@@ -53,7 +52,7 @@ const VERSION: u16 = 0x1;
 // default parameter for Deterministic25 encoding scheme
 pub const DEFAULT_REDUNDANCY: Redundancy = Redundancy::from_fract(2, 50);
 pub const DEFAULT_SEGMENT_LEN: usize =
-    segment_size_for_mtu(ETHERNET_MTU - DataPacketHeader::SIZE as u16) as usize;
+    segment_size_for_mtu(ETHERNET_MTU - AUTHENTICATED_HEADER_SIZE) as usize;
 
 // The smallest message requires 4 chunks (from redundancy=2.5 +
 // min_validator_set_size=1), which is accommodated by a merkle tree

@@ -27,7 +27,10 @@ use futures::{Stream, StreamExt};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
+use monad_dataplane::{
+    auth::{AuthenticatedUdpSocket, AuthenticationProtocol},
+    DataplaneBuilder, TcpSocketId, UdpSocketId,
+};
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{Message, RouterCommand};
 use monad_node_config::{FullNodeConfig, FullNodeIdentityConfig};
@@ -36,7 +39,6 @@ use monad_peer_discovery::{
 };
 use monad_peer_score::IdentityScore;
 use monad_raptorcast::{
-    auth::AuthenticationProtocol,
     config::{
         GroupSchedulingConfig, RaptorCastConfig, RaptorCastConfigSecondary,
         RaptorCastConfigSecondaryClient, RaptorCastConfigSecondaryPublisher,
@@ -55,16 +57,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
 //==============================================================================
-pub struct MultiRouter<ST, M, OM, SE, PD, AP, DS>
+pub struct MultiRouter<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
-    rc_primary: RaptorCast<ST, M, OM, SE, PD, AP, DS>,
+    rc_primary: RaptorCast<ST, M, OM, SE, PD, DS>,
     rc_secondary: Option<RaptorCastSecondary<ST, M, OM, SE, PD>>,
 
     // raptorcast config is stored for future role change
@@ -79,17 +80,16 @@ where
     phantom: PhantomData<(OM, SE)>,
 }
 
-impl<ST, M, OM, SE, PD, AP, DS> MultiRouter<ST, M, OM, SE, PD, AP, DS>
+impl<ST, M, OM, SE, PD, DS> MultiRouter<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<B>(
+    pub fn new<B, AP>(
         self_node_id: NodeId<CertificateSignaturePubKey<ST>>,
         cfg: RaptorCastConfig<ST>,
         dataplane_builder: DataplaneBuilder,
@@ -103,6 +103,7 @@ where
     ) -> Self
     where
         B: PeerDiscoveryAlgoBuilder<PeerDiscoveryAlgoType = PD>,
+        AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     {
         // Peer discovery needs to be shared among primary and secondary
         let pdd = PeerDiscoveryDriver::new(peer_discovery_builder);
@@ -121,7 +122,10 @@ where
             dp.udp_sockets.take(UdpSocketId::DirectUdp),
             direct_udp_auth_protocol,
         ) {
-            (Some(socket), Some(protocol)) => Some((socket, protocol, direct_udp_peer_score)),
+            (Some(socket), Some(protocol)) => Some((
+                AuthenticatedUdpSocket::new(socket, protocol),
+                direct_udp_peer_score,
+            )),
             (None, None) => None,
             (Some(_), None) | (None, Some(_)) => {
                 panic!("direct udp socket and auth protocol must be set or unset together");
@@ -170,7 +174,7 @@ where
             cfg.clone(),
             secondary_mode,
             tcp_socket,
-            (authenticated_socket, auth_protocol),
+            AuthenticatedUdpSocket::new(authenticated_socket, auth_protocol),
             direct_udp,
             control,
             shared_pdd.clone(),
@@ -308,15 +312,14 @@ where
 }
 
 //==============================================================================
-impl<ST, M, OM, SE, PD, AP, DS> Executor for MultiRouter<ST, M, OM, SE, PD, AP, DS>
+impl<ST, M, OM, SE, PD, DS> Executor for MultiRouter<ST, M, OM, SE, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
-    RaptorCast<ST, M, OM, SE, PD, AP, DS>: Unpin,
+    RaptorCast<ST, M, OM, SE, PD, DS>: Unpin,
 {
     type Command = RouterCommand<ST, OM>;
 
@@ -475,16 +478,15 @@ where
 }
 
 //==============================================================================
-impl<ST, M, OM, E, PD, AP, DS> Stream for MultiRouter<ST, M, OM, E, PD, AP, DS>
+impl<ST, M, OM, E, PD, DS> Stream for MultiRouter<ST, M, OM, E, PD, DS>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     E: From<RaptorCastEvent<M::Event, ST>>,
     Self: Unpin,
-    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
-    RaptorCast<ST, M, OM, E, PD, AP, DS>: Unpin,
+    RaptorCast<ST, M, OM, E, PD, DS>: Unpin,
     RaptorCastSecondary<ST, M, OM, E, PD>: Unpin,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
     PeerDiscoveryDriver<PD>: Unpin,

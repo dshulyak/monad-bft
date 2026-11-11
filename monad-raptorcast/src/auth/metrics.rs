@@ -34,9 +34,6 @@ monad_executor::metric_consts! {
     }
 }
 
-monad_wireauth::define_metric_names!(UDP_METRICS, "udp");
-monad_wireauth::define_metric_names!(DIRECT_UDP_METRICS, "direct_udp");
-
 pub(crate) fn init_socket_executor_metrics() -> ExecutorMetrics {
     ExecutorMetrics::with_metric_defs(&[
         GAUGE_RAPTORCAST_AUTH_AUTHENTICATED_UDP_BYTES_WRITTEN,
