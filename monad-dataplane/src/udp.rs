@@ -569,6 +569,42 @@ pub(crate) fn test_pacing() -> mpsc::Sender<PacedMessage> {
     sender
 }
 
+#[cfg(test)]
+pub(crate) fn test_reject_tcp_with_full_udp_queue(
+    request: PacedMessage,
+    metrics: DataplaneMetrics,
+) {
+    let bytes = 64 * 1024;
+    let (sender, receiver) = mpsc::channel(2);
+    sender
+        .try_send(PacedMessage::Udp(UdpMsg {
+            socket_id: UdpSocketId::Raptorcast,
+            dst: "127.0.0.1:9".parse().unwrap(),
+            payload: Bytes::from(vec![0; bytes]),
+            stride: ETHERNET_SEGMENT_SIZE,
+            priority: monad_types::UdpPriority::Regular,
+        }))
+        .ok()
+        .unwrap();
+    sender.try_send(request).ok().unwrap();
+    let (dispatch, received) = async_channel::bounded(2);
+    spawn(async move {
+        let _received = received;
+        let _sender = sender;
+        tx_pacing(
+            dispatch,
+            receiver,
+            1_000,
+            UdpPacingConfig {
+                peer_bandwidth_mbps: 1_000,
+                max_queued_bytes: bytes,
+            },
+            metrics,
+        )
+        .await;
+    });
+}
+
 async fn tx_worker(
     tx_sockets: Vec<(UdpSocketId, std::net::UdpSocket)>,
     dispatch_rx: Receiver<Vec<UdpSend>>,
@@ -707,13 +743,108 @@ mod tests {
         assert_eq!(matches!(first.item, PacedMessage::Udp(_)), udp_first);
         let mut items = vec![first.item];
         let now = queue.next_wakeup(Duration::ZERO).unwrap();
-        items.push(queue.dequeue(now, MAX_BURST_SIZE).unwrap().item);
+        let second = queue.dequeue(now, MAX_BURST_SIZE).unwrap();
+        assert_eq!(matches!(second.item, PacedMessage::Udp(_)), !udp_first);
+        items.push(second.item);
+        assert!(queue.is_empty());
         for item in &mut items {
             if let PacedMessage::Tcp { request, .. } = item {
                 request.grant(0);
             }
         }
         assert_eq!(grants.try_recv(), Ok(Ok(0)));
+    }
+
+    #[rstest::rstest]
+    #[case::same_peer(true)]
+    #[case::different_peers(false)]
+    fn tcp_message_continuations_keep_their_order_against_udp(#[case] same_peer: bool) {
+        let metrics = DataplaneMetrics::new();
+        let mut queue = PacingQueue::new(
+            NonZeroU64::new(1_000_000).unwrap(),
+            NonZeroU64::new(1_000_000_000).unwrap(),
+            1024 * 1024,
+            metrics,
+        );
+        let tcp_addr = "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap();
+        let udp_addr = if same_peer {
+            "127.0.0.1:2"
+        } else {
+            "127.0.0.2:2"
+        }
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+        let (ready, mut grants) = mpsc::channel(1);
+        let reservation = |order| PacedMessage::Tcp {
+            addr: tcp_addr,
+            priority: monad_types::UdpPriority::Regular,
+            request: PacingRequest::new(64 * 1024, ready.clone()).with_order(order),
+        };
+        queue
+            .enqueue(
+                tcp_addr.ip(),
+                monad_types::UdpPriority::Regular,
+                reservation(None),
+            )
+            .ok()
+            .unwrap();
+        queue
+            .enqueue(
+                udp_addr.ip(),
+                monad_types::UdpPriority::Regular,
+                PacedMessage::Udp(UdpMsg {
+                    socket_id: UdpSocketId::Raptorcast,
+                    dst: udp_addr,
+                    payload: Bytes::from_static(b"older than the second TCP reservation"),
+                    stride: 36,
+                    priority: monad_types::UdpPriority::Regular,
+                }),
+            )
+            .ok()
+            .unwrap();
+        let mut first = queue.dequeue(Duration::ZERO, MAX_BURST_SIZE).unwrap();
+        let first_order = first.order;
+        let PacedMessage::Tcp { request, .. } = &mut first.item else {
+            panic!("expected TCP first chunk")
+        };
+        request.grant(first_order);
+        assert_eq!(grants.try_recv(), Ok(Ok(first_order)));
+
+        queue
+            .enqueue(
+                tcp_addr.ip(),
+                monad_types::UdpPriority::Regular,
+                reservation(Some(first_order)),
+            )
+            .ok()
+            .unwrap();
+        let next_at = queue.next_wakeup(Duration::ZERO).unwrap();
+        let mut continued = queue.dequeue(next_at, MAX_BURST_SIZE).unwrap();
+        assert!(matches!(continued.item, PacedMessage::Tcp { .. }));
+        assert_eq!(continued.order, first_order);
+        let PacedMessage::Tcp { request, .. } = &mut continued.item else {
+            unreachable!()
+        };
+        request.grant(continued.order);
+        assert_eq!(grants.try_recv(), Ok(Ok(first_order)));
+
+        // A different message must not inherit the old message's position.
+        queue
+            .enqueue(
+                tcp_addr.ip(),
+                monad_types::UdpPriority::Regular,
+                reservation(None),
+            )
+            .ok()
+            .unwrap();
+        let next_at = queue.next_wakeup(next_at).unwrap();
+        let udp = queue.dequeue(next_at, MAX_BURST_SIZE).unwrap();
+        assert!(matches!(udp.item, PacedMessage::Udp(_)));
+        let next_at = queue.next_wakeup(next_at).unwrap();
+        let new_message = queue.dequeue(next_at, MAX_BURST_SIZE).unwrap();
+        assert!(matches!(new_message.item, PacedMessage::Tcp { .. }));
+        assert!(new_message.order > udp.order && udp.order > first_order);
+        assert!(queue.is_empty());
     }
 
     #[rstest::rstest]

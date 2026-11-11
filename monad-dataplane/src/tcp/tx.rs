@@ -636,7 +636,8 @@ mod tests {
             done.send(()).unwrap();
         });
 
-        for size in [TCP_CHUNK_BYTES * 2 + 17, 0, 1] {
+        for (id, size) in [TCP_CHUNK_BYTES * 2 + 17, 0, 1].into_iter().enumerate() {
+            let mut order = None;
             let expected = [TcpMsgHdr::new(size as u64).as_bytes(), &vec![0; size]].concat();
             let mut frame = Vec::new();
             while frame.len() < expected.len() {
@@ -659,7 +660,10 @@ mod tests {
                     received.try_recv().is_err(),
                     "only one request may be outstanding"
                 );
-                request.grant(0);
+                assert_eq!(request.order(), order);
+                let assigned = 100 + id as u64;
+                request.grant(assigned);
+                order = Some(assigned);
                 drop(request);
                 let (result, chunk) =
                     timeout(Duration::from_secs(1), peer.read_exact(vec![0; bytes]))
@@ -682,13 +686,19 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::closed_ingress(false)]
-    #[case::dropped_request(true)]
+    #[case::closed_ingress(false, false, false)]
+    #[case::dropped_request(true, false, false)]
+    #[case::full_udp_queue(false, true, false)]
+    #[case::full_udp_queue_after_first_chunk(false, true, true)]
     #[monoio::test(timer_enabled = true)]
-    async fn pacing_failure_closes_connection_and_fails_completion(#[case] drop_request: bool) {
+    async fn pacing_failure_closes_connection_and_fails_completion(
+        #[case] drop_request: bool,
+        #[case] overloaded: bool,
+        #[case] mid_frame: bool,
+    ) {
         use std::num::NonZeroU32;
 
-        use monoio::io::AsyncReadRent;
+        use monoio::io::{AsyncReadRent, AsyncReadRentExt};
 
         use super::super::{TcpControl, TcpRateLimit};
 
@@ -705,14 +715,18 @@ mod tests {
             .try_send(
                 &key,
                 TcpMsg {
-                    msg: Bytes::from_static(b"paced"),
+                    msg: if mid_frame {
+                        Bytes::from(vec![0; 2 * TCP_CHUNK_BYTES + 17])
+                    } else {
+                        Bytes::from_static(b"paced")
+                    },
                     completion: Some(complete)
                 },
                 &metrics
             )
             .is_none());
         let (requests, mut received) = mpsc::channel(1);
-        if !drop_request {
+        if !drop_request && !overloaded {
             received.close();
         }
         let (ingress, _messages) = mpsc::channel(1);
@@ -741,7 +755,36 @@ mod tests {
             drop_queued_messages(&mut messages, &context.metrics);
             done.send(error).unwrap();
         });
-        if drop_request {
+        if mid_frame {
+            let PacedMessage::Tcp { mut request, .. } =
+                timeout(Duration::from_secs(1), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected first TCP reservation")
+            };
+            request.grant(7);
+            let (result, first) = timeout(
+                Duration::from_secs(1),
+                peer.read_exact(vec![0; TCP_CHUNK_BYTES]),
+            )
+            .await
+            .unwrap();
+            result.unwrap();
+            let header = TcpMsgHdr::new((2 * TCP_CHUNK_BYTES + 17) as u64);
+            assert_eq!(&first[..header.as_bytes().len()], header.as_bytes());
+            assert!(first[header.as_bytes().len()..]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
+        if overloaded {
+            let request = timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            crate::udp::test_reject_tcp_with_full_udp_queue(request, metrics.clone());
+        } else if drop_request {
             drop(
                 timeout(Duration::from_secs(1), received.recv())
                     .await
@@ -763,11 +806,147 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             0,
-            "connection must close without transmitting the frame"
+            "connection must close without transmitting any further frame bytes"
         );
         assert!(!registry.contains(&key));
         assert_eq!(metrics.tcp_egress_messages_dropped.get(), 1);
         assert_eq!(metrics.tcp_send_errors.get(), 1);
+        assert_eq!(
+            metrics.udp_pacing_memory_limit_drops.get(),
+            u64::from(overloaded)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::before_first_grant([10_100, 0, 0])]
+    #[case::between_chunks([5_100, 5_100, 0])]
+    #[monoio::test(timer_enabled = true)]
+    async fn pacing_wait_does_not_consume_message_write_timeout(#[case] delays_ms: [u64; 3]) {
+        use monoio::io::AsyncReadRentExt;
+
+        let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, mut write) = super::super::split_stream(stream);
+        let size = 2 * TCP_CHUNK_BYTES + 17;
+        let expected = [TcpMsgHdr::new(size as u64).as_bytes(), &vec![0; size]].concat();
+        let (messages, mut receiver) = bounded_queue();
+        assert!(messages.try_send(make_msg(size)).is_ok());
+        drop(messages);
+        let (requests, mut reservations) = mpsc::channel(1);
+        let (done, mut finished) = futures::channel::oneshot::channel();
+        let metrics = DataplaneMetrics::new();
+        let sent_metrics = metrics.clone();
+        spawn(async move {
+            let idle = ConnectionIdle::new();
+            let result = send_messages(
+                0,
+                &addr,
+                &mut write,
+                &mut receiver,
+                &sent_metrics,
+                &idle,
+                &requests,
+            )
+            .await;
+            done.send(result).unwrap();
+        });
+        let started = Instant::now();
+        let mut frame = Vec::new();
+        for delay_ms in delays_ms {
+            let PacedMessage::Tcp { mut request, .. } =
+                timeout(Duration::from_secs(1), reservations.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected a TCP reservation")
+            };
+            monoio::time::sleep(Duration::from_millis(delay_ms)).await;
+            assert!(
+                finished.try_recv().unwrap().is_none(),
+                "local pacing must not time out a healthy writer"
+            );
+            request.grant(42);
+            let bytes = (expected.len() - frame.len()).min(TCP_CHUNK_BYTES);
+            let (result, chunk) = timeout(Duration::from_secs(1), peer.read_exact(vec![0; bytes]))
+                .await
+                .unwrap();
+            result.unwrap();
+            frame.extend_from_slice(&chunk);
+        }
+        assert!(started.elapsed() > message_timeout(size));
+        timeout(Duration::from_secs(1), finished)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, expected);
+        assert_eq!(metrics.tcp_messages_sent.get(), 1);
+        assert_eq!(metrics.tcp_send_errors.get(), 0);
+    }
+
+    #[monoio::test(timer_enabled = true)]
+    async fn socket_write_budget_is_shared_across_writes() {
+        use std::os::fd::AsRawFd;
+
+        use monoio::io::AsyncReadRentExt;
+
+        let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let buffer_size: libc::c_int = 32 * 1024;
+        for (fd, option) in [
+            (stream.as_raw_fd(), libc::SO_SNDBUF),
+            (peer.as_raw_fd(), libc::SO_RCVBUF),
+        ] {
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        &buffer_size as *const _ as _,
+                        std::mem::size_of_val(&buffer_size) as _,
+                    )
+                },
+                0
+            );
+        }
+        let (_, mut write) = super::super::split_stream(stream);
+        let (keep_peer, released) = futures::channel::oneshot::channel::<()>();
+        let (read, received) = futures::channel::oneshot::channel();
+        spawn(async move {
+            monoio::time::sleep(Duration::from_millis(100)).await;
+            let (result, data) = peer.read_exact(vec![0; 1024 * 1024]).await;
+            result.unwrap();
+            assert!(data.iter().all(|byte| *byte == 7));
+            read.send(()).unwrap();
+            let _ = released.await;
+        });
+        let original = Duration::from_millis(300);
+        let mut budget = WriteBudget {
+            remaining: original,
+        };
+        let started = Instant::now();
+        budget
+            .write_all(&mut write, Bytes::from(vec![7; 1024 * 1024]))
+            .await
+            .unwrap();
+        assert!(budget.remaining < original - Duration::from_millis(75));
+        received.await.unwrap();
+        let error = budget
+            .write_all(&mut write, Bytes::from(vec![9; 1024 * 1024]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < original + Duration::from_millis(75),
+            "the second write must use only the remaining budget"
+        );
+        drop(keep_peer);
     }
 
     #[test]
