@@ -628,6 +628,9 @@ impl<AP: AuthenticationProtocol> Backend<AP::PublicKey> for ProtocolBackend<AP> 
                 plaintext.dst,
                 2,
             );
+            // Established plaintext cannot emit protocol output. Flush only
+            // when preparation actually starts a connection.
+            self.drain(socket_id, output);
         }
         if let Some(addr) = self.route(&plaintext) {
             output.push(Self::routed(socket_id, plaintext, addr));
@@ -768,6 +771,7 @@ mod tests {
         recorded: Recorded,
         remote: Option<(u64, SocketAddr)>,
         handshake_pending: bool,
+        output_polls: Arc<std::sync::atomic::AtomicUsize>,
     }
     struct RecordingWriter(Recorded);
     impl monad_wireauth::PacketWriter for RecordingWriter {
@@ -865,6 +869,8 @@ mod tests {
             self.handshake_pending && self.remote == Some((*key, *addr))
         }
         fn next_packet(&mut self) -> Option<(SocketAddr, Bytes)> {
+            self.output_polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             None
         }
         fn tick(&mut self) {}
@@ -884,6 +890,7 @@ mod tests {
                 recorded: recorded.clone(),
                 remote: None,
                 handshake_pending: true,
+                output_polls: Arc::default(),
             },
             pending: VecDeque::new(),
             pending_bytes: HashMap::new(),
@@ -951,6 +958,7 @@ mod tests {
                 recorded: recorded.clone(),
                 remote: None,
                 handshake_pending: false,
+                output_polls: Arc::default(),
             },
         );
         // A cloned raw writer must not bypass authentication once installed.
@@ -995,6 +1003,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn established_data_and_writer_do_not_poll_control_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let destination = sink.local_addr().unwrap();
+        let mut dp = DataplaneBuilder::new(1_000)
+            .with_udp_sockets([(
+                UdpSocketId::AuthenticatedRaptorcast,
+                "127.0.0.1:0".parse().unwrap(),
+            )])
+            .build_with_identity::<u64>();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut socket = AuthenticatedUdpSocket::new(
+            dp.udp_sockets
+                .take(UdpSocketId::AuthenticatedRaptorcast)
+                .unwrap(),
+            RecordingProtocol {
+                recorded: Recorded(Arc::new(Mutex::new(Vec::new()))),
+                remote: None,
+                handshake_pending: false,
+                output_polls: polls.clone(),
+            },
+        );
+        socket.connect(1, destination, 1).unwrap();
+        socket
+            .write(
+                1,
+                destination,
+                Bytes::from_static(b"payload"),
+                7,
+                UdpPriority::High,
+            )
+            .unwrap();
+        let mut packet = [0; 64];
+        assert_eq!(sink.recv_from(&mut packet).unwrap().0, 15);
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            1,
+            "only connect flushes output"
+        );
+        sink.send_to(&[1; 9], socket.local_addr()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), socket.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            1,
+            "data reads do not flush output"
+        );
+        sink.send_to(b"handshake", socket.local_addr()).unwrap();
+        sink.send_to(&[1; 9], socket.local_addr()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), socket.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            2,
+            "control reads flush output"
+        );
+    }
+
+    #[tokio::test]
     async fn typed_ingress_rejects_packets_before_authentication_installation() {
         use futures::poll;
         let mut dp = DataplaneBuilder::new(1_000)
@@ -1032,6 +1102,7 @@ mod tests {
                 recorded: Recorded(Arc::new(Mutex::new(Vec::new()))),
                 remote: None,
                 handshake_pending: false,
+                output_polls: Arc::default(),
             },
         );
         sender.send_to(&[1; 9], socket.local_addr()).unwrap();

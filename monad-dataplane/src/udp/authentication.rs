@@ -134,7 +134,7 @@ impl<I: Identity> Runtime<I> {
     }
     pub(super) fn command(&mut self, command: UdpCommand<I>) {
         let mut output = Vec::new();
-        let id = match command {
+        match command {
             UdpCommand::Send(msg) => {
                 if self.require_auth
                     || self.sockets[msg.socket_id as usize]
@@ -152,15 +152,14 @@ impl<I: Identity> Runtime<I> {
                 let (backend, metrics) = backend();
                 self.sockets[id as usize].as_mut().unwrap().backend = Some(backend);
                 let _ = installed.send(metrics);
-                id
             }
             UdpCommand::Connect(connection) => {
                 let (id, key, addr, attempts) = *connection;
                 if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut()
                 {
                     backend.connect(key, addr, attempts);
+                    backend.drain(id, &mut output);
                 }
-                id
             }
             UdpCommand::Plaintext(plaintext) => {
                 let id = plaintext.socket_id;
@@ -168,11 +167,7 @@ impl<I: Identity> Runtime<I> {
                 {
                     backend.prepare(id, plaintext, &mut output);
                 }
-                id
             }
-        };
-        if let Some(backend) = self.sockets[id as usize].as_mut().unwrap().backend.as_mut() {
-            backend.drain(id, &mut output);
         }
         self.enqueue(output);
         let _ = self.timer_notify.try_send(());
@@ -182,7 +177,6 @@ impl<I: Identity> Runtime<I> {
         let mut output = Vec::new();
         if let Some(backend) = socket.backend.as_mut() {
             let result = backend.receive(packet, src_addr);
-            backend.drain(id, &mut output);
             match result {
                 Ok(Some((payload, sender))) => {
                     let stride = payload.len().max(1).try_into().unwrap();
@@ -194,6 +188,7 @@ impl<I: Identity> Runtime<I> {
                     });
                 }
                 Ok(None) => {
+                    backend.drain(id, &mut output);
                     let _ = self.timer_notify.try_send(());
                 }
                 Err(()) => {
@@ -221,9 +216,6 @@ impl<I: Identity> Runtime<I> {
     ) -> Option<monad_wireauth::Writer> {
         let backend = self.sockets[id as usize].as_mut()?.backend.as_mut()?;
         let writer = backend.writer(encryption, addr, plaintext_len);
-        let mut output = Vec::new();
-        backend.drain(id, &mut output);
-        self.enqueue(output);
         let _ = self.timer_notify.try_send(());
         writer
     }
