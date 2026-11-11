@@ -49,20 +49,28 @@ pub enum EnqueueError<T> {
 #[derive(Debug)]
 pub struct PacingRequest {
     bytes: usize,
-    ready: Option<mpsc::Sender<Result<(), ErrorKind>>>,
+    ready: Option<mpsc::Sender<Result<u64, ErrorKind>>>,
+    order: Option<u64>,
 }
 
 impl PacingRequest {
-    pub fn new(bytes: usize, ready: mpsc::Sender<Result<(), ErrorKind>>) -> Self {
+    pub fn new(bytes: usize, ready: mpsc::Sender<Result<u64, ErrorKind>>) -> Self {
         Self {
             bytes,
             ready: Some(ready),
+            order: None,
         }
     }
 
-    pub fn grant(&mut self) {
+    /// Reuse the first reservation's FIFO position for this TCP message.
+    pub fn with_order(mut self, order: Option<u64>) -> Self {
+        self.order = order;
+        self
+    }
+
+    pub fn grant(&mut self, order: u64) {
         if let Some(ready) = self.ready.take() {
-            let _ = ready.try_send(Ok(()));
+            let _ = ready.try_send(Ok(order));
         }
     }
 }
@@ -76,6 +84,11 @@ impl Drop for PacingRequest {
 }
 
 pub trait PacingItem {
+    /// Existing FIFO position for a continuation of an admitted message.
+    fn order(&self) -> Option<u64> {
+        None
+    }
+
     /// Retained bytes charged against the queue's memory limit.
     fn queued_bytes(&self) -> usize;
 
@@ -88,6 +101,10 @@ pub trait PacingItem {
 }
 
 impl PacingItem for PacingRequest {
+    fn order(&self) -> Option<u64> {
+        self.order
+    }
+
     fn queued_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }
@@ -127,7 +144,7 @@ pub struct Scheduled<T> {
     pub item: T,
     pub(crate) batch_bytes: usize,
     priority: UdpPriority,
-    order: u64,
+    pub(crate) order: u64,
 }
 
 struct Queued<T> {
@@ -374,8 +391,11 @@ impl<T: PacingItem> PacingQueue<T> {
     ) -> Result<(), EnqueueError<T>> {
         // Assign a global sequence number to preserve FIFO among ready messages of
         // equal priority, including across peers. Requeued messages retain their order.
-        let order = self.next_order;
-        self.next_order = self.next_order.wrapping_add(1);
+        let order = item.order().unwrap_or_else(|| {
+            let order = self.next_order;
+            self.next_order = self.next_order.wrapping_add(1);
+            order
+        });
         self.enqueue_inner(key.into(), priority, item, order)
     }
 
@@ -535,10 +555,10 @@ mod tests {
                 grants.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
             ));
-            request.grant();
-            request.grant();
+            request.grant(0);
+            request.grant(0);
             drop(request);
-            assert_eq!(grants.try_recv(), Ok(Ok(())));
+            assert_eq!(grants.try_recv(), Ok(Ok(0)));
             assert!(matches!(
                 grants.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
@@ -547,8 +567,8 @@ mod tests {
         drop(PacingRequest::new(1, ready.clone()));
         assert_eq!(grants.try_recv(), Ok(Err(ErrorKind::BrokenPipe)));
         let mut request = PacingRequest::new(1, ready);
-        request.grant();
-        assert_eq!(grants.try_recv(), Ok(Ok(())));
+        request.grant(0);
+        assert_eq!(grants.try_recv(), Ok(Ok(0)));
     }
 
     #[test]

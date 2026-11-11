@@ -95,6 +95,13 @@ impl From<UdpMsg> for PacedMessage {
 }
 
 impl PacingItem for PacedMessage {
+    fn order(&self) -> Option<u64> {
+        match self {
+            Self::Udp(_) => None,
+            Self::Tcp { request, .. } => request.order(),
+        }
+    }
+
     fn queued_bytes(&self) -> usize {
         match self {
             Self::Udp(message) => message.queued_bytes(),
@@ -470,6 +477,11 @@ async fn tx_pacing(
             }
         }
         for message in incoming.drain(..) {
+            // NOTE(dshulyak): Fail fast on admission overload, including TCP
+            // reservations: rejecting a reservation fails the writer and closes
+            // its connection. Proposal dissemination is bursty; UDP should not
+            // saturate the available bandwidth for long periods. TCP and other
+            // traffic are expected to make progress between these bursts.
             let _ = queue.enqueue(message.addr().ip(), message.priority(), message);
         }
 
@@ -489,10 +501,11 @@ async fn tx_pacing(
                 break;
             };
             burst_size += scheduled.batch_bytes;
+            let order = scheduled.order;
             let msg = match &mut scheduled.item {
                 PacedMessage::Udp(msg) => msg,
                 PacedMessage::Tcp { request, .. } => {
-                    request.grant();
+                    request.grant(order);
                     continue;
                 }
             };
@@ -697,10 +710,10 @@ mod tests {
         items.push(queue.dequeue(now, MAX_BURST_SIZE).unwrap().item);
         for item in &mut items {
             if let PacedMessage::Tcp { request, .. } = item {
-                request.grant();
+                request.grant(0);
             }
         }
-        assert_eq!(grants.try_recv(), Ok(Ok(())));
+        assert_eq!(grants.try_recv(), Ok(Ok(0)));
     }
 
     #[rstest::rstest]
@@ -732,8 +745,8 @@ mod tests {
         let PacedMessage::Tcp { request, .. } = &mut scheduled.item else {
             panic!("expected reservation")
         };
-        request.grant();
-        assert_eq!(grants.try_recv(), Ok(Ok(())));
+        request.grant(0);
+        assert_eq!(grants.try_recv(), Ok(Ok(0)));
         let udp = PacedMessage::Udp(UdpMsg {
             socket_id: UdpSocketId::Raptorcast,
             dst: if same_peer {
@@ -774,7 +787,7 @@ mod tests {
             DataplaneMetrics::new(),
         ));
         let (ready, mut grants) = mpsc::channel(1);
-        for _ in 0..4 {
+        for order in 0..4 {
             assert!(sender
                 .try_send(PacedMessage::Tcp {
                     addr: "127.0.0.1:1".parse().unwrap(),
@@ -786,7 +799,7 @@ mod tests {
                 time::timeout(Duration::from_secs(1), grants.recv())
                     .await
                     .unwrap(),
-                Some(Ok(()))
+                Some(Ok(order))
             );
         }
         assert!(dispatch_rx.try_recv().is_err());
@@ -817,7 +830,7 @@ mod tests {
             time::timeout(Duration::from_secs(1), grants.recv())
                 .await
                 .unwrap(),
-            Some(Ok(()))
+            Some(Ok(0))
         );
         assert!(sender.try_send(tcp()).is_ok());
         assert!(sender
@@ -843,7 +856,7 @@ mod tests {
             time::timeout(Duration::from_secs(1), grants.recv())
                 .await
                 .unwrap(),
-            Some(Ok(()))
+            Some(Ok(1))
         );
     }
 
@@ -868,8 +881,8 @@ mod tests {
         assert!(matches!(grants.try_recv(), Err(TryRecvError::Empty)));
         let mut scheduled = queue.dequeue(Duration::ZERO, MAX_BURST_SIZE).unwrap();
         assert_eq!(scheduled.batch_bytes, 64 * 1024);
-        scheduled.item.grant();
-        assert_eq!(grants.try_recv(), Ok(Ok(())));
+        scheduled.item.grant(scheduled.order);
+        assert_eq!(grants.try_recv(), Ok(Ok(0)));
         assert!(queue.is_empty());
     }
 

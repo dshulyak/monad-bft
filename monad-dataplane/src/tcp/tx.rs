@@ -63,8 +63,8 @@ const _: () = assert!(TCP_CHUNK_BYTES < crate::udp::MAX_BURST_SIZE);
 struct WriterPacing {
     addr: SocketAddr,
     requests: mpsc::Sender<PacedMessage>,
-    ready: mpsc::Sender<Result<(), ErrorKind>>,
-    grants: mpsc::Receiver<Result<(), ErrorKind>>,
+    ready: mpsc::Sender<Result<u64, ErrorKind>>,
+    grants: mpsc::Receiver<Result<u64, ErrorKind>>,
 }
 
 impl WriterPacing {
@@ -78,20 +78,25 @@ impl WriterPacing {
         }
     }
 
-    async fn acquire(&mut self, bytes: usize, priority: UdpPriority) -> Result<(), Error> {
+    async fn acquire(
+        &mut self,
+        bytes: usize,
+        priority: UdpPriority,
+        order: Option<u64>,
+    ) -> Result<u64, Error> {
         self.requests
             .send(PacedMessage::Tcp {
                 addr: self.addr,
                 priority,
-                request: PacingRequest::new(bytes, self.ready.clone()),
+                request: PacingRequest::new(bytes, self.ready.clone()).with_order(order),
             })
             .await
             .map_err(|_| Error::from(ErrorKind::BrokenPipe))?;
         self.grants
             .recv()
             .await
-            .unwrap_or(Err(ErrorKind::BrokenPipe))?;
-        Ok(())
+            .unwrap_or(Err(ErrorKind::BrokenPipe))
+            .map_err(Error::from)
     }
 }
 
@@ -390,25 +395,16 @@ pub(super) async fn send_messages(
     pacing: &mpsc::Sender<PacedMessage>,
 ) -> Result<(), Error> {
     let mut pacing = WriterPacing::new(*addr, pacing.clone());
-    write_half.set_cork(true);
-
     let mut message_id: u64 = 0;
 
     loop {
         let msg = match msg_receiver.try_recv() {
             Ok(msg) => msg,
             Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {
-                write_half.set_cork(false);
-
-                match msg_receiver.recv().await {
-                    None => break,
-                    Some(msg) => {
-                        write_half.set_cork(true);
-                        msg
-                    }
-                }
-            }
+            Err(TryRecvError::Empty) => match msg_receiver.recv().await {
+                None => break,
+                Some(msg) => msg,
+            },
         };
 
         let _writing = idle.writing();
@@ -433,20 +429,16 @@ pub(super) async fn send_messages(
             metrics,
             sent: false,
         };
-        timeout(
-            message_timeout(len),
-            send_message(
-                conn_id,
-                addr,
-                write_half,
-                message_id,
-                msg,
-                metrics,
-                &mut pacing,
-            ),
+        send_message(
+            conn_id,
+            addr,
+            write_half,
+            message_id,
+            msg,
+            metrics,
+            &mut pacing,
         )
         .await
-        .unwrap_or_else(|_| Err(Error::from(ErrorKind::TimedOut)))
         .map_err(|err| {
             metrics.tcp_send_errors.inc();
             Error::other(format!(
@@ -459,6 +451,30 @@ pub(super) async fn send_messages(
     }
 
     Ok(())
+}
+
+/// Socket-write time remaining for one frame. Waiting for a pacing grant does
+/// not consume this budget, and each chunk shares the same remaining allowance.
+struct WriteBudget {
+    remaining: Duration,
+}
+
+impl WriteBudget {
+    async fn write_all<T: monoio::buf::IoBuf>(
+        &mut self,
+        write_half: &mut TcpWriteHalf,
+        buf: T,
+    ) -> Result<(), Error> {
+        if self.remaining.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        let started = Instant::now();
+        let (result, _) = timeout(self.remaining, write_half.write_all(buf))
+            .await
+            .map_err(|_| Error::from(ErrorKind::TimedOut))?;
+        self.remaining = self.remaining.saturating_sub(started.elapsed());
+        result.map(|_| ())
+    }
 }
 
 async fn send_message(
@@ -492,21 +508,28 @@ async fn send_message(
 
     let mut payload = message.msg;
     let mut first = true;
-    write_half.set_cork(false);
+    let mut order = None;
+    let mut budget = WriteBudget {
+        remaining: message_timeout(message_len),
+    };
     loop {
         let header_bytes = if first { header.as_bytes().len() } else { 0 };
         let bytes = payload.len().min(TCP_CHUNK_BYTES - header_bytes);
-        pacing.acquire(bytes + header_bytes, priority).await?;
+        order = Some(
+            pacing
+                .acquire(bytes + header_bytes, priority, order)
+                .await?,
+        );
         write_half.set_cork(true);
         if first {
-            let (ret, _) = write_half
-                .write_all(Box::<[u8]>::from(header.as_bytes()))
-                .await;
-            ret?;
+            budget
+                .write_all(write_half, Box::<[u8]>::from(header.as_bytes()))
+                .await?;
             first = false;
         }
-        let (ret, _) = write_half.write_all(payload.split_to(bytes)).await;
-        ret?;
+        budget
+            .write_all(write_half, payload.split_to(bytes))
+            .await?;
         write_half.set_cork(false);
         if payload.is_empty() {
             break;
@@ -636,7 +659,7 @@ mod tests {
                     received.try_recv().is_err(),
                     "only one request may be outstanding"
                 );
-                request.grant();
+                request.grant(0);
                 drop(request);
                 let (result, chunk) =
                     timeout(Duration::from_secs(1), peer.read_exact(vec![0; bytes]))
